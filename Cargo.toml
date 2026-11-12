@@ -1,0 +1,43 @@
+[package]
+name = "lol-account-manager"
+version = "0.1.0"
+edition = "2024"
+description = "LoL Account Manager — менеджер аккаунтов League of Legends на Rust (eframe/egui)"
+publish = false
+
+[dependencies]
+arboard = { version = "3.7.0", default-features = false }
+dirs = "7.0.0"
+# persistence — eframe запоминает размер и положение окна (файл window.ron в папке данных).
+eframe = { version = "0.37.0", features = ["persistence"] }
+egui_extras = { version = "0.37.0", default-features = false, features = ["image"] }
+governor = "0.10.4"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+keyring = "4.2.0"
+percent-encoding = "2.3.2"
+reqwest = { version = "0.13.5", features = ["json"] }
+# Системное окно «Открыть / Сохранить файл» (экспорт и импорт списка аккаунтов).
+rfd = "0.17.2"
+rusqlite = { version = "0.41.1", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sysinfo = { version = "0.40.1", default-features = false, features = ["system"] }
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "sync", "fs"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+uuid = { version = "1.29.0", features = ["v4"] }
+
+[build-dependencies]
+# Вшивает иконку и название программы в exe (Windows). На других системах build.rs ничего не делает.
+winresource = "0.1.34"
+
+# Зависимости собираем с оптимизациями даже в debug: egui/wgpu и декодирование
+# картинок без оптимизаций заметно тормозят. Наш собственный код остаётся
+# неоптимизированным, поэтому пересборка после правок всё равно быстрая.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+strip = true

@@ -1,0 +1,31 @@
+# Сборка Cargo
+/target
+
+# Локальные данные приложения, если они вдруг окажутся в папке проекта
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+/cache/
+/data/
+
+# Секреты: API-ключ хранится в системном хранилище (keyring), но на всякий случай
+.env
+.env.*
+*.key
+secrets*.json
+
+# Состояние окна (window.ron), если папка данных окажется в проекте
+*.ron
+
+# Логи
+*.log
+
+# Редакторы и ОС
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
