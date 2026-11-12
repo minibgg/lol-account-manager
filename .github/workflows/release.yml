@@ -1,0 +1,193 @@
+# Выпуск новой версии под Windows.
+#
+# Когда запускается:
+#   • сам — когда в GitHub приходит тег вида v1.0.0 (git push origin v1.0.0):
+#     прогоняет тесты, собирает программу и установщик и публикует их в Releases;
+#   • вручную — вкладка Actions → Release → Run workflow: всё то же самое, но
+#     БЕЗ публикации — готовые файлы появятся внизу страницы запуска (Artifacts).
+#     Удобно, чтобы проверить сборку, не выпуская версию.
+#
+# Версия в Cargo.toml должна совпадать с тегом (тег v1.2.3 ↔ version = "1.2.3"),
+# иначе сборка сразу остановится и напишет, что поправить.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+
+# Право создавать релиз и загружать в него файлы (токен выдаётся только на время запуска).
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Сборка под Windows
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Скачать код
+        uses: actions/checkout@v7
+
+      - name: Установить Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc --version
+
+      - name: Проверить версию
+        id: version
+        run: |
+          # Без этого русский текст в логе превращается в «????».
+          [Console]::OutputEncoding = [Text.Encoding]::UTF8
+          $meta = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $version = $meta.packages[0].version
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $tagVersion = $env:GITHUB_REF_NAME.TrimStart('v')
+            if ($tagVersion -ne $version) {
+              $msg = 'Тег {0} не совпадает с версией в Cargo.toml ({1}). Поставьте в Cargo.toml version = "{2}", закоммитьте и создайте тег заново.' -f $env:GITHUB_REF_NAME, $version, $tagVersion
+              "::error::$msg"
+              exit 1
+            }
+          }
+          "Версия: $version"
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      # Те же быстрые тесты, что и `cargo test` локально (без сети и хранилища паролей).
+      # --locked: брать версии библиотек строго из Cargo.lock.
+      - name: Тесты
+        run: cargo test --release --locked
+
+      - name: Сборка
+        run: cargo build --release --locked
+
+      - name: Собрать установщик (Inno Setup)
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --no-progress -y
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
+          # Сценарий установщика пишем во временную папку сборщика — в проекте ничего не появляется.
+          # Ставит туда же, куда и `cargo run --example install`: %LOCALAPPDATA%\Programs\LoL Account Manager,
+          # с теми же ярлыками, поэтому можно ставить поверх такой установки.
+          $iss = Join-Path $env:RUNNER_TEMP 'setup.iss'
+          Set-Content -Path $iss -Encoding utf8BOM -Value @'
+          #define AppName "LoL Account Manager"
+          #define AppExe "lol-account-manager.exe"
+
+          [Setup]
+          ; Постоянный идентификатор программы: по нему установщик находит
+          ; уже установленную версию и обновляет её. НЕ МЕНЯТЬ.
+          AppId={{C43AABAF-9C3D-46F7-BA6B-EC4B2C68EF9D}
+          AppName={#AppName}
+          AppVersion={#AppVersion}
+          AppVerName={#AppName} {#AppVersion}
+          ; Относительные пути ниже (и OutputDir) — от корня репозитория.
+          SourceDir={#SourceRoot}
+          OutputDir=dist
+          OutputBaseFilename=LoL-Account-Manager-Setup-{#AppVersion}
+          ; {userpf} = %LOCALAPPDATA%\Programs: права администратора не нужны.
+          DefaultDirName={userpf}\{#AppName}
+          PrivilegesRequired=lowest
+          DisableProgramGroupPage=yes
+          SetupIconFile=assets\icon.ico
+          UninstallDisplayIcon={app}\{#AppExe}
+          UninstallDisplayName={#AppName}
+          ArchitecturesAllowed=x64compatible
+          ArchitecturesInstallIn64BitMode=x64compatible
+          WizardStyle=modern
+          Compression=lzma2
+          SolidCompression=yes
+
+          [Languages]
+          Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"
+
+          [Tasks]
+          Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
+
+          [InstallDelete]
+          ; Остаётся после обновления через `cargo run --example install`.
+          Type: files; Name: "{app}\lol-account-manager.old.exe"
+
+          [Files]
+          Source: "target\release\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
+
+          [Icons]
+          Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"; Comment: "Менеджер аккаунтов League of Legends"
+          Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Comment: "Менеджер аккаунтов League of Legends"; Tasks: desktopicon
+
+          [Run]
+          Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
+          '@
+          & $iscc "/DAppVersion=$env:VERSION" "/DSourceRoot=$env:GITHUB_WORKSPACE" $iss
+
+      - name: Подготовить файлы
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # Рядом с установщиком — та же программа без установки.
+          Copy-Item target\release\lol-account-manager.exe "dist\LoL-Account-Manager-Portable-$env:VERSION.exe"
+          # Контрольные суммы: по ним можно проверить, что файл скачался целиком и не подменён.
+          Get-ChildItem dist -Filter *.exe | Get-FileHash -Algorithm SHA256 |
+            ForEach-Object { '{0}  {1}' -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf) } |
+            Set-Content dist\SHA256SUMS.txt -Encoding ascii
+          Get-ChildItem dist | Format-Table Name, Length
+
+      # Ручной запуск: файлы прикрепляются к странице запуска (раздел Artifacts), релиз не создаётся.
+      - name: Прикрепить файлы к запуску
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v7
+        with:
+          name: LoL-Account-Manager-${{ steps.version.outputs.version }}
+          path: dist/
+          if-no-files-found: error
+
+      - name: Опубликовать релиз
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # Код возврата gh проверяем сами, а не через исключения PowerShell.
+          $PSNativeCommandUseErrorActionPreference = $false
+          $files = (Get-ChildItem dist -File).FullName
+          # Текст релиза; ниже GitHub сам допишет список изменений с прошлой версии.
+          $notes = Join-Path $env:RUNNER_TEMP 'notes.md'
+          Set-Content -Path $notes -Encoding utf8 -Value (@'
+          ## Что скачать
+
+          - **LoL-Account-Manager-Setup-{VERSION}.exe** — установщик (рекомендуется). Ставит программу
+            для текущего пользователя без прав администратора, создаёт ярлыки на рабочем столе
+            и в меню «Пуск». Новую версию ставьте прямо поверх старой.
+          - **LoL-Account-Manager-Portable-{VERSION}.exe** — та же программа без установки: скачать и запустить.
+          - **SHA256SUMS.txt** — контрольные суммы файлов.
+
+          Аккаунты и настройки хранятся отдельно от программы (`%APPDATA%\lol-account-manager`,
+          логины и пароли — в диспетчере учётных данных Windows), поэтому обновление
+          и удаление программы их не трогают.
+
+          > Файлы не подписаны цифровой подписью, поэтому Windows может показать окно
+          > «Система Windows защитила ваш компьютер». Нажмите «Подробнее» → «Выполнить в любом случае».
+          '@).Replace('{VERSION}', $env:VERSION)
+
+          gh release view $env:TAG *> $null
+          if ($LASTEXITCODE -eq 0) {
+            # Релиз уже есть (например, запуск перезапустили) — просто заменяем в нём файлы.
+            gh release upload $env:TAG $files --clobber
+          } else {
+            gh release create $env:TAG $files --title "LoL Account Manager $env:TAG" --notes-file $notes --generate-notes
+          }
