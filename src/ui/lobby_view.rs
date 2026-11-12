@@ -1,6 +1,6 @@
 //! Вкладка «Лобби» в стиле терминала: ваша группа, команда в выборе чемпионов и в игре —
 //! таблицей с рангами. Щелчок по строке — профиль игрока на op.gg; клавиши `c` —
-//! скопировать ники, `o` — мультипоиск op.gg (те же кнопки внизу).
+//! скопировать ники, `o` — мультипоиск op.gg (они же — подсказки в нижней строке окна).
 
 use eframe::egui::{self, Align, Color32, CursorIcon, Layout, Rect, RichText, Sense, Stroke, pos2, vec2};
 
@@ -10,19 +10,8 @@ use crate::ui::terminal::{self, FONT, ROW_HEIGHT, job};
 use crate::ui::theme::{self, white};
 
 /// Ширины колонок: позиция, игрок, чемпион, solo/duo, flex; дальше — уровень.
-const COLUMNS: [f32; 5] = [56.0, 260.0, 150.0, 190.0, 190.0];
+const COLUMNS: [f32; 5] = [96.0, 260.0, 150.0, 190.0, 190.0];
 const HEADERS: [&str; 6] = ["поз", "игрок", "чемпион", "solo/duo", "flex", "ур."];
-
-/// Что нажали на вкладке.
-pub enum LobbyClick {
-    None,
-    /// «c скопировать ники».
-    CopyNames,
-    /// «o мультипоиск op.gg».
-    MultiSearch,
-    /// Щелчок по игроку — его профиль уже открыт в браузере.
-    OpenedProfile,
-}
 
 /// Все известные Riot ID игроков лобби.
 pub fn riot_ids(state: &LobbyState) -> Vec<RiotId> {
@@ -54,7 +43,8 @@ pub fn open_multisearch(ctx: &egui::Context, state: &LobbyState, region: Option<
 }
 
 /// Рисует вкладку. `region` — сервер клиента League (для ссылок на op.gg).
-pub fn show(ui: &mut egui::Ui, state: &LobbyState, region: Option<Region>) -> LobbyClick {
+/// Возвращает true, если щелчком по игроку открыли его профиль.
+pub fn show(ui: &mut egui::Ui, state: &LobbyState, region: Option<Region>) -> bool {
     let found = state.players.iter().filter(|p| p.riot_id.is_some()).count();
     header(ui, state, found);
     if let Some(problem) = &state.problem {
@@ -64,34 +54,9 @@ pub fn show(ui: &mut egui::Ui, state: &LobbyState, region: Option<Region>) -> Lo
 
     if state.players.is_empty() {
         empty_state(ui, state.phase);
-        return LobbyClick::None;
+        return false;
     }
-
-    let mut click = LobbyClick::None;
-    // Внизу — строка кнопок; таблица занимает остальное и прокручивается.
-    const BAR_HEIGHT: f32 = 30.0;
-    let table_height = (ui.available_height() - BAR_HEIGHT - 40.0).max(ROW_HEIGHT * 3.0);
-    if table(ui, state, region, table_height) {
-        click = LobbyClick::OpenedProfile;
-    }
-
-    ui.add_space((ui.available_height() - BAR_HEIGHT).max(10.0));
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 18.0;
-        if terminal::key_button(ui, "c", "скопировать ники", false)
-            .on_hover_text("Все Riot ID через запятую — например, для мультипоиска на другом сайте")
-            .clicked()
-        {
-            click = LobbyClick::CopyNames;
-        }
-        if terminal::key_button(ui, "o", "мультипоиск op.gg", true)
-            .on_hover_text("Открыть всех найденных игроков на op.gg в браузере")
-            .clicked()
-        {
-            click = LobbyClick::MultiSearch;
-        }
-    });
-    click
+    table(ui, state, region, (ui.available_height() - 30.0).max(ROW_HEIGHT * 3.0))
 }
 
 /// «лобби · выбор чемпионов    найдено 4/5» и строка пояснения под ним.

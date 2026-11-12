@@ -310,7 +310,7 @@ fn player_row(
     egui::Frame::new()
         .fill(fill)
         .stroke(Stroke::new(1.0, stroke))
-        .corner_radius(8)
+        .corner_radius(theme::RADIUS)
         .inner_margin(Margin::symmetric(10, 4))
         .outer_margin(Margin::symmetric(0, 2))
         .show(ui, |ui| {

@@ -195,7 +195,7 @@ impl Widget for IconButton {
             };
             let color = if enabled { color } else { color.gamma_multiply(0.35) };
             let painter = ui.painter();
-            painter.rect_filled(rect, 6, fill);
+            painter.rect_filled(rect, theme::RADIUS, fill);
             let icon_rect = Rect::from_center_size(rect.center(), Vec2::splat(14.0));
             paint_icon(painter, icon_rect, self.icon, color);
         }
@@ -207,7 +207,7 @@ impl Widget for IconButton {
     }
 }
 
-/// Плашка-переключатель (тег в форме): выбрана — синяя, нет — тёмная.
+/// Плашка-переключатель (тег в форме): выбрана — янтарная, нет — тёмная.
 pub fn toggle_chip(ui: &mut Ui, selected: &mut bool, text: &str) -> Response {
     let galley = text_galley(ui, RichText::new(text).size(11.5).medium());
     let size = vec2(galley.size().x + 22.0, 28.0);
@@ -224,7 +224,7 @@ pub fn toggle_chip(ui: &mut Ui, selected: &mut bool, text: &str) -> Response {
             (white(if hovered { 16 } else { 8 }), white(if hovered { 38 } else { 24 }), theme::TEXT_MUTED)
         };
         let painter = ui.painter();
-        painter.rect(rect, 6, fill, Stroke::new(1.0, stroke), StrokeKind::Inside);
+        painter.rect(rect, theme::RADIUS, fill, Stroke::new(1.0, stroke), StrokeKind::Inside);
         painter.galley(rect.center() - galley.size() / 2.0, galley, color);
     }
     response.on_hover_cursor(CursorIcon::PointingHand)
@@ -260,14 +260,14 @@ impl Tone {
     }
 }
 
-/// Маленькая скруглённая плашка: «v0.1.0», «3», «в клиенте», «4/5 найдено».
+/// Маленькая плашка: «v0.1.0», «3», «в клиенте», «4/5 найдено».
 pub fn pill(ui: &mut Ui, text: &str, tone: Tone) -> Response {
-    badge(ui, text, tone, 9)
+    badge(ui, text, tone, 2)
 }
 
-/// Плашка с почти прямыми углами: регион, теги аккаунта.
+/// Плашка с прямыми углами: регион, теги аккаунта.
 pub fn tag(ui: &mut Ui, text: &str, tone: Tone) -> Response {
-    badge(ui, text, tone, 4)
+    badge(ui, text, tone, 2)
 }
 
 fn badge(ui: &mut Ui, text: &str, tone: Tone, radius: u8) -> Response {
@@ -296,21 +296,13 @@ pub fn status_dot(ui: &mut Ui, color: Color32, glow: bool) -> Response {
     response
 }
 
-/// Квадратная подложка со значком (как у reveal на экранах «нет клиента», «пусто»).
+/// Квадратная подложка со значком (окно удаления, карточка «после игры»): тонкая рамка
+/// цвета тона, без свечения — как в терминале.
 pub fn icon_tile(ui: &mut Ui, icon: Icon, tone: Tone, size: f32) -> Response {
     let (fill, stroke, color) = tone.colors();
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
     let painter = ui.painter();
-    painter.add(
-        Shadow {
-            offset: [0, 0],
-            blur: 30,
-            spread: 0,
-            color: alpha(color, 30),
-        }
-        .as_shape(rect, 12),
-    );
-    painter.rect(rect, 12, fill, Stroke::new(1.0, stroke), StrokeKind::Inside);
+    painter.rect(rect, theme::RADIUS, fill, Stroke::new(1.0, stroke), StrokeKind::Inside);
     let icon_rect = Rect::from_center_size(rect.center(), Vec2::splat(size * 0.42));
     paint_icon(painter, icon_rect, icon, color);
     response
@@ -384,7 +376,7 @@ pub fn segmented<T: PartialEq + Clone>(
     let (outer, _) = ui.allocate_exact_size(vec2(total, height), Sense::hover());
 
     let painter = ui.painter();
-    painter.rect(outer, 8, white(6), Stroke::new(1.0, white(18)), StrokeKind::Inside);
+    painter.rect(outer, theme::RADIUS, white(6), Stroke::new(1.0, white(18)), StrokeKind::Inside);
 
     let mut changed = false;
     let mut x = outer.left() + PAD;
@@ -401,9 +393,15 @@ pub fn segmented<T: PartialEq + Clone>(
         let selected = *current == segment.value;
         let painter = ui.painter();
         if selected {
-            painter.rect_filled(rect, 6, white(26));
+            painter.rect_filled(rect, 2, white(20));
         }
-        let color = if selected || response.hovered() { theme::TEXT } else { theme::TEXT_MUTED };
+        let color = if selected {
+            theme::ACCENT_TEXT
+        } else if response.hovered() {
+            theme::TEXT
+        } else {
+            theme::TEXT_MUTED
+        };
 
         let content = label.size().x
             + count.as_ref().map_or(0.0, |c| c.size().x + 5.0)

@@ -118,7 +118,7 @@ impl PostGame {
                 egui::Frame::new()
                     .fill(Color32::from_rgba_unmultiplied(0x0D, 0x13, 0x20, 250))
                     .stroke(Stroke::new(1.0, alpha(color, 90)))
-                    .corner_radius(12)
+                    .corner_radius(theme::RADIUS)
                     .inner_margin(Margin::same(14))
                     .shadow(Shadow {
                         offset: [0, 10],

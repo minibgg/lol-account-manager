@@ -18,7 +18,8 @@ use crate::ui::account_list::STANDARD_TAGS;
 use crate::ui::theme::{self, Weight};
 use crate::ui::widgets::{self, Button};
 
-const FORM_WIDTH: f32 = 420.0;
+/// Две колонки: слева — аккаунт, справа — данные для входа.
+const FORM_WIDTH: f32 = 760.0;
 /// Отступ между полями формы.
 const FIELD_GAP: f32 = 10.0;
 
@@ -141,12 +142,14 @@ impl AccountForm {
 
         let mut enter_pressed = false;
         // Пока ждём ответа, поля заблокированы: add_enabled_ui выключает всё внутри.
+        // Две колонки — так форма помещается и в невысокое окно.
         ui.add_enabled_ui(!self.busy, |ui| {
-            enter_pressed |= self.account_fields(ui, client);
-            ui.add_space(14.0);
-            ui.separator();
-            ui.add_space(10.0);
-            enter_pressed |= self.credential_fields(ui);
+            ui.columns(2, |columns| {
+                columns[0].spacing_mut().item_spacing.y = 4.0;
+                columns[1].spacing_mut().item_spacing.y = 4.0;
+                enter_pressed |= self.account_fields(&mut columns[0], client);
+                enter_pressed |= self.credential_fields(&mut columns[1]);
+            });
         });
 
         if let Some(error) = &self.error {
@@ -258,7 +261,7 @@ impl AccountForm {
             egui::Label::new(
                 RichText::new(
                     "Необязательно. Хранятся только в системном хранилище паролей Windows, \
-                     не в файлах приложения. На строке аккаунта появятся кнопки «Войти» и копирования.",
+                     не в файлах приложения. С ними заработают Enter (войти), l и p (копирование).",
                 )
                 .size(11.5)
                 .color(theme::TEXT_MUTED),

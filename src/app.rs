@@ -35,7 +35,6 @@ use crate::ui::command::{self, Invocation, Suggestion, Target};
 use crate::ui::games_view::{GamesAction, GamesView};
 use crate::ui::keymap::{self, Action, Screen};
 use crate::ui::terminal::{self, CommandEvent, CommandLine, Hint};
-use crate::ui::lobby_view::LobbyClick;
 use crate::ui::{lobby_view, window_frame};
 
 /// Сколько сообщение видно в нижней строке.
@@ -156,6 +155,9 @@ pub struct App {
     help_open: bool,
     /// Окно «Все игры» (архив игр аккаунта, клавиша m).
     games_view: Option<GamesView>,
+    /// Только для отладки (LOLAM_DEBUG_PAGE=lobby-demo): лобби из тестовых аккаунтов,
+    /// клиент League его не перезаписывает.
+    debug_lobby: bool,
 }
 
 impl App {
@@ -223,6 +225,7 @@ impl App {
             command: None,
             help_open: false,
             games_view: None,
+            debug_lobby: false,
         }
     }
 
@@ -249,7 +252,8 @@ impl App {
                 }
             }
             Event::LcuStatus(status) => self.lcu = status,
-            Event::Lobby(state) => self.lobby = state,
+            Event::Lobby(state) if !self.debug_lobby => self.lobby = state,
+            Event::Lobby(_) => {}
 
             Event::AccountAdded {
                 account,
@@ -588,6 +592,11 @@ impl App {
                 }
             }
             "help" => self.help_open = true,
+            "lobby-demo" => {
+                self.page = Page::Lobby;
+                self.debug_lobby = true;
+                self.lobby = debug_lobby(&self.accounts);
+            }
             "games" => {
                 if let Some(account) = self.accounts.iter().find(|a| a.archived_games > 0) {
                     self.games_view = Some(GamesView::new(account.id, account.riot_id.clone()));
@@ -1399,11 +1408,12 @@ impl App {
     fn settings_page(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             ui.set_max_width(760.0);
-            ui.label(RichText::new("Настройки").size(15.0).semibold().color(theme::TEXT));
+            // Заголовок — как строка над таблицей аккаунтов.
+            ui.label(RichText::new("настройки").font(theme::mono(12.5)).color(theme::TEXT));
             ui.label(
-                RichText::new("Всё секретное хранится только в системном хранилище паролей Windows")
-                    .size(11.5)
-                    .color(theme::TEXT_MUTED),
+                RichText::new("всё секретное хранится только в системном хранилище паролей Windows")
+                    .font(theme::mono(11.5))
+                    .color(theme::TEXT_HINT),
             );
             ui.add_space(12.0);
             theme::panel().inner_margin(Margin::same(16)).show(ui, |ui| {
@@ -1678,6 +1688,45 @@ fn result_line<T: AsRef<str>>(ui: &mut egui::Ui, result: Option<&Result<T, AppEr
     }
 }
 
+/// Только для отладки: «выбор чемпионов» из тестовых аккаунтов (первый — вы) и одного
+/// скрытого игрока — чтобы проверить вкладку «Лобби» по скриншоту без настоящей игры.
+fn debug_lobby(accounts: &[Account]) -> LobbyState {
+    use crate::lobby::{LobbyPlayer, PlayerProfile, Position};
+    let positions = [Position::Top, Position::Jungle, Position::Middle, Position::Bottom];
+    let mut players: Vec<LobbyPlayer> = accounts
+        .iter()
+        .take(4)
+        .enumerate()
+        .map(|(index, account)| LobbyPlayer {
+            puuid: format!("demo-{index}"),
+            riot_id: Some(account.riot_id.clone()),
+            is_self: index == 0,
+            cell_id: Some(index as i64),
+            position: positions.get(index).copied(),
+            champion: account
+                .cache
+                .as_ref()
+                .and_then(|c| c.matches.as_ref()?.first())
+                .map(|g| g.me.champion.clone()),
+            profile: account.cache.as_ref().map(|c| PlayerProfile {
+                profile_icon_id: c.profile_icon_id,
+                summoner_level: c.summoner_level,
+                ranked: c.ranked.clone(),
+            }),
+        })
+        .collect();
+    players.push(LobbyPlayer {
+        cell_id: Some(4),
+        position: Some(Position::Utility),
+        ..LobbyPlayer::default()
+    });
+    LobbyState {
+        phase: LobbyPhase::ChampSelect,
+        players,
+        problem: None,
+    }
+}
+
 /// «сессия 3W 2L +17 LP» в шапке; подробности — при наведении.
 fn session_label(ui: &mut egui::Ui, session: &Session) {
     let font = theme::mono(12.0);
@@ -1863,12 +1912,11 @@ impl eframe::App for App {
             }))
             .show(ui, |ui| match self.page {
                 Page::Accounts => actions.extend(self.accounts_page(ui)),
-                Page::Lobby => match lobby_view::show(ui, &self.lobby, self.client_region()) {
-                    LobbyClick::None => {}
-                    LobbyClick::CopyNames => actions.push(Invocation::new(Action::CopyRiotId)),
-                    LobbyClick::MultiSearch => actions.push(Invocation::new(Action::OpGg)),
-                    LobbyClick::OpenedProfile => self.notify("Профиль открыт в браузере"),
-                },
+                Page::Lobby => {
+                    if lobby_view::show(ui, &self.lobby, self.client_region()) {
+                        self.notify("Профиль открыт в браузере");
+                    }
+                }
                 Page::Settings => self.settings_page(ui, frame),
             });
         if !actions.is_empty() {

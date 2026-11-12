@@ -78,12 +78,13 @@ pub fn apply(ctx: &egui::Context) {
     // Так egui сам решает, когда и как безопасно менять общий стиль.
     ctx.style_mut_of(Theme::Dark, |style| {
         style.visuals = visuals();
+        // Моноширинный шрифт шире обычного — размеры чуть меньше, чем были у Inter.
         style.text_styles = [
             (TextStyle::Small, FontId::proportional(11.0)),
-            (TextStyle::Body, FontId::proportional(13.0)),
-            (TextStyle::Button, FontId::proportional(13.0)),
-            (TextStyle::Heading, FontId::proportional(16.0)),
-            (TextStyle::Monospace, FontId::monospace(12.0)),
+            (TextStyle::Body, FontId::proportional(12.5)),
+            (TextStyle::Button, FontId::proportional(12.5)),
+            (TextStyle::Heading, FontId::proportional(15.0)),
+            (TextStyle::Monospace, FontId::monospace(12.5)),
         ]
         .into();
         let spacing = &mut style.spacing;
@@ -99,32 +100,28 @@ pub fn apply(ctx: &egui::Context) {
     });
 }
 
-/// Шрифт Inter (как в reveal) — вшит в программу, лицензия OFL: assets/fonts/Inter-OFL.txt.
-/// Это «вариативный» шрифт: одна и та же буква бывает разной толщины (ось `wght`),
+/// Шрифты вшиты в программу (лицензия OFL, файлы в assets/fonts):
+/// - JetBrains Mono — основной везде, как в терминале: кириллица, символы рамок (█ ░ ›);
+/// - Inter — запасной: символы, которых нет в JetBrains Mono, egui ищет дальше по списку.
+///
+/// Оба «вариативные»: одна и та же буква бывает разной толщины (ось `wght`),
 /// толщину выбирает `RichText::variation` — см. [`Weight`].
 fn install_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
     fonts.font_data.insert(
-        "Inter".to_owned(),
-        Arc::new(FontData::from_static(include_bytes!("../../assets/fonts/Inter.ttf"))),
-    );
-    // Inter — первый; символов, которых в нём нет, egui поищет в стандартных шрифтах.
-    fonts
-        .families
-        .entry(FontFamily::Proportional)
-        .or_default()
-        .insert(0, "Inter".to_owned());
-    // JetBrains Mono (тоже OFL: assets/fonts/JetBrainsMono-OFL.txt) — моноширинный
-    // с кириллицей и символами рамок (█ ░ ›), вариативный по толщине.
-    fonts.font_data.insert(
         "JetBrainsMono".to_owned(),
         Arc::new(FontData::from_static(include_bytes!("../../assets/fonts/JetBrainsMono.ttf"))),
     );
-    fonts
-        .families
-        .entry(FontFamily::Monospace)
-        .or_default()
-        .insert(0, "JetBrainsMono".to_owned());
+    fonts.font_data.insert(
+        "Inter".to_owned(),
+        Arc::new(FontData::from_static(include_bytes!("../../assets/fonts/Inter.ttf"))),
+    );
+    // В обоих семействах первым — JetBrains Mono, за ним Inter, потом стандартные шрифты egui.
+    for family in [FontFamily::Proportional, FontFamily::Monospace] {
+        let list = fonts.families.entry(family).or_default();
+        list.insert(0, "Inter".to_owned());
+        list.insert(0, "JetBrainsMono".to_owned());
+    }
     ctx.set_fonts(fonts);
 }
 
@@ -146,13 +143,10 @@ impl Weight for RichText {
     }
 }
 
-/// Подпись над полем или блоком: «SOLO/DUO», «ПАПКА ИГРЫ» — мелко, заглавными, с разрядкой.
+/// Подпись над полем или блоком в стиле терминала: «solo/duo», «папка игры» — строчными,
+/// приглушённо, как подписи колонок таблицы.
 pub fn caps(text: &str) -> RichText {
-    RichText::new(text.to_uppercase())
-        .size(10.0)
-        .medium()
-        .extra_letter_spacing(1.0)
-        .color(TEXT_MUTED)
+    RichText::new(text.to_lowercase()).size(11.5).color(TEXT_HINT)
 }
 
 /// Панель: тёмная подложка, тонкая рамка, почти прямые углы — как окно терминала.

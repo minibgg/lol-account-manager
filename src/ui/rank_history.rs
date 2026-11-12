@@ -463,7 +463,7 @@ fn stat_tiles(ui: &mut egui::Ui, history: &[RankPoint], queue: Queue, since: i64
             egui::Frame::new()
                 .fill(white(5))
                 .stroke(Stroke::new(1.0, white(14)))
-                .corner_radius(8)
+                .corner_radius(theme::RADIUS)
                 .inner_margin(Margin::symmetric(12, 9))
                 .show(ui, |ui| {
                     // Внутри `horizontal` рамка тоже раскладывает в строку — нужен столбец.
