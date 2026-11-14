@@ -12,7 +12,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::error::AppError;
-use crate::lcu::models::{ChatParticipant, LcuChampSelectSession};
+use crate::lcu::models::{ChatParticipant, LcuChampSelectSession, LcuGameflowSession};
 use crate::riot::{RankedQueues, Region, RiotId};
 
 /// Этап, на котором сейчас игрок.
@@ -134,6 +134,68 @@ impl LobbyPlayer {
     }
 }
 
+/// Игра, которая идёт прямо сейчас («в игре · экко · 12 мин»).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LiveGame {
+    /// Номер игры (как в «RU_573082534» после подчёркивания).
+    pub game_id: i64,
+    pub queue_id: i32,
+    pub champion_id: i32,
+    /// Название чемпиона; пустое — неизвестно.
+    pub champion: String,
+    /// «top» … «utility»; пусто — неизвестна или в режиме нет позиций.
+    pub position: String,
+    /// Когда началась (unix-время). Для игры из клиента — когда мы её впервые увидели.
+    pub started_at: i64,
+}
+
+impl LiveGame {
+    /// Игра аккаунта `my_puuid` из ответа клиента League.
+    pub fn from_session(
+        session: &LcuGameflowSession,
+        my_puuid: &str,
+        champions: &HashMap<i32, String>,
+        now: i64,
+    ) -> Option<Self> {
+        let data = &session.game_data;
+        if data.game_id <= 0 {
+            return None;
+        }
+        let champion_id = data
+            .player_champion_selections
+            .iter()
+            .find(|s| s.puuid == my_puuid)
+            .map_or(0, |s| s.champion_id);
+        let position = data
+            .team_one
+            .iter()
+            .chain(&data.team_two)
+            .find(|m| m.puuid == my_puuid)
+            .map(|m| m.selected_position.to_lowercase())
+            // «none» и всё незнакомое — позиции нет.
+            .filter(|p| Position::from_lcu(p).is_some())
+            .unwrap_or_default();
+        Some(Self {
+            game_id: data.game_id,
+            queue_id: data.queue.id,
+            champion_id,
+            champion: champions.get(&champion_id).cloned().unwrap_or_default(),
+            position,
+            started_at: now,
+        })
+    }
+
+    /// «в игре · экко · 12 мин».
+    pub fn label(&self, now: i64) -> String {
+        let mut text = "в игре".to_string();
+        if !self.champion.is_empty() {
+            text.push_str(&format!(" · {}", self.champion.to_lowercase()));
+        }
+        text.push_str(&format!(" · {} мин", (now - self.started_at).max(0) / 60));
+        text
+    }
+}
+
 /// Что показывает вкладка «Лобби».
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct LobbyState {
@@ -141,6 +203,8 @@ pub struct LobbyState {
     pub players: Vec<LobbyPlayer>,
     /// Почему имён может не хватать (чат ещё не подключился и т.п.).
     pub problem: Option<AppError>,
+    /// Игра, которая сейчас идёт у аккаунта из клиента.
+    pub game: Option<LiveGame>,
 }
 
 /// Riot ID из имени и тега, если оба есть.

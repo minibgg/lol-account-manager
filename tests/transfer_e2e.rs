@@ -41,6 +41,8 @@ fn start(dir: &std::path::Path, db: &str, secrets: &Secrets) -> Backend {
         open_storage: Box::new(move || Storage::open(&db_path, secrets)),
         clipboard_clear_after: Duration::from_secs(30),
         image_cache_dir: dir.join("images"),
+        update_dir: dir.join("updates"),
+        auto_update_check: false,
     };
     Backend::start_with(egui::Context::default(), config)
 }

@@ -18,7 +18,7 @@ use serde::de::DeserializeOwned;
 use tracing::{debug, warn};
 
 use super::models::{
-    API_NEW_MATCHES_PER_REFRESH, AccountDto, AccountSnapshot, DataSource, FETCH_MATCHES, LeagueEntryDto,
+    API_NEW_MATCHES_PER_REFRESH, AccountDto, AccountSnapshot, CurrentGameDto, DataSource, FETCH_MATCHES, LeagueEntryDto,
     MatchDetails, MatchDto, MatchSummary, RankedQueues, SummonerDto,
 };
 use super::routing::{Region, RiotId};
@@ -227,6 +227,12 @@ impl RiotClient {
         self.get_json(region.platform(), &path)
             .await?
             .ok_or(AppError::SummonerNotFound(region.label()))
+    }
+
+    /// spectator-v5: игра, которая идёт у игрока прямо сейчас (`None` — не в игре).
+    pub async fn active_game(&self, puuid: &str, region: Region) -> AppResult<Option<CurrentGameDto>> {
+        let path = format!("/lol/spectator/v5/active-games/by-summoner/{}", encode_segment(puuid));
+        self.get_json(region.platform(), &path).await
     }
 
     /// league-v4: ранги Solo/Duo и Flex. Пустой список = без ранга.

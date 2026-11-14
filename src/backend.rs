@@ -12,6 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -24,20 +25,23 @@ use tracing::{debug, error, info, warn};
 
 use crate::clipboard::{self, SecretClipboard};
 use crate::error::{AppError, AppResult};
+use crate::hello;
 use crate::history::Queue;
 use crate::images::{self, ImageCache};
 use crate::launcher;
 use crate::lcu::models::ChatParticipant;
 use crate::lcu::riot_client::{self, RiotClientAuth};
 use crate::lcu::{LcuClient, LcuStatus, lockfile};
-use crate::lobby::{self, LobbyPhase, LobbyPlayer, LobbyState, PlayerProfile};
+use crate::lobby::{self, LiveGame, LobbyPhase, LobbyPlayer, LobbyState, PlayerProfile};
 use crate::messages::{Command, CredentialKind, Event, ImportReport, LeagueDirInfo, Secret};
 use crate::riot::{
-    AccountSnapshot, ApiKey, DataSource, MatchDetails, MatchSummary, PlayerStats, RankedQueues, Region, RiotClient,
+    AccountSnapshot, ApiKey, DataSource, Inventory, MatchDetails, MatchSummary, PlayerStats, RankedQueues, Region, RiotClient,
     RiotId,
 };
 use crate::storage::{Account, AccountId, AccountInput, Credentials, SecretChange, Storage, unix_now};
 use crate::transfer;
+use crate::update::{self, UpdateInfo, Updater, Version};
+use crate::vault;
 
 /// Сколько аккаунтов обновляются одновременно. Остальные ждут в очереди:
 /// так карточки обновляются по одной сверху вниз, а не все разом в самом конце.
@@ -52,6 +56,11 @@ const LCU_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
 /// Как часто смотреть, что с лобби (выбор чемпионов идёт быстро — чаще, чем LCU_POLL_INTERVAL).
 const LOBBY_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Как часто спрашиваем Riot API, не в игре ли остальные аккаунты (по запросу на аккаунт).
+const LIVE_POLL_INTERVAL: Duration = Duration::from_secs(150);
+/// Первый такой опрос — вскоре после запуска.
+const LIVE_FIRST_POLL: Duration = Duration::from_secs(20);
 
 /// Сколько последних игр архива сверять с ответом Riot API (чтобы не загружать их снова).
 const KNOWN_MATCHES: usize = 100;
@@ -70,6 +79,22 @@ const AFTER_GAME_RETRIES: [Duration; 3] = [
 /// Настройка (в SQLite) с папкой игры, если она не находится сама.
 pub const LEAGUE_DIR_SETTING: &str = "league_dir";
 
+/// Настройка «проверять обновления при запуске»: «0» — выключено, иначе включено.
+pub const UPDATE_CHECK_SETTING: &str = "update_check";
+
+/// Ключ настройки «спрашивать Windows Hello перед копированием пароля» («1» — да).
+pub const HELLO_LOCK_SETTING: &str = "hello_lock";
+/// После успешной проверки Windows Hello столько времени не спрашиваем снова:
+/// «Войти» и следом «Пароль» — одно действие, а не два.
+const HELLO_GRACE: Duration = Duration::from_secs(120);
+
+/// Первая проверка обновлений — чуть погодя после запуска, чтобы не мешать загрузке списка.
+const UPDATE_FIRST_CHECK: Duration = Duration::from_secs(8);
+/// Приложение может работать сутками — проверяем ещё и раз в 6 часов.
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+/// Как часто сообщать окну о ходе скачивания.
+const UPDATE_PROGRESS_STEP: Duration = Duration::from_millis(100);
+
 /// Сколько окно ждёт фоновый поток при выходе.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(3);
 
@@ -83,6 +108,11 @@ pub struct BackendConfig {
     pub clipboard_clear_after: Duration,
     /// Куда складывать скачанные иконки и эмблемы.
     pub image_cache_dir: PathBuf,
+    /// Куда скачивать установщик новой версии.
+    pub update_dir: PathBuf,
+    /// Самим проверять обновления (при запуске и раз в 6 часов). В тестах выключено:
+    /// им незачем ходить в сеть.
+    pub auto_update_check: bool,
 }
 
 impl Default for BackendConfig {
@@ -91,6 +121,8 @@ impl Default for BackendConfig {
             open_storage: Box::new(Storage::open_default),
             clipboard_clear_after: clipboard::CLEAR_AFTER,
             image_cache_dir: images::default_cache_dir(),
+            update_dir: update::default_dir(),
+            auto_update_check: true,
         }
     }
 }
@@ -281,6 +313,18 @@ struct Worker {
     /// Семафор — «N пропусков»: задача берёт пропуск перед обновлением и
     /// возвращает после. Когда пропуска кончились, следующие ждут.
     refresh_slots: Arc<Semaphore>,
+    /// Позиции в недавних играх аккаунта из клиента (номер игры → «middle»): клиент
+    /// знает их во время игры, а в истории игр потом часто отдаёт пустыми.
+    positions: Arc<Mutex<HashMap<i64, String>>>,
+    /// Включена ли проверка Windows Hello перед копированием пароля.
+    hello_lock: Arc<AtomicBool>,
+    /// До какого момента действует последняя успешная проверка Windows Hello.
+    hello_ok_until: Arc<Mutex<Option<Instant>>>,
+    /// Проверка и скачивание новой версии приложения.
+    updater: Updater,
+    /// Установщик уже скачивается. `AtomicBool` — флажок, который можно менять из
+    /// разных потоков без Mutex.
+    update_running: Arc<AtomicBool>,
 }
 
 impl Worker {
@@ -294,13 +338,17 @@ impl Worker {
             open_storage,
             clipboard_clear_after,
             image_cache_dir,
+            update_dir,
+            auto_update_check,
         } = config;
         // Открыть базу и найти папку клиента League (папка из настроек + стандартные
         // места) — всё это блокирующие операции с диском, поэтому в `blocking`.
-        let (storage, (league_dir, dirs)) = blocking(move || {
+        let (storage, (league_dir, dirs), update_check, hello_lock) = blocking(move || {
             let storage = open_storage()?;
             let custom = storage.setting(LEAGUE_DIR_SETTING)?;
-            Ok((storage, league_dirs(custom)))
+            let update_check = update_check_enabled(storage.setting(UPDATE_CHECK_SETTING)?);
+            let hello_lock = storage.setting(HELLO_LOCK_SETTING)?.as_deref() == Some("1");
+            Ok((storage, league_dirs(custom), update_check, hello_lock))
         })
         .await?;
         debug!(?dirs, "где искать клиент League");
@@ -324,6 +372,11 @@ impl Worker {
             clipboard_clear_after,
             refreshing: Arc::default(),
             refresh_slots: Arc::new(Semaphore::new(PARALLEL_REFRESHES)),
+            positions: Arc::default(),
+            hello_lock: Arc::new(AtomicBool::new(hello_lock)),
+            hello_ok_until: Arc::default(),
+            updater: Updater::new(update_dir)?,
+            update_running: Arc::default(),
         };
 
         // Хранилище паролей может быть недоступно (например, на Linux не запущен
@@ -344,13 +397,173 @@ impl Worker {
         worker.events.send(Event::Ready {
             has_api_key,
             league_dir,
+            update_check,
+            hello_lock,
         });
         worker.reload_accounts().await;
 
         // Отдельные задачи следят за клиентом League и за лобби всё время работы программы.
         tokio::spawn(worker.clone().watch_lcu());
         tokio::spawn(worker.clone().watch_lobby());
+        tokio::spawn(worker.clone().watch_live_games());
+        if auto_update_check {
+            tokio::spawn(worker.clone().watch_updates());
+        }
         Ok(worker)
+    }
+
+    // ----- Обновление приложения --------------------------------------------
+
+    /// Проверяет обновления вскоре после запуска и потом раз в 6 часов —
+    /// если это не выключено в настройках.
+    async fn watch_updates(self) {
+        // Установщик от прошлого обновления больше не нужен.
+        self.updater.clean().await;
+        tokio::time::sleep(UPDATE_FIRST_CHECK).await;
+        loop {
+            let setting = self.with_storage(|s| s.setting(UPDATE_CHECK_SETTING)).await;
+            if update_check_enabled(setting.ok().flatten()) {
+                self.check_update(false).await;
+            }
+            tokio::time::sleep(UPDATE_CHECK_INTERVAL).await;
+        }
+    }
+
+    /// `manual` — проверку попросил пользователь. Фоновая проверка об ошибках молчит:
+    /// нет интернета — значит, проверим в следующий раз.
+    async fn check_update(&self, manual: bool) {
+        match self.updater.check(Version::current()).await {
+            Err(error) if !manual => debug!(%error, "не удалось проверить обновления"),
+            result => self.events.send(Event::UpdateChecked { result, manual }),
+        }
+    }
+
+    async fn install_update(&self, info: UpdateInfo) {
+        // swap записывает true и возвращает прежнее значение: если там уже было true,
+        // установщик уже скачивается (кнопку нажали дважды).
+        if self.update_running.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let result = self.download_and_launch(&info).await;
+        self.update_running.store(false, Ordering::SeqCst);
+        match result {
+            Ok(()) => {
+                info!(version = %info.version, "установщик запущен — закрываюсь");
+                self.events.send(Event::UpdateInstalling);
+            }
+            Err(error) => {
+                warn!(%error, "обновление не установлено");
+                self.events.send(Event::UpdateFailed(error));
+            }
+        }
+    }
+
+    async fn download_and_launch(&self, info: &UpdateInfo) -> AppResult<()> {
+        let installer = info
+            .installer
+            .as_ref()
+            .ok_or_else(|| AppError::UpdateRejected("в выпуске нет установщика".into()))?;
+        if !update::can_self_install() {
+            return Err(AppError::UpdateRejected(
+                "эта копия программы запущена не из папки установки".into(),
+            ));
+        }
+        let events = self.events.clone();
+        let mut last_report: Option<Instant> = None;
+        let path = self
+            .updater
+            .download(installer, move |received, total| {
+                // Куски приходят сотнями в секунду — окну хватит десяти сообщений.
+                let due = last_report.is_none_or(|at| at.elapsed() >= UPDATE_PROGRESS_STEP);
+                if due || received == total {
+                    last_report = Some(Instant::now());
+                    events.send(Event::UpdateProgress { received, total });
+                }
+            })
+            .await?;
+        blocking(move || update::launch_installer(&path)).await
+    }
+
+    async fn set_update_check(&self, enabled: bool) {
+        let saved = self
+            .with_storage(move |s| s.set_setting(UPDATE_CHECK_SETTING, if enabled { "1" } else { "0" }))
+            .await;
+        if let Err(error) = saved {
+            self.events.send(Event::Warning(error));
+        }
+    }
+
+    // ----- Инвентарь --------------------------------------------------------
+
+    /// Инвентарь аккаунта. Клиент League отдаёт его только для аккаунта, в который
+    /// выполнен вход: тогда берём свежий и запоминаем в базе (в настройках, по ключу
+    /// `inventory_<id>` — там только числа, ничего секретного). Для остальных аккаунтов
+    /// — то, что запомнили в прошлый раз.
+    async fn inventory(&self, id: AccountId) -> Option<Inventory> {
+        let key = format!("inventory_{id}");
+        let account = self.with_storage(move |s| s.get_account(id)).await.ok()?;
+        let in_client = match self.lcu.status().await {
+            LcuStatus::Connected { region, riot_id, puuid } => is_same_account(&account, region, &riot_id, &puuid),
+            _ => false,
+        };
+        if in_client {
+            match self.lcu.inventory(unix_now()).await {
+                Ok(inventory) => {
+                    if let Ok(json) = serde_json::to_string(&inventory) {
+                        let key = key.clone();
+                        let _ = self.with_storage(move |s| s.set_setting(&key, &json)).await;
+                    }
+                    return Some(inventory);
+                }
+                Err(error) => debug!(%error, "инвентарь из клиента не загрузился"),
+            }
+        }
+        let saved = self.with_storage(move |s| s.setting(&key)).await.ok()??;
+        serde_json::from_str(&saved).ok()
+    }
+
+    // ----- Windows Hello ----------------------------------------------------
+
+    /// Показывает окно Windows Hello и ждёт ответа (в блокирующем потоке).
+    async fn ask_hello(&self, reason: &'static str) -> AppResult<()> {
+        blocking(move || hello::verify(reason)).await?;
+        let mut until = self.hello_ok_until.lock().unwrap_or_else(PoisonError::into_inner);
+        *until = Some(Instant::now() + HELLO_GRACE);
+        Ok(())
+    }
+
+    /// Перед действием с паролями: если защита включена и недавней проверки нет —
+    /// спрашиваем Windows Hello. Ошибка — человек не подтвердил, действие отменяется.
+    async fn confirm_user(&self, reason: &'static str) -> AppResult<()> {
+        if !self.hello_lock.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let recently = self
+            .hello_ok_until
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some_and(|until| Instant::now() < until);
+        if recently {
+            return Ok(());
+        }
+        self.ask_hello(reason).await
+    }
+
+    /// Включает или выключает защиту. В обоих случаях сначала проверка Windows Hello:
+    /// включение доказывает, что она на этом компьютере работает (иначе пароли стало бы
+    /// не скопировать), а выключить защиту без проверки не должен мочь посторонний.
+    async fn set_hello_lock(&self, enabled: bool) -> AppResult<bool> {
+        self.ask_hello(if enabled {
+            "LoL Account Manager: включить проверку перед копированием пароля"
+        } else {
+            "LoL Account Manager: выключить проверку перед копированием пароля"
+        })
+        .await?;
+        self.with_storage(move |s| s.set_setting(HELLO_LOCK_SETTING, if enabled { "1" } else { "0" }))
+            .await?;
+        self.hello_lock.store(enabled, Ordering::SeqCst);
+        info!(enabled, "проверка Windows Hello перед копированием пароля");
+        Ok(enabled)
     }
 
     /// Раз в 2 секунды смотрит, что с лобби, и сообщает окну, если что-то изменилось.
@@ -376,6 +589,76 @@ impl Worker {
         }
     }
 
+    /// Раз в несколько минут спрашивает Riot API, не идёт ли игра у аккаунтов списка
+    /// (кроме того, что в клиенте: про него всё знает сам клиент). Нужен API-ключ.
+    async fn watch_live_games(self) {
+        let mut last: Vec<(AccountId, LiveGame)> = Vec::new();
+        tokio::time::sleep(LIVE_FIRST_POLL).await;
+        loop {
+            let now = self.live_games().await;
+            if now != last {
+                self.events.send(Event::LiveGames(now.clone()));
+                last = now;
+            }
+            tokio::time::sleep(LIVE_POLL_INTERVAL).await;
+        }
+    }
+
+    async fn live_games(&self) -> Vec<(AccountId, LiveGame)> {
+        if !self.riot.has_api_key() {
+            return Vec::new();
+        }
+        let Ok(accounts) = self.with_storage(|s| s.list_accounts()).await else {
+            return Vec::new();
+        };
+        let client = match self.lcu.status().await {
+            LcuStatus::Connected { region, riot_id, puuid } => Some((region, riot_id, puuid)),
+            _ => None,
+        };
+        let mut live = Vec::new();
+        for account in &accounts {
+            // Нужен PUUID Riot API: он появляется после первого обновления через API.
+            let Some(puuid) = &account.puuid else {
+                continue;
+            };
+            if client.as_ref().is_some_and(|(region, riot_id, lcu_puuid)| is_same_account(account, *region, riot_id, lcu_puuid)) {
+                continue;
+            }
+            match self.riot.active_game(puuid, account.region).await {
+                Ok(Some(game)) => {
+                    let champion_id = game
+                        .participants
+                        .iter()
+                        .find(|p| p.puuid.as_deref() == Some(puuid.as_str()))
+                        .map_or(0, |p| p.champion_id);
+                    let champion = match self.images.champion_names().await {
+                        Ok(names) => names.get(&champion_id).cloned().unwrap_or_default(),
+                        Err(_) => String::new(),
+                    };
+                    live.push((
+                        account.id,
+                        LiveGame {
+                            game_id: game.game_id,
+                            queue_id: game.game_queue_config_id,
+                            champion_id,
+                            champion,
+                            position: String::new(),
+                            // Пока идёт загрузка, времени начала ещё нет.
+                            started_at: if game.game_start_time > 0 { game.game_start_time / 1000 } else { unix_now() },
+                        },
+                    ));
+                }
+                Ok(None) => {}
+                // Ключ истёк, лимит, нет сети — просто не знаем; попробуем в следующий раз.
+                Err(error) => {
+                    debug!(id = account.id, %error, "не удалось узнать, идёт ли игра");
+                    break;
+                }
+            }
+        }
+        live
+    }
+
     async fn poll_lobby(&self, cache: &mut LobbyCache) -> LobbyState {
         let raw_phase = match self.lcu.gameflow_phase().await {
             Ok(phase) => Some(phase),
@@ -393,6 +676,9 @@ impl Worker {
         }
         // map_or(по умолчанию, функция): пока клиент загружается — «ничего не происходит».
         let phase = raw_phase.as_deref().map_or(LobbyPhase::Idle, LobbyPhase::from_gameflow);
+        if !cache.game_running {
+            cache.live = None;
+        }
         if cache.my_puuid.is_none() && phase != LobbyPhase::Idle {
             cache.my_puuid = self.lcu.current_summoner().await.ok().map(|s| s.puuid);
         }
@@ -437,6 +723,23 @@ impl Worker {
             player.is_self |= cache.my_puuid.as_deref() == Some(player.puuid.as_str());
         }
         self.fill_profiles(&mut players, cache).await;
+        // Идёт игра — один раз узнаём у клиента, какая: чемпион, очередь, позиция.
+        if cache.game_running
+            && cache.live.is_none()
+            && let Some(my_puuid) = cache.my_puuid.clone()
+            && let Ok(Some(session)) = self.lcu.gameflow_session().await
+        {
+            if cache.champions.is_empty()
+                && let Ok(names) = self.lcu.champion_names().await
+            {
+                cache.champions = names;
+            }
+            cache.live = LiveGame::from_session(&session, &my_puuid, &cache.champions, unix_now());
+            if let Some(game) = cache.live.as_ref().filter(|g| !g.position.is_empty()) {
+                let mut positions = self.positions.lock().unwrap_or_else(PoisonError::into_inner);
+                positions.insert(game.game_id, game.position.clone());
+            }
+        }
         if phase == LobbyPhase::ChampSelect {
             cache.last_team = players.clone();
         }
@@ -444,6 +747,7 @@ impl Worker {
             phase,
             players,
             problem,
+            game: cache.live.clone(),
         }
     }
 
@@ -646,6 +950,11 @@ impl Worker {
                     worker.events.send(Event::Exported(result));
                 }
                 Command::ImportAccounts(path) => worker.import_accounts(path).await,
+                Command::ExportVault { path, password } => {
+                    let result = worker.export_vault(path, password).await;
+                    worker.events.send(Event::Exported(result));
+                }
+                Command::ImportVault { path, password } => worker.import_vault(path, password).await,
                 Command::LoadMatch { account, match_id } => {
                     let result = worker.load_match(account, &match_id).await;
                     if let Err(error) = &result {
@@ -656,6 +965,24 @@ impl Worker {
                 Command::LoadGames(account) => {
                     let result = worker.with_storage(move |s| s.archived_matches(account, None)).await;
                     worker.events.send(Event::GamesLoaded { account, result });
+                }
+                Command::LoadInventory(account) => {
+                    let inventory = worker.inventory(account).await;
+                    worker.events.send(Event::InventoryLoaded { account, inventory });
+                }
+                Command::LoadRanks { account, match_id, players } => {
+                    let result = worker.player_ranks(account, players).await;
+                    if let Err(error) = &result {
+                        debug!(%match_id, %error, "ранги игроков не загрузились");
+                    }
+                    worker.events.send(Event::RanksLoaded { match_id, result });
+                }
+                Command::CheckUpdate => worker.check_update(true).await,
+                Command::InstallUpdate(info) => worker.install_update(info).await,
+                Command::SetUpdateCheck(enabled) => worker.set_update_check(enabled).await,
+                Command::SetHelloLock(enabled) => {
+                    let result = worker.set_hello_lock(enabled).await;
+                    worker.events.send(Event::HelloLockSaved(result));
                 }
             }
         });
@@ -670,6 +997,70 @@ impl Worker {
         tokio::fs::write(&path, json).await?;
         info!(count = accounts.len(), "список аккаунтов экспортирован");
         Ok(accounts.len())
+    }
+
+    /// Полная копия: список с логинами и паролями → зашифрованный файл (см. vault.rs).
+    async fn export_vault(&self, path: PathBuf, password: Secret) -> AppResult<usize> {
+        vault::check_password(password.expose())?;
+        self.confirm_user("LoL Account Manager: сохранить копию с паролями").await?;
+        let text = self
+            .with_storage(move |s| {
+                let mut entries = Vec::new();
+                for account in s.list_accounts()? {
+                    let credentials = s.credentials(account.id)?;
+                    entries.push((account, credentials));
+                }
+                // Шифрование намеренно медленное (Argon2) — оно уже в блокирующем потоке.
+                let text = vault::seal(&entries, password.expose(), unix_now())?;
+                Ok((text, entries.len()))
+            })
+            .await?;
+        let (text, count) = text;
+        tokio::fs::write(&path, text).await?;
+        info!(count, "зашифрованная копия сохранена");
+        Ok(count)
+    }
+
+    /// Зашифрованная копия → новые аккаунты вместе с логинами и паролями. Аккаунты,
+    /// которые уже есть в списке, пропускаются целиком (их логины и пароли не трогаем).
+    async fn import_vault(&self, path: PathBuf, password: Secret) {
+        let result: AppResult<(ImportReport, Vec<AccountId>)> = async {
+            if tokio::fs::metadata(&path).await?.len() > transfer::MAX_IMPORT_BYTES {
+                return Err(AppError::ImportTooLarge);
+            }
+            let bytes = tokio::fs::read(&path).await?;
+            self.with_storage(move |s| {
+                let plan = vault::open(&bytes, password.expose())?;
+                let (mut added, mut duplicates) = (Vec::new(), 0);
+                for entry in plan.entries {
+                    match s.add_account(&entry.input, entry.credentials) {
+                        Ok(account) => added.push(account.id),
+                        Err(AppError::DuplicateAccount) => duplicates += 1,
+                        Err(e) => return Err(e),
+                    }
+                }
+                let report = ImportReport {
+                    added: added.len(),
+                    duplicates,
+                    invalid: plan.invalid,
+                };
+                Ok((report, added))
+            })
+            .await
+        }
+        .await;
+        // Что бы ни случилось — показываем то, что успело добавиться.
+        self.reload_accounts().await;
+        match result {
+            Ok((report, added)) => {
+                info!(?report, "аккаунты восстановлены из зашифрованной копии");
+                self.events.send(Event::Imported(Ok(report)));
+                if !added.is_empty() {
+                    self.refresh(added).await;
+                }
+            }
+            Err(error) => self.events.send(Event::Imported(Err(error))),
+        }
     }
 
     /// Файл → новые аккаунты (без логинов и паролей). Уже существующие пропускаются.
@@ -1015,6 +1406,14 @@ impl Worker {
                 Err(e) => debug!(error = %e, "поражения из Riot API не загрузились"),
             }
         }
+        // Позиции, которые мы запомнили во время игры (в истории игр клиент их часто не отдаёт).
+        let positions = self.positions.lock().unwrap_or_else(PoisonError::into_inner);
+        for game in snapshot.matches.iter_mut().flatten().filter(|g| g.me.position.is_empty()) {
+            if let Some(position) = MatchSummary::game_id(&game.id).and_then(|id| positions.get(&id)) {
+                game.me.position.clone_from(position);
+            }
+        }
+        drop(positions);
         Ok(snapshot)
     }
 
@@ -1128,6 +1527,52 @@ impl Worker {
         Ok(details)
     }
 
+    /// Нынешние ранги игроков (для окна «Подробности игры»). Клиент League отдаёт ранги
+    /// только игроков своего сервера; для остальных нужен API-ключ. Кого найти не
+    /// удалось (сменил ник, скрыт) — того просто нет в ответе.
+    async fn player_ranks(
+        &self,
+        account_id: AccountId,
+        players: Vec<RiotId>,
+    ) -> AppResult<Vec<(RiotId, RankedQueues)>> {
+        let region = self.with_storage(move |s| s.get_account(account_id)).await?.region;
+        let via_lcu = self.lcu.region().await.is_ok_and(|client| client == region);
+        let via_api = self.riot.has_api_key();
+        if !via_lcu && !via_api {
+            return Err(AppError::NoDataSource);
+        }
+        // JoinSet — набор задач, которые идут одновременно; ниже ждём их все.
+        let mut tasks = JoinSet::new();
+        for id in players {
+            let worker = self.clone();
+            tasks.spawn(async move {
+                let mut ranked = Err(AppError::NoDataSource);
+                if via_lcu {
+                    ranked = async {
+                        let summoner = worker.lcu.summoner_by_riot_id(&id).await?;
+                        worker.lcu.ranked_by_puuid(&summoner.puuid).await
+                    }
+                    .await;
+                }
+                if ranked.is_err() && via_api {
+                    ranked = async {
+                        let account = worker.riot.account_by_riot_id(&id, region).await?;
+                        worker.riot.ranked_by_puuid(&account.puuid, region).await
+                    }
+                    .await;
+                }
+                (id, ranked)
+            });
+        }
+        let mut found = Vec::new();
+        while let Some(joined) = tasks.join_next().await {
+            if let Ok((id, Ok(ranked))) = joined {
+                found.push((id, ranked));
+            }
+        }
+        Ok(found)
+    }
+
     async fn match_via_lcu(&self, account: &Account, match_id: &str) -> AppResult<MatchDetails> {
         let client_region = self.lcu.region().await?;
         if client_region != account.region {
@@ -1193,11 +1638,14 @@ impl Worker {
     }
 
     async fn try_copy(&self, id: AccountId, kind: CredentialKind) -> AppResult<u64> {
-        let credentials = self.with_storage(move |s| s.credentials(id)).await?;
-        // Забираем нужное поле во владение, второе уничтожится вместе с credentials.
+        if kind == CredentialKind::Password {
+            self.confirm_user("LoL Account Manager: скопировать пароль").await?;
+        }
+        let mut credentials = self.with_storage(move |s| s.credentials(id)).await?;
+        // Забираем нужное поле (take), второе затрётся в памяти вместе с credentials.
         let secret = match kind {
-            CredentialKind::Login => credentials.login,
-            CredentialKind::Password => credentials.password,
+            CredentialKind::Login => credentials.login.take(),
+            CredentialKind::Password => credentials.password.take(),
         }
         .ok_or(AppError::CredentialMissing(kind.label()))?;
         let clipboard = self.clipboard.clone();
@@ -1283,12 +1731,19 @@ struct LobbyCache {
     last_team: Vec<LobbyPlayer>,
     /// На прошлом опросе шла игра.
     game_running: bool,
+    /// Игра, которая сейчас идёт (узнаём один раз за игру).
+    live: Option<LiveGame>,
     /// Игра только что закончилась — пора обновить аккаунт (забирает `watch_lobby`).
     game_ended: bool,
 }
 
 /// Где искать клиент League с учётом папки из настроек, и где игра нашлась.
 /// Блокирующая функция (проверяет диск).
+/// Значение настройки «проверять обновления»: выключает только явный «0».
+fn update_check_enabled(setting: Option<String>) -> bool {
+    setting.as_deref() != Some("0")
+}
+
 fn league_dirs(custom: Option<String>) -> (LeagueDirInfo, Vec<PathBuf>) {
     let dirs = lockfile::candidate_dirs(custom.as_deref().map(Path::new));
     let found = lockfile::find_install_dir(&dirs);
@@ -1422,6 +1877,7 @@ mod tests {
             }),
             history: vec![],
             archived_games: 0,
+            ranked_games: vec![],
         }
     }
 

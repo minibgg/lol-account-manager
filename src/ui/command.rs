@@ -63,6 +63,8 @@ enum Arg {
     /// Аккаунт или «все».
     AccountOrAll,
     Tag,
+    /// Любой тег: существующий или новый (для «метка …»).
+    NewTag,
     Sort,
 }
 
@@ -75,14 +77,19 @@ enum Kind {
     Refresh,
     History,
     Games,
+    Profile,
     OpGg,
     Edit,
     Delete,
     Add,
     Tag,
+    Label,
     Sort,
     Go(Screen),
     Help,
+    Overview,
+    Update,
+    Quit,
 }
 
 struct Spec {
@@ -100,16 +107,21 @@ const COMMANDS: &[Spec] = &[
     Spec { kind: Kind::Refresh, names: &["обновить", "refresh", "update"], hint: "обновить ранги" },
     Spec { kind: Kind::History, names: &["история", "history"], hint: "история ранга" },
     Spec { kind: Kind::Games, names: &["игры", "games", "матчи"], hint: "все игры аккаунта (архив)" },
+    Spec { kind: Kind::Profile, names: &["профиль", "profile", "стата"], hint: "статистика по архиву игр" },
     Spec { kind: Kind::OpGg, names: &["opgg", "опгг"], hint: "профиль на op.gg" },
     Spec { kind: Kind::Edit, names: &["изменить", "edit"], hint: "изменить аккаунт" },
     Spec { kind: Kind::Delete, names: &["удалить", "delete"], hint: "удалить аккаунт" },
     Spec { kind: Kind::Add, names: &["добавить", "add", "new"], hint: "новый аккаунт" },
     Spec { kind: Kind::Tag, names: &["тег", "tag"], hint: "показать только аккаунты с тегом" },
+    Spec { kind: Kind::Label, names: &["метка", "label"], hint: "добавить или убрать тег у отмеченных аккаунтов" },
     Spec { kind: Kind::Sort, names: &["сортировка", "sort"], hint: "порядок списка" },
     Spec { kind: Kind::Go(Screen::Accounts), names: &["аккаунты", "accounts"], hint: "экран аккаунтов" },
     Spec { kind: Kind::Go(Screen::Lobby), names: &["лобби", "lobby"], hint: "экран лобби" },
     Spec { kind: Kind::Go(Screen::Settings), names: &["настройки", "settings"], hint: "экран настроек" },
+    Spec { kind: Kind::Overview, names: &["сводка", "overview", "итоги"], hint: "все аккаунты за период" },
     Spec { kind: Kind::Help, names: &["помощь", "help", "?"], hint: "горячие клавиши" },
+    Spec { kind: Kind::Quit, names: &["выход", "quit", "exit"], hint: "закрыть программу совсем" },
+    Spec { kind: Kind::Update, names: &["обновление", "upgrade", "версия"], hint: "проверить новую версию приложения" },
 ];
 
 /// Сортировки: (порядок, русское слово, английское).
@@ -124,11 +136,12 @@ impl Kind {
     fn arg(self) -> Arg {
         match self {
             Self::Login | Self::Password | Self::UserName | Self::RiotId | Self::History | Self::Games
-            | Self::OpGg | Self::Edit | Self::Delete => Arg::Account,
+            | Self::Profile | Self::OpGg | Self::Edit | Self::Delete => Arg::Account,
             Self::Refresh => Arg::AccountOrAll,
             Self::Tag => Arg::Tag,
+            Self::Label => Arg::NewTag,
             Self::Sort => Arg::Sort,
-            Self::Add | Self::Go(_) | Self::Help => Arg::None,
+            Self::Add | Self::Go(_) | Self::Help | Self::Overview | Self::Update | Self::Quit => Arg::None,
         }
     }
 
@@ -142,12 +155,16 @@ impl Kind {
             Self::Refresh => Action::Refresh,
             Self::History => Action::History,
             Self::Games => Action::Games,
+            Self::Profile => Action::Profile,
             Self::OpGg => Action::OpGg,
             Self::Edit => Action::Edit,
             Self::Delete => Action::Delete,
             // Остальные аккаунт не принимают — сюда не попадают.
             Self::Add => Action::Add,
-            Self::Tag | Self::Sort | Self::Go(_) | Self::Help => Action::Help,
+            Self::Tag | Self::Label | Self::Sort | Self::Go(_) | Self::Help => Action::Help,
+            Self::Update => Action::Update,
+            Self::Overview => Action::Overview,
+            Self::Quit => Action::Quit,
         }
     }
 
@@ -157,6 +174,9 @@ impl Kind {
             Self::Add => Some(Action::Add),
             Self::Go(screen) => Some(Action::Screen(screen)),
             Self::Help => Some(Action::Help),
+            Self::Overview => Some(Action::Overview),
+            Self::Update => Some(Action::Update),
+            Self::Quit => Some(Action::Quit),
             _ => None,
         }
     }
@@ -317,6 +337,23 @@ fn arguments(
                 }
             }
         }
+        Arg::NewTag => {
+            // Сначала то, что набрано (может быть новым тегом), потом похожие существующие.
+            let typed = rest.trim().to_string();
+            let known = tags.iter().filter(|t| t.to_lowercase().starts_with(&typed) && **t != typed).cloned();
+            let values = (!typed.is_empty()).then(|| typed.clone()).into_iter().chain(known);
+            for tag in values {
+                out.push(Suggestion {
+                    label: format!("{name} {tag}"),
+                    hint: spec.hint,
+                    completion: format!("{name} {tag}"),
+                    run: Some(Invocation::new(Action::ToggleTag(tag))),
+                });
+            }
+            if out.is_empty() {
+                out.push(needs_argument(spec));
+            }
+        }
         Arg::Sort => {
             let swapped = swap_layout(rest);
             for (order, ru, en) in SORTS {
@@ -414,6 +451,8 @@ mod tests {
         // Часть ника из середины.
         assert_eq!(first("история shroom"), Some(Invocation::on(Action::History, 3)));
         assert_eq!(first("игры benjm"), Some(Invocation::on(Action::Games, 1)));
+        assert_eq!(first("профиль benjm"), Some(Invocation::on(Action::Profile, 1)));
+        assert_eq!(first("метка новый"), Some(Invocation::new(Action::ToggleTag("новый".into()))));
         // Без ника — выбранный курсором (id 3) первым.
         assert_eq!(first("войти "), Some(Invocation::on(Action::Login, 3)));
     }

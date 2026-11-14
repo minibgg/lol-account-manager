@@ -12,8 +12,10 @@ use eframe::egui::{
     StrokeKind, TextFormat, Ui, pos2, text::LayoutJob, vec2,
 };
 
+use crate::decay;
 use crate::error::AppError;
 use crate::history::{self, DAY};
+use crate::lobby::LiveGame;
 use crate::riot::{MatchSummary, RankedStats};
 use crate::storage::{Account, AccountId, unix_now};
 use crate::ui::command::{Invocation, Suggestion};
@@ -65,6 +67,14 @@ fn rank_cell(stats: Option<Option<&RankedStats>>) -> (String, Color32) {
     }
 }
 
+/// Пометка «↓5д» рядом с рангом: ранг скоро начнёт сгорать (или уже сгорает).
+/// `None` — предупреждать не о чем.
+fn decay_mark(account: &Account, queue: history::Queue, now: i64) -> Option<(String, Color32)> {
+    let decay = decay::of_account(account, queue, now).filter(decay::Decay::is_warning)?;
+    let color = if decay.is_urgent() { theme::RED_TEXT } else { theme::AMBER_TEXT };
+    Some((format!(" {}", decay.short_label()), color))
+}
+
 /// «+62» / «−11» за неделю (Solo/Duo, а если там тихо — Flex).
 fn week_cell(account: &Account) -> (String, Color32) {
     let since = unix_now() - 7 * DAY;
@@ -111,6 +121,10 @@ pub struct Table<'a> {
     pub accounts: &'a [&'a Account],
     pub cursor: Option<AccountId>,
     pub in_client: Option<AccountId>,
+    /// Отмеченные аккаунты (пробел) — для действий сразу с несколькими.
+    pub marked: &'a HashSet<AccountId>,
+    /// У кого сейчас идёт игра.
+    pub live: &'a HashMap<AccountId, LiveGame>,
     pub refreshing: &'a HashSet<AccountId>,
     pub errors: &'a HashMap<AccountId, AppError>,
     /// Курсор сдвинули с клавиатуры — прокрутить к нему.
@@ -151,6 +165,10 @@ impl Table<'_> {
                         clicked = Some(account.id);
                     }
                     if ui.is_rect_visible(rect) {
+                        // Отмеченная строка — с лёгкой янтарной подложкой.
+                        if self.marked.contains(&account.id) && !is_cursor {
+                            ui.painter().rect_filled(rect, 0, alpha(theme::ACCENT, 26));
+                        }
                         self.row(ui, rect, account, is_cursor, response.hovered());
                     }
                 }
@@ -173,6 +191,15 @@ impl Table<'_> {
         let (solo, solo_color) = rank_cell(ranked.map(|r| r.solo.as_ref()));
         let (flex, flex_color) = rank_cell(ranked.map(|r| r.flex.as_ref()));
         let (week, week_color) = week_cell(account);
+        let now = unix_now();
+        // Ячейка ранга: сам ранг и, если пора, пометка о сгорании.
+        let rank_job = |text: &str, color: Color32, queue: history::Queue| {
+            let mut cell = job(&[(text, ink(color))], &font);
+            if let Some((mark, mark_color)) = decay_mark(account, queue, now) {
+                cell.append(&mark, 0.0, TextFormat::simple(font.clone(), ink(mark_color)));
+            }
+            cell
+        };
 
         let games = match cache.map(|c| c.matches.as_deref()) {
             None => job(&[("—", ink(theme::TEXT_HINT))], &font),
@@ -191,7 +218,9 @@ impl Table<'_> {
             }
         };
 
-        let extra = if self.in_client == Some(account.id) {
+        let extra = if let Some(game) = self.live.get(&account.id) {
+            job(&[(&format!("● {}", game.label(now)), ink(theme::GREEN_TEXT))], &font)
+        } else if self.in_client == Some(account.id) {
             job(&[("● в клиенте", ink(theme::GREEN_TEXT))], &font)
         } else if self.refreshing.contains(&account.id) {
             job(&[("обновляется…", ink(theme::ACCENT_TEXT))], &font)
@@ -202,7 +231,11 @@ impl Table<'_> {
         };
 
         let cells = [
-            job(&[(if is_cursor { "›" } else { "" }, ink(theme::TEXT))], &font),
+            match (self.marked.contains(&account.id), is_cursor) {
+                (true, _) => job(&[("+", ink(theme::ACCENT_TEXT))], &font),
+                (false, true) => job(&[("›", ink(theme::TEXT))], &font),
+                (false, false) => job(&[("", ink(theme::TEXT))], &font),
+            },
             job(
                 &[
                     (&account.riot_id.game_name, ink(theme::TEXT)),
@@ -211,8 +244,8 @@ impl Table<'_> {
                 &font,
             ),
             job(&[(account.region.label(), ink(theme::TEXT_MUTED))], &font),
-            job(&[(&solo, ink(solo_color))], &font),
-            job(&[(&flex, ink(flex_color))], &font),
+            rank_job(&solo, solo_color, history::Queue::Solo),
+            rank_job(&flex, flex_color, history::Queue::Flex),
             job(&[(&week, ink(week_color))], &font),
             games,
             extra,
@@ -235,6 +268,8 @@ impl Table<'_> {
 pub struct Details<'a> {
     pub account: &'a Account,
     pub in_client: bool,
+    /// Игра, которая идёт у аккаунта прямо сейчас.
+    pub live: Option<&'a LiveGame>,
     pub refreshing: bool,
     pub error: Option<&'a AppError>,
     /// Нажата «Войти»: логин в буфере, Enter скопирует пароль.
@@ -275,7 +310,23 @@ impl Details<'_> {
                 let cache = account.cache.as_ref();
                 for (title, queue) in [("solo ", history::Queue::Solo), ("flex ", history::Queue::Flex)] {
                     let stats = cache.map(|c| queue.stats(&c.ranked));
-                    let left = rank_line(title, stats, &font);
+                    let mut left = rank_line(title, stats, &font);
+                    // Алмаз и выше: через сколько дней без игр ранг начнёт сгорать.
+                    if let Some(decay) = decay::of_account(account, queue, unix_now()) {
+                        let color = if decay.is_urgent() {
+                            theme::RED_TEXT
+                        } else if decay.is_warning() {
+                            theme::AMBER_TEXT
+                        } else {
+                            k
+                        };
+                        let text = if decay.is_active() {
+                            "  ↓ сгорает".to_string()
+                        } else {
+                            format!("  ↓ ≈{} дн", decay.days_left)
+                        };
+                        left.append(&text, 0.0, TextFormat::simple(font.clone(), color));
+                    }
                     let right = match (queue, stats) {
                         (history::Queue::Solo, Some(Some(s))) => record_line("всего ", s, &font),
                         (history::Queue::Flex, _) => self.status_line(&font),
@@ -318,6 +369,9 @@ impl Details<'_> {
                         if key_button(ui, "m", "все игры", false).clicked() {
                             action = Some(Invocation::on(Action::Games, account.id));
                         }
+                        if key_button(ui, "i", "профиль", false).clicked() {
+                            action = Some(Invocation::on(Action::Profile, account.id));
+                        }
                     });
                 }
 
@@ -359,6 +413,11 @@ impl Details<'_> {
         let k = theme::TEXT_HINT;
         if self.refreshing {
             return job(&[("обновляется…", theme::ACCENT_TEXT)], font);
+        }
+        if let Some(game) = self.live {
+            let label = format!("● {}", game.label(unix_now()));
+            let queue = format!(" · {}", crate::riot::models::queue_label(game.queue_id).to_lowercase());
+            return job(&[(&label, theme::GREEN_TEXT), (&queue, k)], font);
         }
         let age = self
             .account

@@ -58,6 +58,13 @@ pub enum Action {
     Last,
     /// Поставить курсор на аккаунт (из командной строки: «dr4g» и Enter).
     Select,
+    /// Пробел: отметить аккаунт (или снять отметку) — для действий сразу с несколькими.
+    Mark,
+    /// Ctrl+A: отметить все видимые аккаунты (или снять все отметки).
+    MarkAll,
+    /// Команда «метка smurf»: добавить тег отмеченным аккаунтам (или убрать, если он
+    /// уже есть у всех). Без отметок — аккаунту под курсором.
+    ToggleTag(String),
     // Выбранный аккаунт
     /// Enter: «Войти» — логин в буфер и запустить Riot Client; второй Enter — пароль.
     Login,
@@ -71,6 +78,8 @@ pub enum Action {
     Game(usize),
     /// Окно «Все игры» — архив игр аккаунта.
     Games,
+    /// Окно «Профиль» — статистика по архиву игр: чемпионы, винрейт, KDA.
+    Profile,
     OpGg,
     Edit,
     Delete,
@@ -86,6 +95,12 @@ pub enum Action {
     Search,
     CommandLine,
     Help,
+    /// Окно «Сводка»: все аккаунты разом за период.
+    Overview,
+    /// Открыть настройки и проверить, нет ли новой версии приложения.
+    Update,
+    /// Закрыть программу совсем (с включённым треем крестик только прячет окно).
+    Quit,
     Screen(Screen),
     /// Esc: сбросить поиск и фильтр.
     Escape,
@@ -97,6 +112,7 @@ impl Action {
         matches!(
             self,
             Self::Select
+                | Self::Mark
                 | Self::Login
                 | Self::CopyLogin
                 | Self::CopyPassword
@@ -105,6 +121,7 @@ impl Action {
                 | Self::History
                 | Self::Game(_)
                 | Self::Games
+                | Self::Profile
                 | Self::OpGg
                 | Self::Edit
                 | Self::Delete
@@ -113,7 +130,16 @@ impl Action {
 
     /// Работает на любом экране (остальные — только на экране аккаунтов).
     pub fn is_global(&self) -> bool {
-        matches!(self, Self::CommandLine | Self::Help | Self::Screen(_) | Self::RefreshAll | Self::Add)
+        matches!(
+            self,
+            Self::CommandLine
+                | Self::Help
+                | Self::Update
+                | Self::Quit
+                | Self::Screen(_)
+                | Self::RefreshAll
+                | Self::Add
+        )
     }
 }
 
@@ -130,6 +156,7 @@ pub fn for_key(key: Key, mods: Modifiers) -> Option<Action> {
         (true, false, Key::K) => A::CommandLine,
         (true, false, Key::F) => A::Search,
         (true, false, Key::N) => A::Add,
+        (true, false, Key::A) => A::MarkAll,
         (true, false, Key::Num1) => A::Screen(Screen::Accounts),
         (true, false, Key::Num2) => A::Screen(Screen::Lobby),
         (true, false, Key::Num3) => A::Screen(Screen::Settings),
@@ -148,6 +175,7 @@ pub fn for_key(key: Key, mods: Modifiers) -> Option<Action> {
             Key::Home | Key::G => A::First,
             Key::End => A::Last,
             Key::Enter => A::Login,
+            Key::Space => A::Mark,
             Key::L => A::CopyLogin,
             Key::P => A::CopyPassword,
             Key::C => A::CopyRiotId,
@@ -161,9 +189,11 @@ pub fn for_key(key: Key, mods: Modifiers) -> Option<Action> {
             Key::Num5 => A::Game(4),
             Key::O => A::OpGg,
             Key::M => A::Games,
+            Key::I => A::Profile,
             Key::E => A::Edit,
             Key::Delete => A::Delete,
             Key::N => A::Add,
+            Key::D => A::Overview,
             Key::T => A::NextTag,
             Key::S => A::NextSort,
             Key::F1 => A::Help,
@@ -244,7 +274,9 @@ pub const HELP: &[HelpSection] = &[
             ("/  Ctrl+F", "поиск по нику, заметке, региону"),
             ("t  Shift+T", "следующий / предыдущий тег"),
             ("s", "сортировка: ранг → уровень → имя → дата"),
-            ("Esc", "сбросить поиск и тег"),
+            ("d", "сводка: LP, победы и поражения по всем аккаунтам за период"),
+            ("Space  Ctrl+A", "отметить аккаунт / все; дальше r, Delete или «: метка тег» — сразу для отмеченных"),
+            ("Esc", "снять отметки; сбросить поиск и тег"),
         ],
     },
     HelpSection {
@@ -258,6 +290,7 @@ pub const HELP: &[HelpSection] = &[
             ("h", "история ранга"),
             ("1 … 5", "подробности последних игр"),
             ("m", "все игры аккаунта — архив без ограничений"),
+            ("i", "профиль: винрейт, KDA и чемпионы по архиву игр"),
             ("o", "профиль на op.gg"),
             ("e", "изменить"),
             ("Delete", "удалить (спросит подтверждение)"),
@@ -271,6 +304,8 @@ pub const HELP: &[HelpSection] = &[
         title: "везде",
         rows: &[
             (":  Ctrl+K", "командная строка: «войти dr4g», «пароль benjm», «обновить все»"),
+            (": обновление", "проверить, нет ли новой версии приложения"),
+            (": выход", "закрыть программу совсем (с треем крестик только прячет окно)"),
             ("n  Ctrl+N", "добавить аккаунт"),
             ("Shift+R  F5", "обновить все аккаунты"),
             ("Ctrl+1 2 3", "аккаунты / лобби / настройки"),

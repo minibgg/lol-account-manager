@@ -51,6 +51,64 @@ pub struct LcuChampSelectMember {
     pub tag_line: String,
 }
 
+/// Чемпион из `/lol-champions/v1/owned-champions-minimal` (там же — бесплатные на этой неделе).
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct LcuOwnedChampion {
+    pub ownership: LcuOwnership,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct LcuOwnership {
+    pub owned: bool,
+}
+
+/// Предмет из `/lol-inventory/v2/inventory/CHAMPION_SKIN` — образ чемпиона.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct LcuInventoryItem {
+    pub owned: bool,
+}
+
+/// `/lol-gameflow/v1/session` — текущая игра: номер, очередь, кто на ком и на какой позиции.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LcuGameflowSession {
+    pub game_data: LcuGameData,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LcuGameData {
+    pub game_id: i64,
+    pub queue: LcuGameQueue,
+    pub player_champion_selections: Vec<LcuChampionSelection>,
+    pub team_one: Vec<LcuGameMember>,
+    pub team_two: Vec<LcuGameMember>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct LcuGameQueue {
+    pub id: i32,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LcuChampionSelection {
+    pub champion_id: i32,
+    pub puuid: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LcuGameMember {
+    pub puuid: String,
+    /// «TOP», «JUNGLE», «MIDDLE», «BOTTOM», «UTILITY» или «NONE».
+    pub selected_position: String,
+}
+
 /// `/lol-lobby/v2/lobby` — группа до начала поиска игры.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
@@ -130,6 +188,34 @@ pub struct LcuParticipant {
     pub team_id: i32,
     pub champion_id: i32,
     pub stats: LcuParticipantStats,
+    pub timeline: LcuTimeline,
+}
+
+/// Линия и роль игрока, как их определил сервер по ходу игры.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LcuTimeline {
+    /// «TOP», «JUNGLE», «MIDDLE», «BOTTOM» или «NONE».
+    pub lane: String,
+    /// «SOLO», «CARRY», «SUPPORT», «DUO_CARRY», «DUO_SUPPORT», «NONE»…
+    pub role: String,
+}
+
+impl LcuTimeline {
+    /// Позиция в нашем виде («top» … «utility»); пусто — клиент её не знает.
+    /// Клиент часто отдаёт «NONE» вместо линии (и тогда роль у всех одинаковая,
+    /// ей верить нельзя), поэтому позицию берём, только когда линия названа.
+    pub fn position(&self) -> String {
+        match (self.lane.as_str(), self.role.as_str()) {
+            ("TOP", _) => "top",
+            ("JUNGLE", _) => "jungle",
+            ("MIDDLE" | "MID", _) => "middle",
+            ("BOTTOM", "SUPPORT" | "DUO_SUPPORT") => "utility",
+            ("BOTTOM", "CARRY" | "DUO_CARRY") => "bottom",
+            _ => "",
+        }
+        .to_string()
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -199,6 +285,7 @@ impl LcuParticipant {
             vision: s.vision_score,
             items: vec![s.item0, s.item1, s.item2, s.item3, s.item4, s.item5, s.item6],
             largest_multi_kill: s.largest_multi_kill,
+            position: self.timeline.position(),
         }
     }
 }

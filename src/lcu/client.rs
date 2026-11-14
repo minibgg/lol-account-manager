@@ -13,13 +13,13 @@ use tracing::{debug, warn};
 use super::lockfile::Lockfile;
 use super::models::{
     ChatParticipant, ChatParticipants, LcuChampSelectSession, LcuChampionSummary, LcuLobby,
-    LcuGame, LcuMatchHistory, LcuRankedStats, LcuRegionLocale, LcuSummoner,
+    LcuGame, LcuGameflowSession, LcuInventoryItem, LcuMatchHistory, LcuOwnedChampion, LcuRankedStats, LcuRegionLocale, LcuSummoner,
 };
 use super::riot_client::RiotClientAuth;
 use crate::error::{AppError, AppResult};
 use crate::riot::client::encode_segment;
 use crate::riot::models::FETCH_MATCHES;
-use crate::riot::{AccountSnapshot, DataSource, MatchSummary, RankedQueues, Region, RiotId};
+use crate::riot::{AccountSnapshot, DataSource, Inventory, MatchSummary, RankedQueues, Region, RiotId};
 
 /// Что сейчас происходит с клиентом League.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,6 +226,41 @@ impl LcuClient {
         self.get_json("/lol-gameflow/v1/gameflow-phase")
             .await?
             .ok_or(AppError::LcuNotReady)
+    }
+
+    /// Сколько валюты в кошельке: «lol_blue_essence», «lol_orange_essence», «RP».
+    async fn wallet(&self, currency: &str) -> AppResult<i64> {
+        let wallet: HashMap<String, i64> = self
+            .get_json(&format!("/lol-inventory/v1/wallet/{currency}"))
+            .await?
+            .unwrap_or_default();
+        Ok(wallet.get(currency).copied().unwrap_or(0))
+    }
+
+    /// Инвентарь аккаунта, в который выполнен вход: чемпионы, образы, валюта.
+    /// Только чтение — пять GET-запросов.
+    pub async fn inventory(&self, fetched_at: i64) -> AppResult<Inventory> {
+        let champions: Vec<LcuOwnedChampion> = self
+            .get_json("/lol-champions/v1/owned-champions-minimal")
+            .await?
+            .ok_or(AppError::LcuNotReady)?;
+        let skins: Vec<LcuInventoryItem> = self
+            .get_json("/lol-inventory/v2/inventory/CHAMPION_SKIN")
+            .await?
+            .unwrap_or_default();
+        Ok(Inventory {
+            champions: champions.iter().filter(|c| c.ownership.owned).count() as u32,
+            skins: skins.iter().filter(|s| s.owned).count() as u32,
+            blue_essence: self.wallet("lol_blue_essence").await?,
+            orange_essence: self.wallet("lol_orange_essence").await?,
+            rp: self.wallet("RP").await?,
+            fetched_at,
+        })
+    }
+
+    /// Текущая игра (`None` — игры нет).
+    pub async fn gameflow_session(&self) -> AppResult<Option<LcuGameflowSession>> {
+        self.get_json("/lol-gameflow/v1/session").await
     }
 
     /// Выбор чемпионов (`None` — его сейчас нет).

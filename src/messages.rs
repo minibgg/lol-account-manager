@@ -18,12 +18,15 @@
 use std::fmt;
 use std::path::PathBuf;
 
+use zeroize::Zeroize;
+
 use crate::error::AppError;
 use crate::images::{ImageBytes, ImageKey};
 use crate::lcu::LcuStatus;
-use crate::lobby::LobbyState;
-use crate::riot::{DataSource, MatchDetails, MatchSummary};
+use crate::lobby::{LiveGame, LobbyState};
+use crate::riot::{DataSource, Inventory, MatchDetails, MatchSummary, RankedQueues, RiotId};
 use crate::storage::{Account, AccountId, AccountInput, Credentials, SecretChange};
+use crate::update::UpdateInfo;
 
 /// Папка игры: какую указал пользователь и где игра нашлась на самом деле.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -47,6 +50,15 @@ impl Secret {
     /// где секрет «раскрывается».
     pub fn expose(&self) -> &str {
         &self.0
+    }
+}
+
+/// Когда секрет больше не нужен, его байты в памяти затираются нулями (crate zeroize):
+/// иначе строка просто «освобождается» и её содержимое остаётся лежать в памяти,
+/// пока это место не займёт что-то другое.
+impl Drop for Secret {
+    fn drop(&mut self) {
+        self.0.zeroize();
     }
 }
 
@@ -113,10 +125,34 @@ pub enum Command {
     ExportAccounts(PathBuf),
     /// Добавить аккаунты из файла экспорта (те, которых ещё нет в списке).
     ImportAccounts(PathBuf),
+    /// Сохранить полную копию — список вместе с логинами и паролями, — зашифрованную
+    /// этим паролем (см. vault.rs).
+    ExportVault { path: PathBuf, password: Secret },
+    /// Восстановить аккаунты (с логинами и паролями) из зашифрованной копии.
+    ImportVault { path: PathBuf, password: Secret },
     /// Подробности игры (обе команды) — для окна, которое открывается щелчком по игре.
     LoadMatch { account: AccountId, match_id: String },
     /// Все игры аккаунта из архива — для окна «Все игры».
     LoadGames(AccountId),
+    /// Инвентарь аккаунта — для окна «Профиль»: свежий из клиента League, если в нём
+    /// выполнен вход в этот аккаунт, иначе последний сохранённый.
+    LoadInventory(AccountId),
+    /// Нынешние ранги игроков одной игры — для окна «Подробности игры».
+    /// `account` нужен ради сервера: игроки игры — с того же сервера, что и аккаунт.
+    LoadRanks {
+        account: AccountId,
+        match_id: String,
+        players: Vec<RiotId>,
+    },
+    /// Проверить, нет ли новой версии приложения (кнопка в настройках).
+    CheckUpdate,
+    /// Скачать установщик этой версии, проверить его и запустить.
+    InstallUpdate(UpdateInfo),
+    /// Проверять ли обновления при запуске.
+    SetUpdateCheck(bool),
+    /// Включить или выключить «спрашивать Windows Hello перед копированием пароля».
+    /// И включение, и выключение сами требуют проверки Windows Hello.
+    SetHelloLock(bool),
 }
 
 /// Итог импорта.
@@ -136,6 +172,10 @@ pub enum Event {
     Ready {
         has_api_key: bool,
         league_dir: LeagueDirInfo,
+        /// Включена ли проверка обновлений при запуске.
+        update_check: bool,
+        /// Включена ли проверка Windows Hello перед копированием пароля.
+        hello_lock: bool,
     },
     /// База не открылась — без неё приложение работать не может.
     StartupFailed(AppError),
@@ -145,6 +185,8 @@ pub enum Event {
     LcuStatus(LcuStatus),
     /// Изменилось лобби: группа, выбор чемпионов, игра.
     Lobby(LobbyState),
+    /// Кто из аккаунтов (кроме того, что в клиенте) сейчас в игре — по данным Riot API.
+    LiveGames(Vec<(AccountId, LiveGame)>),
 
     /// Аккаунт добавлен. `fetch_error` — почему не удалось сразу загрузить данные из Riot
     /// (нет ключа, нет сети...): аккаунт сохранён, обновить его можно позже.
@@ -203,6 +245,34 @@ pub enum Event {
         result: Result<Vec<MatchSummary>, AppError>,
     },
 
+    /// Ответ на `LoadInventory`: `None` — инвентарь этого аккаунта ещё ни разу не видели.
+    InventoryLoaded {
+        account: AccountId,
+        inventory: Option<Inventory>,
+    },
+
+    /// Ответ на `LoadRanks`: ранги тех игроков, кого удалось найти.
+    RanksLoaded {
+        match_id: String,
+        result: Result<Vec<(RiotId, RankedQueues)>, AppError>,
+    },
+
+    /// Проверка обновлений закончилась: `Ok(None)` — установлена последняя версия.
+    /// `manual` — проверку запустил пользователь (тогда показываем и «обновлений нет»,
+    /// и ошибку; о неудачной фоновой проверке окно вообще не узнаёт).
+    UpdateChecked {
+        result: Result<Option<UpdateInfo>, AppError>,
+        manual: bool,
+    },
+    /// Установщик скачивается: сколько байт получено из скольких.
+    UpdateProgress { received: u64, total: u64 },
+    /// Установщик проверен и запущен — окну пора закрыться, чтобы он заменил программу.
+    UpdateInstalling,
+    UpdateFailed(AppError),
+
+    /// Ответ на `SetHelloLock`: новое состояние настройки или почему оно не изменилось.
+    HelloLockSaved(Result<bool, AppError>),
+
     /// Ошибка, не привязанная к конкретному действию (например, хранилище паролей
     /// недоступно при запуске).
     Warning(AppError),
@@ -235,6 +305,14 @@ mod tests {
             },
             Command::SaveApiKey(Secret::new("RGAPI-my-key")),
             Command::CheckApiKey(Some(Secret::new("RGAPI-my-key"))),
+            Command::ExportVault {
+                path: "copy.lolvault".into(),
+                password: Secret::new("my-pass"),
+            },
+            Command::ImportVault {
+                path: "copy.lolvault".into(),
+                password: Secret::new("my-pass"),
+            },
         ];
         for command in &commands {
             let text = format!("{command:?}");

@@ -55,6 +55,9 @@ impl SecretClipboard {
     /// `secret: String` (а не `&str`): функция забирает строку во владение,
     /// и она уничтожается в конце функции — копий не остаётся.
     pub fn copy_secret(&self, secret: String) -> AppResult<u64> {
+        // Наша копия секрета затрётся нулями при выходе из функции (в буфере обмена
+        // он остаётся — его стирает таймер).
+        let secret = zeroize::Zeroizing::new(secret);
         let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         // `&mut *guard` — изменяемая ссылка на сами данные под замком. Через неё можно
         // одновременно занять разные поля (clipboard и hasher): компилятор видит, что
@@ -62,7 +65,7 @@ impl SecretClipboard {
         let inner = &mut *guard;
         let clipboard = open(&mut inner.clipboard)?;
         set_secret_text(clipboard, &secret).map_err(clipboard_error)?;
-        inner.fingerprint = Some(inner.hasher.hash_one(&secret));
+        inner.fingerprint = Some(inner.hasher.hash_one(&*secret));
         inner.generation += 1;
         Ok(inner.generation)
     }

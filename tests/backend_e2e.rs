@@ -95,6 +95,8 @@ fn add_copy_autoclear_delete() {
         open_storage: Box::new(move || Storage::open(&db_path, secrets)),
         clipboard_clear_after: Duration::from_secs(1),
         image_cache_dir: dir.join("images"),
+        update_dir: dir.join("updates"),
+        auto_update_check: false,
     };
     let mut backend = Backend::start_with(egui::Context::default(), config);
 

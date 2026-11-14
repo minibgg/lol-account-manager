@@ -2,12 +2,14 @@
 //! без ограничения количества. Вид терминала: курсор-строка, ↑ ↓ PgUp PgDn Home End,
 //! Enter или щелчок — подробности игры, Tab — фильтр по очереди, Esc — закрыть.
 //! Сверху — итог: сколько игр, побед и поражений, винрейт и самые частые чемпионы.
+//! У ранговых игр — ранг аккаунта после игры и сколько LP она принесла (по истории рангов).
 
 use std::collections::HashMap;
 
 use eframe::egui::{self, Align, Layout, Margin, Rect, RichText, Sense, Stroke, pos2, vec2};
 
 use crate::error::AppError;
+use crate::history::{self, GameRank, Queue, RankPoint};
 use crate::riot::{MatchSummary, RiotId};
 use crate::storage::AccountId;
 use crate::ui::format;
@@ -15,14 +17,15 @@ use crate::ui::match_view;
 use crate::ui::terminal::{self, FONT, ROW_HEIGHT, job};
 use crate::ui::theme::{self, Weight, white};
 
-/// Ширины колонок: курсор, когда, результат, чемпион, K/D/A, KDA, CS, длительность; дальше — режим.
-const COLUMNS: [f32; 8] = [16.0, 118.0, 26.0, 128.0, 92.0, 62.0, 70.0, 64.0];
-const HEADERS: [&str; 9] = ["", "когда", "", "чемпион", "k/d/a", "kda", "cs", "время", "режим"];
+/// Ширины колонок: курсор, когда, результат, чемпион, K/D/A, KDA, CS, длительность,
+/// ранг после игры; дальше — режим.
+const COLUMNS: [f32; 9] = [16.0, 104.0, 26.0, 118.0, 88.0, 50.0, 48.0, 60.0, 190.0];
+const HEADERS: [&str; 10] = ["", "когда", "", "чемпион", "k/d/a", "kda", "cs", "время", "ранг после игры", "режим"];
 const WIDTH: f32 = 820.0;
 
-/// Фильтр по очереди (Tab).
+/// Фильтр по очереди (Tab). Общий с окном «Профиль».
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Filter {
+pub enum Filter {
     All,
     Solo,
     Flex,
@@ -30,9 +33,9 @@ enum Filter {
 }
 
 impl Filter {
-    const ALL: [Self; 4] = [Self::All, Self::Solo, Self::Flex, Self::Other];
+    pub const ALL: [Self; 4] = [Self::All, Self::Solo, Self::Flex, Self::Other];
 
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::All => "все",
             Self::Solo => "solo/duo",
@@ -41,7 +44,7 @@ impl Filter {
         }
     }
 
-    fn accepts(self, game: &MatchSummary) -> bool {
+    pub fn accepts(self, game: &MatchSummary) -> bool {
         match self {
             Self::All => true,
             Self::Solo => game.queue_id == 420,
@@ -62,6 +65,10 @@ pub struct GamesView {
     /// Прокрутка списка (запоминаем, чтобы двигать её вслед за курсором).
     offset: f32,
     filter: Filter,
+    /// Ранги после игр — и для каких размеров архива и истории они посчитаны
+    /// (пересчитываем, только когда что-то добавилось, а не каждый кадр).
+    ranks: HashMap<String, GameRank>,
+    ranks_for: (usize, usize),
 }
 
 /// Что сделать после кадра.
@@ -82,6 +89,8 @@ impl GamesView {
             scroll_to_cursor: false,
             offset: 0.0,
             filter: Filter::All,
+            ranks: HashMap::new(),
+            ranks_for: (0, 0),
         }
     }
 
@@ -94,9 +103,15 @@ impl GamesView {
     }
 
     /// Рисует окно. `keys` — false, если поверх открыто другое окно (подробности игры):
-    /// тогда клавиши достаются ему.
-    pub fn show(&mut self, ctx: &egui::Context, keys: bool) -> GamesAction {
+    /// тогда клавиши достаются ему. `history` — история рангов аккаунта.
+    pub fn show(&mut self, ctx: &egui::Context, keys: bool, history: &[RankPoint]) -> GamesAction {
         let mut action = GamesAction::None;
+        if let Some(Ok(games)) = &self.games
+            && self.ranks_for != (games.len(), history.len())
+        {
+            self.ranks = history::game_ranks(history, games);
+            self.ranks_for = (games.len(), history.len());
+        }
         if keys {
             action = self.handle_keys(ctx);
         }
@@ -283,7 +298,7 @@ impl GamesView {
                     self.cursor = index;
                     clicked = Some(game.clone());
                 }
-                row(ui, rect, game, is_cursor, response.hovered());
+                row(ui, rect, game, self.ranks.get(&game.id), is_cursor, response.hovered());
             }
         });
         self.offset = output.state.clamped_offset().y;
@@ -291,8 +306,32 @@ impl GamesView {
     }
 }
 
-/// Строка игры: «› 4 дн назад  W  экко  14/5/7  4.2  165  27:25  Ранговая соло/дуо».
-fn row(ui: &egui::Ui, rect: Rect, game: &MatchSummary, is_cursor: bool, hovered: bool) {
+/// Ячейка «ранг после игры»: «платина I 40lp −18». «+46/2» — изменение сразу за две игры
+/// (приложение было закрыто между ними). У неранговых игр ячейка пустая; «—» — ранговая
+/// игра, для которой в истории рангов записи нет.
+fn rank_cell(game: &MatchSummary, rank: Option<&GameRank>) -> Vec<(String, egui::Color32)> {
+    let Some(rank) = rank else {
+        let ranked = Queue::from_queue_id(game.queue_id).is_some() && !game.remake;
+        return vec![((if ranked { "—" } else { "" }).into(), theme::TEXT_HINT)];
+    };
+    let lp = history::signed_lp(rank.lp);
+    let mut change = format!(" {}", lp.trim_end_matches(" LP"));
+    if rank.games > 1 {
+        change.push_str(&format!("/{}", rank.games));
+    }
+    let color = match rank.lp {
+        0 => theme::TEXT_MUTED,
+        lp if lp > 0 => theme::GREEN_TEXT,
+        _ => theme::RED_TEXT,
+    };
+    vec![
+        (terminal::rank_text(&rank.after), theme::tier_color(Some(rank.after.tier))),
+        (change, color),
+    ]
+}
+
+/// Строка игры: «› 4 дн назад  W  экко  14/5/7  4.2  165  27:25  платина I 40lp −18  ранговая…».
+fn row(ui: &egui::Ui, rect: Rect, game: &MatchSummary, rank: Option<&GameRank>, is_cursor: bool, hovered: bool) {
     let painter = ui.painter_at(rect);
     if is_cursor {
         painter.rect_filled(rect, 0, theme::ACCENT);
@@ -305,21 +344,25 @@ fn row(ui: &egui::Ui, rect: Rect, game: &MatchSummary, is_cursor: bool, hovered:
     let me = &game.me;
     let ratio = me.kda_ratio();
     let cs = if game.has_full_stats() { me.cs.to_string() } else { "—".into() };
-    let cells: [(String, egui::Color32); 9] = [
-        ((if is_cursor { "›" } else { "" }).into(), ink(theme::TEXT)),
-        (format::relative_time(game.played_at), ink(theme::TEXT_MUTED)),
-        (letter.into(), ink(color)),
-        (match_view::champion_name(me).to_lowercase(), ink(theme::TEXT)),
-        (game.kda(), ink(theme::TEXT)),
-        (format!("{ratio:.1}"), ink(match_view::kda_color(ratio))),
-        (cs, ink(theme::TEXT_MUTED)),
-        (match_view::duration(game.duration_secs), ink(theme::TEXT_MUTED)),
-        (game.queue_label().to_lowercase(), ink(theme::TEXT_HINT)),
+    // Каждая ячейка — куски текста своего цвета (в ячейке ранга их два).
+    let one = |text: String, color| vec![(text, color)];
+    let cells: [Vec<(String, egui::Color32)>; 10] = [
+        one((if is_cursor { "›" } else { "" }).into(), theme::TEXT),
+        one(format::relative_time(game.played_at), theme::TEXT_MUTED),
+        one(letter.into(), color),
+        one(match_view::champion_name(me).to_lowercase(), theme::TEXT),
+        one(game.kda(), theme::TEXT),
+        one(format!("{ratio:.1}"), match_view::kda_color(ratio)),
+        one(cs, theme::TEXT_MUTED),
+        one(match_view::duration(game.duration_secs), theme::TEXT_MUTED),
+        rank_cell(game, rank),
+        one(game.queue_label().to_lowercase(), theme::TEXT_HINT),
     ];
     let mut x = rect.left();
-    for (index, (text, color)) in cells.into_iter().enumerate() {
+    for (index, parts) in cells.into_iter().enumerate() {
         let width = COLUMNS.get(index).copied().unwrap_or(rect.right() - x) - 8.0;
-        let mut cell = job(&[(&text, color)], &font);
+        let parts: Vec<(&str, egui::Color32)> = parts.iter().map(|(text, color)| (text.as_str(), ink(*color))).collect();
+        let mut cell = job(&parts, &font);
         cell.wrap = egui::text::TextWrapping::truncate_at_width(width.max(8.0));
         let galley = painter.layout_job(cell);
         painter.galley(pos2(x, rect.center().y - galley.size().y / 2.0), galley, theme::TEXT);
@@ -376,7 +419,7 @@ mod tests {
             ..Default::default()
         };
         let mut action = GamesAction::None;
-        ctx.run_ui(input, |ui| action = view.show(ui.ctx(), true))
+        ctx.run_ui(input, |ui| action = view.show(ui.ctx(), true, &[]))
             .drop_without_applying_deltas();
         action
     }

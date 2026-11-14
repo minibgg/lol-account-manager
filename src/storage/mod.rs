@@ -142,7 +142,9 @@ impl Storage {
             let mut creds = self.secrets.credentials(&account.secret_ref)?;
             login.apply(&mut creds.login);
             password.apply(&mut creds.password);
-            let creds = Credentials::new(creds.login, creds.password);
+            // take() — забрать значение из поля (у Credentials есть Drop, просто
+            // «вынуть» поле из него компилятор не даст).
+            let creds = Credentials::new(creds.login.take(), creds.password.take());
             self.secrets.set_credentials(&account.secret_ref, &creds)?;
             self.db
                 .set_credential_flags(id, creds.login.is_some(), creds.password.is_some())?;

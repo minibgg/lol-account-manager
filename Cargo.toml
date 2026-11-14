@@ -1,12 +1,17 @@
 [package]
 name = "lol-account-manager"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "LoL Account Manager — менеджер аккаунтов League of Legends на Rust (eframe/egui)"
 publish = false
 
 [dependencies]
 arboard = { version = "3.7.0", default-features = false }
+# Зашифрованная резервная копия с паролями (src/vault.rs): ключ из пароля — Argon2id,
+# шифрование — XChaCha20-Poly1305.
+argon2 = { version = "0.6.0", default-features = false, features = ["alloc"] }
+base64 = "0.23.1"
+chacha20poly1305 = "0.11.0"
 dirs = "7.0.0"
 # persistence — eframe запоминает размер и положение окна (файл window.ron в папке данных).
 eframe = { version = "0.37.0", features = ["persistence"] }
@@ -21,12 +26,26 @@ rfd = "0.17.2"
 rusqlite = { version = "0.41.1", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+# Контрольная сумма скачанного установщика (обновление приложения, src/update.rs).
+sha2 = "0.11.1"
 sysinfo = { version = "0.40.1", default-features = false, features = ["system"] }
 thiserror = "2.0.21"
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "sync", "fs"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "sync", "fs", "io-util"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.29.0", features = ["v4"] }
+# Затирает секреты в памяти нулями, когда они больше не нужны.
+zeroize = "1.9.1"
+
+# Только Windows: значок в трее и запись в реестр для запуска вместе с системой.
+[target.'cfg(windows)'.dependencies]
+tray-icon = { version = "0.26.1", default-features = false }
+# Уведомления Windows («игра закончилась, +18 LP»), src/notify.rs.
+tauri-winrt-notification = "0.8.1"
+winreg = "0.56.0"
+# Windows Hello (отпечаток, лицо или PIN перед копированием пароля), src/hello.rs.
+windows = { version = "0.62.2", features = ["Security_Credentials_UI", "Win32_System_WinRT", "Win32_UI_WindowsAndMessaging"] }
+windows-future = "0.3.2"
 
 [build-dependencies]
 # Вшивает иконку и название программы в exe (Windows). На других системах build.rs ничего не делает.

@@ -318,6 +318,9 @@ pub struct PlayerStats {
     pub items: Vec<i32>,
     /// Лучшая серия убийств подряд: 2 — двойное … 5 — пентакилл.
     pub largest_multi_kill: u32,
+    /// Позиция: «top», «jungle», «middle», «bottom», «utility» (как в `lobby::Position`).
+    /// Пустая — неизвестна (режим без позиций или старая запись архива).
+    pub position: String,
 }
 
 impl PlayerStats {
@@ -519,6 +522,9 @@ pub struct MatchParticipantDto {
     pub total_damage_dealt_to_champions: u32,
     pub vision_score: u32,
     pub largest_multi_kill: u32,
+    /// «TOP», «JUNGLE», «MIDDLE», «BOTTOM», «UTILITY»; пусто — в режиме нет позиций.
+    #[serde(default)]
+    pub team_position: String,
     pub item0: i32,
     pub item1: i32,
     pub item2: i32,
@@ -567,6 +573,7 @@ impl MatchParticipantDto {
             vision: self.vision_score,
             items: vec![self.item0, self.item1, self.item2, self.item3, self.item4, self.item5, self.item6],
             largest_multi_kill: self.largest_multi_kill,
+            position: self.team_position.to_lowercase(),
         }
     }
 }
@@ -666,6 +673,44 @@ pub enum DataSource {
     RiotApi,
     /// Локальный API запущенного клиента League (LCU).
     Lcu,
+}
+
+/// Что есть на аккаунте: чемпионы, образы, валюта. Известно только для аккаунта,
+/// в который выполнен вход в клиенте League; последнее увиденное сохраняется в базе.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Inventory {
+    pub champions: u32,
+    /// Образы чемпионов (скины).
+    pub skins: u32,
+    pub blue_essence: i64,
+    pub orange_essence: i64,
+    pub rp: i64,
+    /// Когда получено (unix-время).
+    pub fetched_at: i64,
+}
+
+/// spectator-v5: игра, которая идёт прямо сейчас.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CurrentGameDto {
+    pub game_id: i64,
+    /// Начало игры, миллисекунды unix-времени; 0 — ещё идёт загрузка.
+    #[serde(default)]
+    pub game_start_time: i64,
+    #[serde(default)]
+    pub game_queue_config_id: i32,
+    #[serde(default)]
+    pub participants: Vec<CurrentGameParticipantDto>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CurrentGameParticipantDto {
+    /// У скрытых (анонимных) игроков puuid нет.
+    #[serde(default)]
+    pub puuid: Option<String>,
+    #[serde(default)]
+    pub champion_id: i32,
 }
 
 /// Всё, что мы узнали об аккаунте за одно обновление.

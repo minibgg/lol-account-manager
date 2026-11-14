@@ -130,6 +130,15 @@ jobs:
 
           [Run]
           Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
+          ; Обновление из самого приложения (src/update.rs): оно запускает установщик
+          ; с /SILENT /relaunch=1 и закрывается, а после установки открывается снова.
+          Filename: "{app}\{#AppExe}"; Flags: nowait skipifnotsilent; Check: RelaunchRequested
+
+          [Code]
+          function RelaunchRequested: Boolean;
+          begin
+            Result := ExpandConstant('{param:relaunch|0}') = '1';
+          end;
           '@
           & $iscc "/DAppVersion=$env:VERSION" "/DSourceRoot=$env:GITHUB_WORKSPACE" $iss
 
