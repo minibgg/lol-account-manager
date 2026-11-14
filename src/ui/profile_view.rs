@@ -12,7 +12,7 @@ use crate::error::AppError;
 use crate::history::{DAY, Queue};
 use crate::lobby::Position;
 use crate::profile::{self, ChampionSort, ChampionStats, Totals};
-use crate::riot::MatchSummary;
+use crate::riot::{Inventory, MatchSummary};
 use crate::storage::{Account, AccountId, unix_now};
 use crate::ui::format;
 use crate::ui::games_view::Filter;
@@ -71,6 +71,8 @@ pub struct ProfileView {
     pub account: AccountId,
     /// Все игры из архива, новые первыми. `None` — ещё грузятся.
     pub games: Option<Result<Vec<MatchSummary>, AppError>>,
+    /// Инвентарь: `None` — ещё грузится, `Some(None)` — этот аккаунт в клиенте ещё не видели.
+    pub inventory: Option<Option<Inventory>>,
     filter: Filter,
     period: Period,
     sort: ChampionSort,
@@ -84,6 +86,7 @@ impl ProfileView {
         Self {
             account,
             games: None,
+            inventory: None,
             filter: Filter::All,
             period: Period::All,
             sort: ChampionSort::Games,
@@ -120,6 +123,7 @@ impl ProfileView {
                 ui.set_width(WIDTH);
                 ui.spacing_mut().item_spacing.y = 4.0;
                 close = header(ui, account, now);
+                inventory_line(ui, self.inventory.as_ref());
                 ui.add_space(4.0);
                 self.switches(ui);
                 separator(ui);
@@ -354,6 +358,52 @@ fn header(ui: &mut egui::Ui, account: &Account, now: i64) -> bool {
         ui.label(job(&parts, &font));
     }
     close
+}
+
+/// «инвентарь чемпионов 75 · образов 56 · BE 12 415 · RP 0 · оранжевой эссенции 29».
+fn inventory_line(ui: &mut egui::Ui, inventory: Option<&Option<Inventory>>) {
+    let font = theme::mono(FONT);
+    let k = theme::TEXT_HINT;
+    let dot = (" · ", k);
+    match inventory {
+        None => {}
+        Some(None) => {
+            ui.label(job(
+                &[("инвентарь ", k), ("появится, когда вы войдёте в этот аккаунт в клиенте League и откроете профиль", k)],
+                &font,
+            ));
+        }
+        Some(Some(inventory)) => {
+            // Числа с разрядами через пробел; отрицательных здесь не бывает.
+            let number = |n: i64| match_view::number(n.clamp(0, i64::from(u32::MAX)) as u32);
+            let champions = inventory.champions.to_string();
+            let skins = inventory.skins.to_string();
+            let (blue, orange, rp) = (number(inventory.blue_essence), number(inventory.orange_essence), number(inventory.rp));
+            let seen = format!("на {}", format::relative_time(inventory.fetched_at));
+            ui.label(job(
+                &[
+                    ("инвентарь ", k),
+                    ("чемпионов ", k),
+                    (&champions, theme::TEXT),
+                    dot,
+                    ("образов ", k),
+                    (&skins, theme::TEXT),
+                    dot,
+                    ("синей эссенции ", k),
+                    (&blue, theme::TEXT),
+                    dot,
+                    ("оранжевой ", k),
+                    (&orange, theme::TEXT),
+                    dot,
+                    ("rp ", k),
+                    (&rp, theme::TEXT),
+                    dot,
+                    (&seen, k),
+                ],
+                &font,
+            ));
+        }
+    }
 }
 
 /// Общий итог по играм и последние игры буквами.
@@ -628,7 +678,16 @@ mod tests {
         let mut view = ProfileView::new(1);
         assert!(!frame(&ctx, &mut view, vec![]), "пока грузится — окно открыто");
         view.games = Some(Err(AppError::AccountMissing));
+        view.inventory = Some(None);
         frame(&ctx, &mut view, vec![]);
+        view.inventory = Some(Some(Inventory {
+            champions: 75,
+            skins: 56,
+            blue_essence: 12_415,
+            orange_essence: 29,
+            rp: 0,
+            fetched_at: unix_now(),
+        }));
         // 40 чемпионов по одной игре.
         view.games = Some(Ok((0..40).map(|i| game(i, 420, i % 2 == 0, i64::from(i))).collect()));
         frame(&ctx, &mut view, vec![]);

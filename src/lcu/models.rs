@@ -51,6 +51,26 @@ pub struct LcuChampSelectMember {
     pub tag_line: String,
 }
 
+/// Чемпион из `/lol-champions/v1/owned-champions-minimal` (там же — бесплатные на этой неделе).
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct LcuOwnedChampion {
+    pub ownership: LcuOwnership,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct LcuOwnership {
+    pub owned: bool,
+}
+
+/// Предмет из `/lol-inventory/v2/inventory/CHAMPION_SKIN` — образ чемпиона.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct LcuInventoryItem {
+    pub owned: bool,
+}
+
 /// `/lol-gameflow/v1/session` — текущая игра: номер, очередь, кто на ком и на какой позиции.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]

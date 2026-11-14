@@ -13,6 +13,7 @@ pub mod backend;
 pub mod clipboard;
 pub mod decay;
 pub mod error;
+pub mod hello;
 pub mod history;
 pub mod images;
 pub mod launcher;

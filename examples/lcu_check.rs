@@ -12,6 +12,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use lol_account_manager::lcu::{LcuClient, LcuStatus, lockfile};
+use lol_account_manager::lobby::LiveGame;
 use lol_account_manager::riot::{RankedStats, RiotId};
 use tracing_subscriber::EnvFilter;
 
@@ -78,6 +79,26 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 );
             }
         }
+    }
+    // Инвентарь и текущая игра — только для аккаунта, в который выполнен вход.
+    match lcu.inventory(0).await {
+        Ok(i) => println!(
+            "Инвентарь: чемпионов {}, образов {}, синей эссенции {}, оранжевой {}, RP {}",
+            i.champions, i.skins, i.blue_essence, i.orange_essence, i.rp
+        ),
+        Err(e) => println!("Инвентарь: не загрузился ({e})"),
+    }
+    let my_puuid = lcu.current_summoner().await?.puuid;
+    let champions = lcu.champion_names().await.unwrap_or_default();
+    match lcu.gameflow_session().await? {
+        Some(session) => match LiveGame::from_session(&session, &my_puuid, &champions, 0) {
+            Some(game) => println!(
+                "Сейчас:    игра {} — очередь {}, чемпион «{}», позиция «{}»",
+                game.game_id, game.queue_id, game.champion, game.position
+            ),
+            None => println!("Сейчас:    игры нет"),
+        },
+        None => println!("Сейчас:    игры нет"),
     }
     println!("Готово за {:.2} с (без API-ключа)", started.elapsed().as_secs_f64());
     Ok(())

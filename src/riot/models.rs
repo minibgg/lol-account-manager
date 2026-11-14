@@ -675,6 +675,20 @@ pub enum DataSource {
     Lcu,
 }
 
+/// Что есть на аккаунте: чемпионы, образы, валюта. Известно только для аккаунта,
+/// в который выполнен вход в клиенте League; последнее увиденное сохраняется в базе.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Inventory {
+    pub champions: u32,
+    /// Образы чемпионов (скины).
+    pub skins: u32,
+    pub blue_essence: i64,
+    pub orange_essence: i64,
+    pub rp: i64,
+    /// Когда получено (unix-время).
+    pub fetched_at: i64,
+}
+
 /// spectator-v5: игра, которая идёт прямо сейчас.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]

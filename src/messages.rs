@@ -24,7 +24,7 @@ use crate::error::AppError;
 use crate::images::{ImageBytes, ImageKey};
 use crate::lcu::LcuStatus;
 use crate::lobby::{LiveGame, LobbyState};
-use crate::riot::{DataSource, MatchDetails, MatchSummary, RankedQueues, RiotId};
+use crate::riot::{DataSource, Inventory, MatchDetails, MatchSummary, RankedQueues, RiotId};
 use crate::storage::{Account, AccountId, AccountInput, Credentials, SecretChange};
 use crate::update::UpdateInfo;
 
@@ -134,6 +134,9 @@ pub enum Command {
     LoadMatch { account: AccountId, match_id: String },
     /// Все игры аккаунта из архива — для окна «Все игры».
     LoadGames(AccountId),
+    /// Инвентарь аккаунта — для окна «Профиль»: свежий из клиента League, если в нём
+    /// выполнен вход в этот аккаунт, иначе последний сохранённый.
+    LoadInventory(AccountId),
     /// Нынешние ранги игроков одной игры — для окна «Подробности игры».
     /// `account` нужен ради сервера: игроки игры — с того же сервера, что и аккаунт.
     LoadRanks {
@@ -147,6 +150,9 @@ pub enum Command {
     InstallUpdate(UpdateInfo),
     /// Проверять ли обновления при запуске.
     SetUpdateCheck(bool),
+    /// Включить или выключить «спрашивать Windows Hello перед копированием пароля».
+    /// И включение, и выключение сами требуют проверки Windows Hello.
+    SetHelloLock(bool),
 }
 
 /// Итог импорта.
@@ -168,6 +174,8 @@ pub enum Event {
         league_dir: LeagueDirInfo,
         /// Включена ли проверка обновлений при запуске.
         update_check: bool,
+        /// Включена ли проверка Windows Hello перед копированием пароля.
+        hello_lock: bool,
     },
     /// База не открылась — без неё приложение работать не может.
     StartupFailed(AppError),
@@ -237,6 +245,12 @@ pub enum Event {
         result: Result<Vec<MatchSummary>, AppError>,
     },
 
+    /// Ответ на `LoadInventory`: `None` — инвентарь этого аккаунта ещё ни разу не видели.
+    InventoryLoaded {
+        account: AccountId,
+        inventory: Option<Inventory>,
+    },
+
     /// Ответ на `LoadRanks`: ранги тех игроков, кого удалось найти.
     RanksLoaded {
         match_id: String,
@@ -255,6 +269,9 @@ pub enum Event {
     /// Установщик проверен и запущен — окну пора закрыться, чтобы он заменил программу.
     UpdateInstalling,
     UpdateFailed(AppError),
+
+    /// Ответ на `SetHelloLock`: новое состояние настройки или почему оно не изменилось.
+    HelloLockSaved(Result<bool, AppError>),
 
     /// Ошибка, не привязанная к конкретному действию (например, хранилище паролей
     /// недоступно при запуске).

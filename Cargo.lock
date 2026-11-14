@@ -2489,6 +2489,8 @@ dependencies = [
  "tracing-subscriber",
  "tray-icon",
  "uuid",
+ "windows",
+ "windows-future",
  "winreg",
  "winresource",
  "zeroize",

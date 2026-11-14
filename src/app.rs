@@ -18,6 +18,7 @@ use crate::decay;
 use crate::notify::{self, Message, Notifier};
 use crate::backend::{Backend, is_same_account};
 use crate::error::AppError;
+use crate::hello;
 use crate::history::{self, Queue, Session};
 use crate::images::ImageKey;
 use crate::lcu::LcuStatus;
@@ -149,6 +150,15 @@ struct SettingsState {
     result: Option<Result<&'static str, AppError>>,
 }
 
+/// Настройка «спрашивать Windows Hello перед копированием пароля».
+#[derive(Default)]
+struct HelloState {
+    enabled: bool,
+    /// Ждём ответа человека в окне Windows Hello.
+    busy: bool,
+    result: Option<Result<&'static str, AppError>>,
+}
+
 #[derive(Default)]
 struct TransferState {
     /// Ждём, пока фоновый поток запишет или прочитает файл.
@@ -208,6 +218,7 @@ pub struct App {
     league_dir: LeagueDirState,
     /// Экспорт / импорт списка (настройки).
     transfer: TransferState,
+    hello: HelloState,
     update: UpdateState,
     desktop: DesktopState,
     /// Поиск, фильтр по тегу и сортировка над списком.
@@ -305,6 +316,7 @@ impl App {
             settings: SettingsState::default(),
             league_dir: LeagueDirState::default(),
             transfer: TransferState::default(),
+            hello: HelloState::default(),
             desktop,
             update: UpdateState {
                 auto: true,
@@ -531,8 +543,10 @@ impl App {
                 has_api_key,
                 league_dir,
                 update_check,
+                hello_lock,
             } => {
                 self.state = BackendState::Ready;
+                self.hello.enabled = hello_lock;
                 self.update.auto = update_check;
                 self.has_api_key = has_api_key;
                 self.league_dir.input = league_dir.custom.clone().unwrap_or_default();
@@ -774,11 +788,25 @@ impl App {
                     view.games = Some(result);
                 }
             }
+            Event::InventoryLoaded { account, inventory } => {
+                if let Some(view) = &mut self.profile_view
+                    && view.account == account
+                {
+                    view.inventory = Some(inventory);
+                }
+            }
             Event::UpdateChecked { result, manual } => self.update_checked(result, manual),
             Event::UpdateProgress { received, total } => self.update.progress = Some((received, total)),
             Event::UpdateInstalling => {
                 self.update.progress = None;
                 self.update.installing = true; // окно закроется в `ui`
+            }
+            Event::HelloLockSaved(result) => {
+                self.hello.busy = false;
+                self.hello.result = Some(result.map(|enabled| {
+                    self.hello.enabled = enabled;
+                    if enabled { "Защита включена" } else { "Защита выключена" }
+                }));
             }
             Event::UpdateFailed(error) => {
                 self.update.progress = None;
@@ -1009,6 +1037,7 @@ impl App {
                 if let Some(account) = self.accounts.iter().find(|a| a.archived_games > 0) {
                     self.profile_view = Some(ProfileView::new(account.id));
                     self.backend.send(Command::LoadGames(account.id));
+                    self.backend.send(Command::LoadInventory(account.id));
                 }
             }
             "games" => {
@@ -1714,6 +1743,7 @@ impl App {
             A::Profile => {
                 self.profile_view = Some(ProfileView::new(id));
                 self.backend.send(Command::LoadGames(id));
+                self.backend.send(Command::LoadInventory(id));
             }
             A::Game(n) => match game {
                 Some(match_id) => self.card_action(CardAction::OpenMatch(match_id), id),
@@ -2021,6 +2051,11 @@ impl App {
             ui.add_space(12.0);
             theme::panel().inner_margin(Margin::same(16)).show(ui, |ui| {
                 ui.set_width(ui.available_width());
+                self.hello_settings(ui);
+            });
+            ui.add_space(12.0);
+            theme::panel().inner_margin(Margin::same(16)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
                 self.transfer_settings(ui, frame);
             });
             ui.add_space(12.0);
@@ -2034,6 +2069,38 @@ impl App {
                 self.desktop_settings(ui);
             });
         });
+    }
+
+    /// Защита паролей проверкой Windows Hello (см. hello.rs).
+    fn hello_settings(&mut self, ui: &mut egui::Ui) {
+        ui.label(theme::caps("Защита паролей"));
+        ui.add_space(6.0);
+        let mut enabled = self.hello.enabled;
+        let mut changed = false;
+        ui.add_enabled_ui(hello::is_supported() && !self.hello.busy, |ui| {
+            let label = RichText::new("спрашивать Windows Hello перед копированием пароля").size(12.5).color(theme::TEXT);
+            changed = ui.checkbox(&mut enabled, label).changed();
+        });
+        if changed {
+            // Галочка переключится, только когда Windows Hello подтвердит (см. HelloLockSaved).
+            self.hello.busy = true;
+            self.hello.result = None;
+            self.backend.send(Command::SetHelloLock(enabled));
+        }
+        ui.add_space(4.0);
+        let text = if hello::is_supported() {
+            "Перед копированием пароля (клавиша p, второй шаг «Войти») и сохранением копии с \
+             паролями Windows попросит отпечаток пальца, лицо или PIN-код. После подтверждения \
+             две минуты повторно не спрашивает. Чтобы включить или выключить защиту, тоже нужно \
+             пройти проверку. Требуется настроенный вход Windows Hello (хотя бы PIN-код)."
+        } else {
+            "Windows Hello есть только в Windows."
+        };
+        ui.add(egui::Label::new(RichText::new(text).size(12.0).color(theme::TEXT_MUTED)).wrap());
+        if self.hello.busy {
+            ui.label(RichText::new("ждём подтверждения в окне Windows Hello…").size(12.0).color(theme::ACCENT_TEXT));
+        }
+        result_line(ui, self.hello.result.as_ref());
     }
 
     /// Запуск вместе с Windows и сворачивание в трей.

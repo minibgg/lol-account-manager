@@ -25,6 +25,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::clipboard::{self, SecretClipboard};
 use crate::error::{AppError, AppResult};
+use crate::hello;
 use crate::history::Queue;
 use crate::images::{self, ImageCache};
 use crate::launcher;
@@ -34,7 +35,7 @@ use crate::lcu::{LcuClient, LcuStatus, lockfile};
 use crate::lobby::{self, LiveGame, LobbyPhase, LobbyPlayer, LobbyState, PlayerProfile};
 use crate::messages::{Command, CredentialKind, Event, ImportReport, LeagueDirInfo, Secret};
 use crate::riot::{
-    AccountSnapshot, ApiKey, DataSource, MatchDetails, MatchSummary, PlayerStats, RankedQueues, Region, RiotClient,
+    AccountSnapshot, ApiKey, DataSource, Inventory, MatchDetails, MatchSummary, PlayerStats, RankedQueues, Region, RiotClient,
     RiotId,
 };
 use crate::storage::{Account, AccountId, AccountInput, Credentials, SecretChange, Storage, unix_now};
@@ -80,6 +81,12 @@ pub const LEAGUE_DIR_SETTING: &str = "league_dir";
 
 /// Настройка «проверять обновления при запуске»: «0» — выключено, иначе включено.
 pub const UPDATE_CHECK_SETTING: &str = "update_check";
+
+/// Ключ настройки «спрашивать Windows Hello перед копированием пароля» («1» — да).
+pub const HELLO_LOCK_SETTING: &str = "hello_lock";
+/// После успешной проверки Windows Hello столько времени не спрашиваем снова:
+/// «Войти» и следом «Пароль» — одно действие, а не два.
+const HELLO_GRACE: Duration = Duration::from_secs(120);
 
 /// Первая проверка обновлений — чуть погодя после запуска, чтобы не мешать загрузке списка.
 const UPDATE_FIRST_CHECK: Duration = Duration::from_secs(8);
@@ -309,6 +316,10 @@ struct Worker {
     /// Позиции в недавних играх аккаунта из клиента (номер игры → «middle»): клиент
     /// знает их во время игры, а в истории игр потом часто отдаёт пустыми.
     positions: Arc<Mutex<HashMap<i64, String>>>,
+    /// Включена ли проверка Windows Hello перед копированием пароля.
+    hello_lock: Arc<AtomicBool>,
+    /// До какого момента действует последняя успешная проверка Windows Hello.
+    hello_ok_until: Arc<Mutex<Option<Instant>>>,
     /// Проверка и скачивание новой версии приложения.
     updater: Updater,
     /// Установщик уже скачивается. `AtomicBool` — флажок, который можно менять из
@@ -332,11 +343,12 @@ impl Worker {
         } = config;
         // Открыть базу и найти папку клиента League (папка из настроек + стандартные
         // места) — всё это блокирующие операции с диском, поэтому в `blocking`.
-        let (storage, (league_dir, dirs), update_check) = blocking(move || {
+        let (storage, (league_dir, dirs), update_check, hello_lock) = blocking(move || {
             let storage = open_storage()?;
             let custom = storage.setting(LEAGUE_DIR_SETTING)?;
             let update_check = update_check_enabled(storage.setting(UPDATE_CHECK_SETTING)?);
-            Ok((storage, league_dirs(custom), update_check))
+            let hello_lock = storage.setting(HELLO_LOCK_SETTING)?.as_deref() == Some("1");
+            Ok((storage, league_dirs(custom), update_check, hello_lock))
         })
         .await?;
         debug!(?dirs, "где искать клиент League");
@@ -361,6 +373,8 @@ impl Worker {
             refreshing: Arc::default(),
             refresh_slots: Arc::new(Semaphore::new(PARALLEL_REFRESHES)),
             positions: Arc::default(),
+            hello_lock: Arc::new(AtomicBool::new(hello_lock)),
+            hello_ok_until: Arc::default(),
             updater: Updater::new(update_dir)?,
             update_running: Arc::default(),
         };
@@ -384,6 +398,7 @@ impl Worker {
             has_api_key,
             league_dir,
             update_check,
+            hello_lock,
         });
         worker.reload_accounts().await;
 
@@ -476,6 +491,79 @@ impl Worker {
         if let Err(error) = saved {
             self.events.send(Event::Warning(error));
         }
+    }
+
+    // ----- Инвентарь --------------------------------------------------------
+
+    /// Инвентарь аккаунта. Клиент League отдаёт его только для аккаунта, в который
+    /// выполнен вход: тогда берём свежий и запоминаем в базе (в настройках, по ключу
+    /// `inventory_<id>` — там только числа, ничего секретного). Для остальных аккаунтов
+    /// — то, что запомнили в прошлый раз.
+    async fn inventory(&self, id: AccountId) -> Option<Inventory> {
+        let key = format!("inventory_{id}");
+        let account = self.with_storage(move |s| s.get_account(id)).await.ok()?;
+        let in_client = match self.lcu.status().await {
+            LcuStatus::Connected { region, riot_id, puuid } => is_same_account(&account, region, &riot_id, &puuid),
+            _ => false,
+        };
+        if in_client {
+            match self.lcu.inventory(unix_now()).await {
+                Ok(inventory) => {
+                    if let Ok(json) = serde_json::to_string(&inventory) {
+                        let key = key.clone();
+                        let _ = self.with_storage(move |s| s.set_setting(&key, &json)).await;
+                    }
+                    return Some(inventory);
+                }
+                Err(error) => debug!(%error, "инвентарь из клиента не загрузился"),
+            }
+        }
+        let saved = self.with_storage(move |s| s.setting(&key)).await.ok()??;
+        serde_json::from_str(&saved).ok()
+    }
+
+    // ----- Windows Hello ----------------------------------------------------
+
+    /// Показывает окно Windows Hello и ждёт ответа (в блокирующем потоке).
+    async fn ask_hello(&self, reason: &'static str) -> AppResult<()> {
+        blocking(move || hello::verify(reason)).await?;
+        let mut until = self.hello_ok_until.lock().unwrap_or_else(PoisonError::into_inner);
+        *until = Some(Instant::now() + HELLO_GRACE);
+        Ok(())
+    }
+
+    /// Перед действием с паролями: если защита включена и недавней проверки нет —
+    /// спрашиваем Windows Hello. Ошибка — человек не подтвердил, действие отменяется.
+    async fn confirm_user(&self, reason: &'static str) -> AppResult<()> {
+        if !self.hello_lock.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let recently = self
+            .hello_ok_until
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some_and(|until| Instant::now() < until);
+        if recently {
+            return Ok(());
+        }
+        self.ask_hello(reason).await
+    }
+
+    /// Включает или выключает защиту. В обоих случаях сначала проверка Windows Hello:
+    /// включение доказывает, что она на этом компьютере работает (иначе пароли стало бы
+    /// не скопировать), а выключить защиту без проверки не должен мочь посторонний.
+    async fn set_hello_lock(&self, enabled: bool) -> AppResult<bool> {
+        self.ask_hello(if enabled {
+            "LoL Account Manager: включить проверку перед копированием пароля"
+        } else {
+            "LoL Account Manager: выключить проверку перед копированием пароля"
+        })
+        .await?;
+        self.with_storage(move |s| s.set_setting(HELLO_LOCK_SETTING, if enabled { "1" } else { "0" }))
+            .await?;
+        self.hello_lock.store(enabled, Ordering::SeqCst);
+        info!(enabled, "проверка Windows Hello перед копированием пароля");
+        Ok(enabled)
     }
 
     /// Раз в 2 секунды смотрит, что с лобби, и сообщает окну, если что-то изменилось.
@@ -878,6 +966,10 @@ impl Worker {
                     let result = worker.with_storage(move |s| s.archived_matches(account, None)).await;
                     worker.events.send(Event::GamesLoaded { account, result });
                 }
+                Command::LoadInventory(account) => {
+                    let inventory = worker.inventory(account).await;
+                    worker.events.send(Event::InventoryLoaded { account, inventory });
+                }
                 Command::LoadRanks { account, match_id, players } => {
                     let result = worker.player_ranks(account, players).await;
                     if let Err(error) = &result {
@@ -888,6 +980,10 @@ impl Worker {
                 Command::CheckUpdate => worker.check_update(true).await,
                 Command::InstallUpdate(info) => worker.install_update(info).await,
                 Command::SetUpdateCheck(enabled) => worker.set_update_check(enabled).await,
+                Command::SetHelloLock(enabled) => {
+                    let result = worker.set_hello_lock(enabled).await;
+                    worker.events.send(Event::HelloLockSaved(result));
+                }
             }
         });
     }
@@ -906,6 +1002,7 @@ impl Worker {
     /// Полная копия: список с логинами и паролями → зашифрованный файл (см. vault.rs).
     async fn export_vault(&self, path: PathBuf, password: Secret) -> AppResult<usize> {
         vault::check_password(password.expose())?;
+        self.confirm_user("LoL Account Manager: сохранить копию с паролями").await?;
         let text = self
             .with_storage(move |s| {
                 let mut entries = Vec::new();
@@ -1541,6 +1638,9 @@ impl Worker {
     }
 
     async fn try_copy(&self, id: AccountId, kind: CredentialKind) -> AppResult<u64> {
+        if kind == CredentialKind::Password {
+            self.confirm_user("LoL Account Manager: скопировать пароль").await?;
+        }
         let mut credentials = self.with_storage(move |s| s.credentials(id)).await?;
         // Забираем нужное поле (take), второе затрётся в памяти вместе с credentials.
         let secret = match kind {
