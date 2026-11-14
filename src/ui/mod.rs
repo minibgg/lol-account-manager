@@ -10,6 +10,7 @@ pub mod image_store;
 pub mod keymap;
 pub mod lobby_view;
 pub mod match_view;
+pub mod overview_view;
 pub mod post_game;
 pub mod profile_view;
 pub mod rank_history;

@@ -20,6 +20,7 @@ pub mod lcu;
 pub mod lobby;
 pub mod messages;
 pub mod notify;
+pub mod overview;
 pub mod profile;
 pub mod riot;
 pub mod single_instance;

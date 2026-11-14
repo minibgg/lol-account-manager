@@ -25,7 +25,7 @@ use crate::lobby::{self, LiveGame, LobbyPhase, LobbyState};
 use crate::messages::{Command, CredentialKind, Event, LeagueDirInfo, Secret};
 use crate::riot::models::RECENT_MATCHES;
 use crate::riot::{Division, MatchDetails, MatchSummary, RankedQueues, Region, RiotId};
-use crate::storage::{Account, AccountId, unix_now};
+use crate::storage::{Account, AccountId, AccountInput, SecretChange, unix_now};
 use crate::single_instance;
 use crate::transfer;
 use crate::tray::{self, Tray, TrayAction};
@@ -37,6 +37,7 @@ use crate::ui::image_store::ImageStore;
 use crate::ui::theme::{self, Weight};
 use crate::ui::widgets::{self, Button, Icon, Tone};
 use crate::ui::match_view::{DialogAction, MatchDialog, Ranks};
+use crate::ui::overview_view::{OverviewAction, OverviewView};
 use crate::ui::post_game::PostGame;
 use crate::ui::profile_view::ProfileView;
 use crate::ui::rank_history::{self, HistoryDialog};
@@ -124,8 +125,10 @@ struct Notice {
 
 /// Окно «Удалить аккаунт?».
 struct ConfirmDelete {
-    id: AccountId,
-    riot_id: RiotId,
+    /// Кого удаляем: один аккаунт или все отмеченные.
+    ids: Vec<AccountId>,
+    /// «Name#TAG» или список имён.
+    names: String,
     has_credentials: bool,
 }
 
@@ -228,6 +231,8 @@ pub struct App {
     login_flow: Option<LoginFlow>,
     /// Аккаунт под курсором (янтарная строка таблицы).
     cursor: Option<AccountId>,
+    /// Отмеченные аккаунты (пробел): r, Delete и «метка» действуют на них все.
+    marked: HashSet<AccountId>,
     /// Курсор сдвинули с клавиатуры — прокрутить таблицу к нему.
     scroll_to_cursor: bool,
     /// Открыто поле поиска над таблицей.
@@ -240,6 +245,8 @@ pub struct App {
     help_open: bool,
     /// Окно «Все игры» (архив игр аккаунта, клавиша m).
     games_view: Option<GamesView>,
+    /// Окно «Сводка» (все аккаунты за период, клавиша d).
+    overview: Option<OverviewView>,
     /// Окно «Профиль» (статистика по архиву игр, клавиша i).
     profile_view: Option<ProfileView>,
     /// Только для отладки (LOLAM_DEBUG_PAGE=lobby-demo): лобби из тестовых аккаунтов,
@@ -316,6 +323,7 @@ impl App {
                 .filter(|_| cfg!(debug_assertions)),
             login_flow: None,
             cursor: None,
+            marked: HashSet::new(),
             scroll_to_cursor: false,
             search_open: false,
             search_focus: false,
@@ -323,6 +331,7 @@ impl App {
             help_open: false,
             games_view: None,
             profile_view: None,
+            overview: None,
             debug_lobby: false,
         }
     }
@@ -574,6 +583,7 @@ impl App {
                 _ => self.notify_error(&error),
             },
             Event::AccountDeleted(id) => {
+                self.marked.remove(&id);
                 if self.form.as_ref().and_then(AccountForm::editing) == Some(id) {
                     self.form = None;
                 }
@@ -889,8 +899,8 @@ impl App {
             CardAction::Edit => self.form = Some(AccountForm::edit(account)),
             CardAction::Delete => {
                 self.confirm_delete = Some(ConfirmDelete {
-                    id,
-                    riot_id: account.riot_id.clone(),
+                    ids: vec![id],
+                    names: account.riot_id.to_string(),
                     has_credentials: account.has_login || account.has_password,
                 });
             }
@@ -991,6 +1001,7 @@ impl App {
                 self.debug_lobby = true;
                 self.lobby = debug_lobby(&self.accounts);
             }
+            "overview" => self.overview = Some(OverviewView::default()),
             "profile" => {
                 if let Some(account) = self.accounts.iter().find(|a| a.archived_games > 0) {
                     self.profile_view = Some(ProfileView::new(account.id));
@@ -1390,6 +1401,7 @@ impl App {
             accounts: &visible,
             cursor: self.cursor,
             in_client,
+            marked: &self.marked,
             live: &live,
             refreshing: &self.refreshing,
             errors: &self.errors,
@@ -1434,6 +1446,14 @@ impl App {
                 && link(ui, &format!("поиск «{}»", self.view.search), theme::ACCENT_TEXT, "/ — изменить, Esc — сбросить")
             {
                 out.push(Invocation::new(Action::Search));
+            }
+            if !self.marked.is_empty() {
+                ui.label(RichText::new(format!("отмечено {}", self.marked.len())).font(font.clone()).color(theme::ACCENT_TEXT));
+                ui.label(
+                    RichText::new("r обновить · del удалить · :метка тег · esc снять")
+                        .font(font.clone())
+                        .color(theme::TEXT_HINT),
+                );
             }
             let tag = self.view.tag.clone().unwrap_or_else(|| "все".into());
             let tag_color = if self.view.tag.is_some() { theme::ACCENT_TEXT } else { theme::TEXT_MUTED };
@@ -1514,6 +1534,7 @@ impl App {
             || self.help_open
             || self.games_view.is_some()
             || self.profile_view.is_some()
+            || self.overview.is_some()
             || self.command.is_some()
             || ctx.text_edit_focused();
         if busy {
@@ -1542,6 +1563,12 @@ impl App {
             }
             return;
         }
+        // Есть отмеченные аккаунты и действие не про конкретный аккаунт из командной
+        // строки — «обновить» и «удалить» относятся ко всем отмеченным.
+        if account.is_none() && !self.marked.is_empty() && matches!(action, A::Refresh | A::Delete) {
+            self.run_on_marked(&action);
+            return;
+        }
         if action.needs_account() {
             match account.or(self.cursor) {
                 Some(id) => self.run_on(action, id, ctx),
@@ -1558,6 +1585,16 @@ impl App {
             A::Last => self.move_cursor(100_000),
             A::RefreshAll => self.refresh_all(),
             A::Add => self.open_add_form(),
+            A::MarkAll => {
+                let visible: Vec<AccountId> = self.view.apply(&self.accounts).iter().map(|a| a.id).collect();
+                // Все уже отмечены — снимаем отметки, иначе отмечаем все видимые.
+                if !visible.is_empty() && visible.iter().all(|id| self.marked.contains(id)) {
+                    self.marked.clear();
+                } else {
+                    self.marked.extend(visible);
+                }
+            }
+            A::ToggleTag(tag) => self.toggle_tag(&tag),
             A::NextTag => self.cycle_tag(1),
             A::PrevTag => self.cycle_tag(-1),
             A::NextSort => {
@@ -1573,12 +1610,18 @@ impl App {
             }
             A::CommandLine => self.command = Some(CommandLine::default()),
             A::Help => self.help_open = true,
+            A::Overview => {
+                self.go_to(Page::Accounts);
+                self.overview = Some(OverviewView::default());
+            }
             A::Quit => self.quit(ctx),
             A::Update => {
                 self.go_to(Page::Settings);
                 self.check_update();
             }
             A::Screen(screen) => self.go_to(screen),
+            // Первый Esc снимает отметки, второй — сбрасывает поиск и тег.
+            A::Escape if !self.marked.is_empty() => self.marked.clear(),
             A::Escape => {
                 self.view.search.clear();
                 self.view.tag = None;
@@ -1586,6 +1629,7 @@ impl App {
             }
             // С аккаунтом — в `run_on` выше.
             A::Select
+            | A::Mark
             | A::Login
             | A::CopyLogin
             | A::CopyPassword
@@ -1633,6 +1677,14 @@ impl App {
                     self.view.tag = None;
                 }
             }
+            A::Mark => {
+                // Отметить (или снять отметку) и перейти к следующей строке — так удобно
+                // отмечать несколько подряд.
+                if !self.marked.remove(&id) {
+                    self.marked.insert(id);
+                }
+                self.move_cursor(1);
+            }
             A::Login if pending => self.card_action(CardAction::FinishLogin, id),
             A::Login if in_client => self.notify("Вы уже вошли в этот аккаунт в клиенте League"),
             A::Login if !has_login => {
@@ -1672,6 +1724,78 @@ impl App {
             A::Delete => self.card_action(CardAction::Delete, id),
             _ => {}
         }
+    }
+
+    /// Отмеченные аккаунты в порядке списка.
+    fn marked_accounts(&self) -> Vec<&Account> {
+        self.accounts.iter().filter(|a| self.marked.contains(&a.id)).collect()
+    }
+
+    /// «Обновить» или «удалить» для всех отмеченных аккаунтов.
+    fn run_on_marked(&mut self, action: &Action) {
+        let marked = self.marked_accounts();
+        let ids: Vec<AccountId> = marked.iter().map(|a| a.id).collect();
+        match action {
+            Action::Refresh => {
+                for id in &ids {
+                    self.backend.send(Command::RefreshAccount(*id));
+                }
+                self.notify(format!("Обновляю отмеченные аккаунты: {}", ids.len()));
+            }
+            Action::Delete => {
+                let names: Vec<String> = marked.iter().map(|a| a.riot_id.to_string()).collect();
+                let has_credentials = marked.iter().any(|a| a.has_login || a.has_password);
+                self.confirm_delete = Some(ConfirmDelete {
+                    ids,
+                    names: names.join(", "),
+                    has_credentials,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// Команда «метка тег»: добавить тег отмеченным аккаунтам (без отметок — аккаунту
+    /// под курсором); если он уже есть у всех — убрать. Логины и пароли не трогаем.
+    fn toggle_tag(&mut self, tag: &str) {
+        let tag = tag.trim().to_lowercase();
+        let targets: Vec<&Account> = if self.marked.is_empty() {
+            self.accounts.iter().filter(|a| Some(a.id) == self.cursor).collect()
+        } else {
+            self.marked_accounts()
+        };
+        if tag.is_empty() || targets.is_empty() {
+            self.notify_error_text("Сначала выберите аккаунт или отметьте несколько пробелом".into());
+            return;
+        }
+        let remove = targets.iter().all(|a| a.tags.iter().any(|t| t.to_lowercase() == tag));
+        let commands: Vec<Command> = targets
+            .iter()
+            .filter(|a| remove || !a.tags.iter().any(|t| t.to_lowercase() == tag))
+            .map(|a| {
+                let mut tags: Vec<String> = a.tags.iter().filter(|t| t.to_lowercase() != tag).cloned().collect();
+                if !remove {
+                    tags.push(tag.clone());
+                }
+                Command::UpdateAccount {
+                    id: a.id,
+                    input: AccountInput {
+                        riot_id: a.riot_id.clone(),
+                        region: a.region,
+                        note: a.note.clone(),
+                        tags,
+                    },
+                    login: SecretChange::Keep,
+                    password: SecretChange::Keep,
+                }
+            })
+            .collect();
+        let count = commands.len();
+        for command in commands {
+            self.backend.send(command);
+        }
+        let what = if remove { "убран у" } else { "добавлен" };
+        self.notify(format!("Тег «{tag}» {what} аккаунтов: {count}"));
     }
 
     /// Сдвинуть курсор на `delta` строк (в пределах списка).
@@ -1753,6 +1877,16 @@ impl App {
                 self.history_dialog = None;
             }
         }
+        if let Some(view) = &mut self.overview {
+            match view.show(ctx, &self.accounts) {
+                OverviewAction::None => {}
+                OverviewAction::Close => self.overview = None,
+                OverviewAction::Select(id) => {
+                    self.overview = None;
+                    self.run_on(Action::Select, id, ctx);
+                }
+            }
+        }
         if let Some(view) = &mut self.profile_view {
             let close = match self.accounts.iter().find(|a| a.id == view.account) {
                 Some(account) => view.show(ctx, account),
@@ -1821,13 +1955,17 @@ impl App {
                     widgets::icon_tile(ui, Icon::Trash, Tone::Red, 40.0);
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 2.0;
-                        ui.label(RichText::new("Удалить аккаунт?").size(15.0).semibold().color(theme::TEXT));
-                        ui.label(RichText::new(confirm.riot_id.to_string()).size(12.5).color(theme::TEXT_MUTED));
+                        let title = match confirm.ids.len() {
+                            1 => "Удалить аккаунт?".to_string(),
+                            n => format!("Удалить аккаунты ({n})?"),
+                        };
+                        ui.label(RichText::new(title).size(15.0).semibold().color(theme::TEXT));
+                        ui.add(egui::Label::new(RichText::new(&confirm.names).size(12.5).color(theme::TEXT_MUTED)).wrap());
                     });
                 });
                 ui.add_space(12.0);
                 let text = if confirm.has_credentials {
-                    "Сохранённые логин и пароль этого аккаунта тоже будут удалены \
+                    "Сохранённые логины и пароли тоже будут удалены \
                      из хранилища паролей. Отменить нельзя."
                 } else {
                     "Отменить нельзя."
@@ -1843,7 +1981,10 @@ impl App {
             });
 
         if confirmed {
-            self.backend.send(Command::DeleteAccount(confirm.id));
+            for id in &confirm.ids {
+                self.backend.send(Command::DeleteAccount(*id));
+            }
+            self.marked.clear();
             self.confirm_delete = None;
         } else if cancelled || modal.should_close() {
             self.confirm_delete = None;

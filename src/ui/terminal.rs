@@ -121,6 +121,8 @@ pub struct Table<'a> {
     pub accounts: &'a [&'a Account],
     pub cursor: Option<AccountId>,
     pub in_client: Option<AccountId>,
+    /// Отмеченные аккаунты (пробел) — для действий сразу с несколькими.
+    pub marked: &'a HashSet<AccountId>,
     /// У кого сейчас идёт игра.
     pub live: &'a HashMap<AccountId, LiveGame>,
     pub refreshing: &'a HashSet<AccountId>,
@@ -163,6 +165,10 @@ impl Table<'_> {
                         clicked = Some(account.id);
                     }
                     if ui.is_rect_visible(rect) {
+                        // Отмеченная строка — с лёгкой янтарной подложкой.
+                        if self.marked.contains(&account.id) && !is_cursor {
+                            ui.painter().rect_filled(rect, 0, alpha(theme::ACCENT, 26));
+                        }
                         self.row(ui, rect, account, is_cursor, response.hovered());
                     }
                 }
@@ -225,7 +231,11 @@ impl Table<'_> {
         };
 
         let cells = [
-            job(&[(if is_cursor { "›" } else { "" }, ink(theme::TEXT))], &font),
+            match (self.marked.contains(&account.id), is_cursor) {
+                (true, _) => job(&[("+", ink(theme::ACCENT_TEXT))], &font),
+                (false, true) => job(&[("›", ink(theme::TEXT))], &font),
+                (false, false) => job(&[("", ink(theme::TEXT))], &font),
+            },
             job(
                 &[
                     (&account.riot_id.game_name, ink(theme::TEXT)),

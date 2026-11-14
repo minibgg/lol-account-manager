@@ -58,6 +58,13 @@ pub enum Action {
     Last,
     /// Поставить курсор на аккаунт (из командной строки: «dr4g» и Enter).
     Select,
+    /// Пробел: отметить аккаунт (или снять отметку) — для действий сразу с несколькими.
+    Mark,
+    /// Ctrl+A: отметить все видимые аккаунты (или снять все отметки).
+    MarkAll,
+    /// Команда «метка smurf»: добавить тег отмеченным аккаунтам (или убрать, если он
+    /// уже есть у всех). Без отметок — аккаунту под курсором.
+    ToggleTag(String),
     // Выбранный аккаунт
     /// Enter: «Войти» — логин в буфер и запустить Riot Client; второй Enter — пароль.
     Login,
@@ -88,6 +95,8 @@ pub enum Action {
     Search,
     CommandLine,
     Help,
+    /// Окно «Сводка»: все аккаунты разом за период.
+    Overview,
     /// Открыть настройки и проверить, нет ли новой версии приложения.
     Update,
     /// Закрыть программу совсем (с включённым треем крестик только прячет окно).
@@ -103,6 +112,7 @@ impl Action {
         matches!(
             self,
             Self::Select
+                | Self::Mark
                 | Self::Login
                 | Self::CopyLogin
                 | Self::CopyPassword
@@ -146,6 +156,7 @@ pub fn for_key(key: Key, mods: Modifiers) -> Option<Action> {
         (true, false, Key::K) => A::CommandLine,
         (true, false, Key::F) => A::Search,
         (true, false, Key::N) => A::Add,
+        (true, false, Key::A) => A::MarkAll,
         (true, false, Key::Num1) => A::Screen(Screen::Accounts),
         (true, false, Key::Num2) => A::Screen(Screen::Lobby),
         (true, false, Key::Num3) => A::Screen(Screen::Settings),
@@ -164,6 +175,7 @@ pub fn for_key(key: Key, mods: Modifiers) -> Option<Action> {
             Key::Home | Key::G => A::First,
             Key::End => A::Last,
             Key::Enter => A::Login,
+            Key::Space => A::Mark,
             Key::L => A::CopyLogin,
             Key::P => A::CopyPassword,
             Key::C => A::CopyRiotId,
@@ -181,6 +193,7 @@ pub fn for_key(key: Key, mods: Modifiers) -> Option<Action> {
             Key::E => A::Edit,
             Key::Delete => A::Delete,
             Key::N => A::Add,
+            Key::D => A::Overview,
             Key::T => A::NextTag,
             Key::S => A::NextSort,
             Key::F1 => A::Help,
@@ -261,7 +274,9 @@ pub const HELP: &[HelpSection] = &[
             ("/  Ctrl+F", "поиск по нику, заметке, региону"),
             ("t  Shift+T", "следующий / предыдущий тег"),
             ("s", "сортировка: ранг → уровень → имя → дата"),
-            ("Esc", "сбросить поиск и тег"),
+            ("d", "сводка: LP, победы и поражения по всем аккаунтам за период"),
+            ("Space  Ctrl+A", "отметить аккаунт / все; дальше r, Delete или «: метка тег» — сразу для отмеченных"),
+            ("Esc", "снять отметки; сбросить поиск и тег"),
         ],
     },
     HelpSection {
