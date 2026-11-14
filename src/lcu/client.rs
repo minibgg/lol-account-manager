@@ -8,6 +8,7 @@ use std::time::Duration;
 use reqwest::StatusCode;
 use reqwest::header::ACCEPT;
 use serde::de::DeserializeOwned;
+use serde_json::json;
 use tracing::{debug, warn};
 
 use super::lockfile::Lockfile;
@@ -20,6 +21,7 @@ use crate::error::{AppError, AppResult};
 use crate::riot::client::encode_segment;
 use crate::riot::models::FETCH_MATCHES;
 use crate::riot::{AccountSnapshot, DataSource, Inventory, MatchSummary, RankedQueues, Region, RiotId};
+use crate::riot_login::{self, AuthStep};
 
 /// Что сейчас происходит с клиентом League.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +113,48 @@ impl LcuClient {
             .await
             .map_err(lcu_error)?;
         Ok(())
+    }
+
+    /// POST к локальному API Riot Client с телом JSON; возвращает тело ответа.
+    async fn riot_post(&self, path: &str, body: &serde_json::Value) -> AppResult<Vec<u8>> {
+        let lock = self.riot_lockfile().await?.ok_or(AppError::LcuNotRunning)?;
+        let url = format!("https://127.0.0.1:{}{path}", lock.port);
+        let response = self
+            .http
+            .post(&url)
+            .basic_auth("riot", Some(lock.password()))
+            .json(body)
+            .send()
+            .await
+            .map_err(lcu_error)?;
+        Ok(response.bytes().await.map_err(lcu_error)?.to_vec())
+    }
+
+    /// Начать вход: ответ скажет, нужна ли капча (см. [`crate::riot_login`]).
+    pub async fn riot_auth_start(&self, product_id: &str, intended: &str, language: &str) -> AppResult<AuthStep> {
+        let body = json!({"productId": product_id, "intendedProductId": intended, "language": language});
+        let bytes = self.riot_post("/rso-authenticator/v1/authentication/riot-identity/start", &body).await?;
+        Ok(riot_login::parse(&bytes))
+    }
+
+    /// Отправить логин, пароль и токен капчи. `captcha` пустой — если капча не нужна.
+    pub async fn riot_auth_complete(&self, username: &str, password: &str, captcha: &str, language: &str) -> AppResult<AuthStep> {
+        let body = json!({
+            "username": username,
+            "password": password,
+            "captcha": captcha,
+            "remember": true,
+            "language": language,
+        });
+        let bytes = self.riot_post("/rso-authenticator/v1/authentication/riot-identity/complete", &body).await?;
+        Ok(riot_login::parse(&bytes))
+    }
+
+    /// Отправить код подтверждения (двухфакторная защита).
+    pub async fn riot_auth_multifactor(&self, otp: &str) -> AppResult<AuthStep> {
+        let body = json!({"multifactor": {"otp": otp, "rememberDevice": true}});
+        let bytes = self.riot_post("/rso-authenticator/v1/authentication/multifactor", &body).await?;
+        Ok(riot_login::parse(&bytes))
     }
 
     /// Состояние клиента для индикатора в окне. Ошибки сводятся к трём состояниям.

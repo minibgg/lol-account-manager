@@ -134,6 +134,14 @@ struct ConfirmDelete {
     has_credentials: bool,
 }
 
+/// Окно ввода кода подтверждения (двухфакторная защита) при входе.
+struct LoginCodePrompt {
+    /// Куда Riot отправил код (пусто — неизвестно).
+    email: String,
+    code_length: u8,
+    input: String,
+}
+
 /// Нажата «Войти»: логин скопирован, ждём нажатия «Пароль» на этой карточке.
 struct LoginFlow {
     id: AccountId,
@@ -227,6 +235,8 @@ pub struct App {
     /// Открытая форма добавления или редактирования (`None` — закрыта).
     form: Option<AccountForm>,
     confirm_delete: Option<ConfirmDelete>,
+    /// Окно ввода кода подтверждения при входе (`None` — закрыто).
+    login_code_prompt: Option<LoginCodePrompt>,
     /// Окно «Подробности игры» (щелчок по игре на строке аккаунта).
     match_dialog: Option<MatchDialog>,
     /// Уже загруженные подробности: повторное открытие той же игры — без запроса.
@@ -327,6 +337,7 @@ impl App {
             images: ImageStore::default(),
             form,
             confirm_delete: None,
+            login_code_prompt: None,
             match_dialog: None,
             match_cache: HashMap::new(),
             player_ranks: HashMap::new(),
@@ -688,6 +699,9 @@ impl App {
             Event::AutoLoginProgress(text) => self.notify(text),
             Event::AutoLoginDone(Ok(text)) => self.notify(text),
             Event::AutoLoginDone(Err(error)) => self.notify_error(&error),
+            Event::AutoLoginNeedCode { email, code_length } => {
+                self.login_code_prompt = Some(LoginCodePrompt { email, code_length, input: String::new() });
+            }
             Event::RiotClientLaunched => self.notify(if self.login_flow.is_some() {
                 "Riot Client открывается. Вставьте логин (Ctrl+V), затем нажмите «Пароль» на карточке"
             } else {
@@ -1566,6 +1580,7 @@ impl App {
             || self.match_dialog.is_some()
             || self.history_dialog.is_some()
             || self.confirm_delete.is_some()
+            || self.login_code_prompt.is_some()
             || self.help_open
             || self.games_view.is_some()
             || self.profile_view.is_some()
@@ -1915,6 +1930,7 @@ impl App {
             }
         }
         self.delete_dialog(ctx);
+        self.login_code_dialog(ctx);
         if let Some(dialog) = &mut self.history_dialog {
             // Аккаунт могли удалить — тогда и окно закрываем.
             let close = match self.accounts.iter().find(|a| a.id == dialog.account) {
@@ -1979,6 +1995,64 @@ impl App {
                     });
                 }
             }
+        }
+    }
+
+    /// Окно ввода кода подтверждения при входе (двухфакторная защита).
+    fn login_code_dialog(&mut self, ctx: &egui::Context) {
+        let Some(prompt) = &mut self.login_code_prompt else {
+            return;
+        };
+        let none = egui::Modifiers::NONE;
+        let (submit, cancel) = ctx.input_mut(|i| {
+            (i.consume_key(none, egui::Key::Enter), i.consume_key(none, egui::Key::Escape))
+        });
+        // Some(код) — что отправить фоновому потоку; пустая строка — отмена.
+        let mut done: Option<String> = None;
+        let modal = egui::Modal::new(egui::Id::unique("login_code"))
+            .frame(theme::dialog_frame())
+            .show(ctx, |ui| {
+                ui.set_width(360.0);
+                ui.label(RichText::new("Код подтверждения").size(15.0).semibold().color(theme::TEXT));
+                ui.add_space(4.0);
+                let where_sent = if prompt.email.is_empty() {
+                    "Riot отправил код подтверждения.".to_string()
+                } else {
+                    format!("Riot отправил код на {}.", prompt.email)
+                };
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!("{where_sent} Введите {} цифр, чтобы войти.", prompt.code_length))
+                            .size(12.0)
+                            .color(theme::TEXT_MUTED),
+                    )
+                    .wrap(),
+                );
+                ui.add_space(10.0);
+                let edit = egui::TextEdit::singleline(&mut prompt.input)
+                    .font(theme::mono(16.0))
+                    .desired_width(160.0)
+                    .hint_text("******");
+                ui.add(edit).request_focus();
+                ui.add_space(12.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(Button::primary("Войти")).clicked() {
+                        done = Some(prompt.input.clone());
+                    }
+                    if ui.add(Button::outline("Отмена")).clicked() {
+                        done = Some(String::new());
+                    }
+                });
+            });
+        if submit {
+            done = Some(prompt.input.clone());
+        }
+        if cancel || modal.should_close() {
+            done = Some(String::new());
+        }
+        if let Some(code) = done {
+            self.backend.send(Command::SubmitLoginCode(code));
+            self.login_code_prompt = None;
         }
     }
 
