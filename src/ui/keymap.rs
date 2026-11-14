@@ -86,6 +86,10 @@ pub enum Action {
     Search,
     CommandLine,
     Help,
+    /// Открыть настройки и проверить, нет ли новой версии приложения.
+    Update,
+    /// Закрыть программу совсем (с включённым треем крестик только прячет окно).
+    Quit,
     Screen(Screen),
     /// Esc: сбросить поиск и фильтр.
     Escape,
@@ -113,7 +117,16 @@ impl Action {
 
     /// Работает на любом экране (остальные — только на экране аккаунтов).
     pub fn is_global(&self) -> bool {
-        matches!(self, Self::CommandLine | Self::Help | Self::Screen(_) | Self::RefreshAll | Self::Add)
+        matches!(
+            self,
+            Self::CommandLine
+                | Self::Help
+                | Self::Update
+                | Self::Quit
+                | Self::Screen(_)
+                | Self::RefreshAll
+                | Self::Add
+        )
     }
 }
 
@@ -271,6 +284,8 @@ pub const HELP: &[HelpSection] = &[
         title: "везде",
         rows: &[
             (":  Ctrl+K", "командная строка: «войти dr4g», «пароль benjm», «обновить все»"),
+            (": обновление", "проверить, нет ли новой версии приложения"),
+            (": выход", "закрыть программу совсем (с треем крестик только прячет окно)"),
             ("n  Ctrl+N", "добавить аккаунт"),
             ("Shift+R  F5", "обновить все аккаунты"),
             ("Ctrl+1 2 3", "аккаунты / лобби / настройки"),

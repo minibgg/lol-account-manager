@@ -5,9 +5,13 @@ use eframe::egui::{
     self, Align, Color32, Layout, Margin, Rect, RichText, Sense, Stroke, StrokeKind, Vec2, pos2, vec2,
 };
 
+use std::collections::HashMap;
+
 use crate::error::AppError;
 use crate::images::ImageKey;
-use crate::riot::{MatchDetails, MatchSummary, PlayerLine, PlayerStats, RiotId, TeamDetails};
+use crate::riot::{
+    MatchDetails, MatchSummary, PlayerLine, PlayerStats, RankedQueues, RankedStats, RiotId, TeamDetails,
+};
 use crate::storage::AccountId;
 use crate::ui::format;
 use crate::ui::image_store::ImageStore;
@@ -130,17 +134,45 @@ pub enum DialogAction {
     Retry,
 }
 
+/// Нынешние ранги игроков для окна (их загружают отдельно от самой игры).
+#[derive(Clone, Copy)]
+pub struct Ranks<'a> {
+    /// Кого уже нашли. `'a` — время жизни: структура лишь ссылается на таблицу,
+    /// которой владеет приложение, и не может её пережить.
+    pub known: &'a HashMap<RiotId, RankedQueues>,
+    /// Запрос ещё идёт — у остальных показываем «…».
+    pub loading: bool,
+}
+
+/// Очередь «Флекс 5×5» — в такой игре показываем ранг во флексе.
+const QUEUE_FLEX: i32 = 440;
+
+/// Какой ранг показать: в нужной очереди, а если его там нет — в другой, с пометкой.
+pub fn pick_rank(queues: &RankedQueues, prefer_flex: bool) -> Option<(&RankedStats, Option<&'static str>)> {
+    let (first, second, note) = if prefer_flex {
+        (&queues.flex, &queues.solo, "соло")
+    } else {
+        (&queues.solo, &queues.flex, "флекс")
+    };
+    match (first, second) {
+        (Some(stats), _) => Some((stats, None)),
+        (None, Some(stats)) => Some((stats, Some(note))),
+        (None, None) => None,
+    }
+}
+
 const COL_ICON: f32 = 30.0;
-const COL_NAME: f32 = 176.0;
+const COL_NAME: f32 = 150.0;
+const COL_RANK: f32 = 96.0;
 const COL_KDA: f32 = 104.0;
 const COL_DAMAGE: f32 = 124.0;
 const COL_GOLD: f32 = 62.0;
 const COL_CS: f32 = 70.0;
 const ITEM_SIZE: f32 = 20.0;
-const DIALOG_WIDTH: f32 = 790.0;
+const DIALOG_WIDTH: f32 = 868.0;
 
 impl MatchDialog {
-    pub fn show(&self, ctx: &egui::Context, images: &ImageStore) -> DialogAction {
+    pub fn show(&self, ctx: &egui::Context, images: &ImageStore, ranks: Ranks<'_>) -> DialogAction {
         let mut action = DialogAction::None;
         let modal = egui::Modal::new(egui::Id::unique("match_details"))
             .frame(theme::dialog_frame())
@@ -180,7 +212,7 @@ impl MatchDialog {
                             .max_height(height)
                             .min_scrolled_height(height)
                             .auto_shrink([false, true])
-                            .show(ui, |ui| teams(ui, details, images));
+                            .show(ui, |ui| teams(ui, details, images, ranks));
                     }
                 }
             });
@@ -234,18 +266,25 @@ impl MatchDialog {
 }
 
 /// Две команды одна под другой (своя первой).
-fn teams(ui: &mut egui::Ui, details: &MatchDetails, images: &ImageStore) {
+fn teams(ui: &mut egui::Ui, details: &MatchDetails, images: &ImageStore, ranks: Ranks<'_>) {
     // Полоски урона — относительно лучшего урона в игре.
     let max_damage = details.teams.iter().flat_map(|t| &t.players).map(|p| p.stats.damage).max().unwrap_or(0).max(1);
     for (index, team) in details.teams.iter().enumerate() {
         if index > 0 {
             ui.add_space(12.0);
         }
-        team_table(ui, team, details, max_damage, images);
+        team_table(ui, team, details, max_damage, images, ranks);
     }
 }
 
-fn team_table(ui: &mut egui::Ui, team: &TeamDetails, details: &MatchDetails, max_damage: u32, images: &ImageStore) {
+fn team_table(
+    ui: &mut egui::Ui,
+    team: &TeamDetails,
+    details: &MatchDetails,
+    max_damage: u32,
+    images: &ImageStore,
+    ranks: Ranks<'_>,
+) {
     let kills = team.kills();
     // Заголовок команды: «ВАША КОМАНДА · ПОБЕДА» и итоги справа.
     ui.horizontal(|ui| {
@@ -272,7 +311,7 @@ fn team_table(ui: &mut egui::Ui, team: &TeamDetails, details: &MatchDetails, max
     ui.add_space(4.0);
     column_titles(ui);
     for player in &team.players {
-        player_row(ui, player, kills, details.duration_secs, max_damage, images);
+        player_row(ui, player, kills, details, max_damage, images, ranks);
     }
 }
 
@@ -288,6 +327,7 @@ fn column_titles(ui: &mut egui::Ui) {
             });
         };
         title(ui, COL_ICON + COL_NAME + 8.0, "Игрок");
+        title(ui, COL_RANK, "Ранг сейчас");
         title(ui, COL_KDA, "K / D / A");
         title(ui, COL_DAMAGE, "Урон");
         title(ui, COL_GOLD, "Золото");
@@ -300,11 +340,13 @@ fn player_row(
     ui: &mut egui::Ui,
     player: &PlayerLine,
     team_kills: u32,
-    duration_secs: u32,
+    details: &MatchDetails,
     max_damage: u32,
     images: &ImageStore,
+    ranks: Ranks<'_>,
 ) {
     let stats = &player.stats;
+    let duration_secs = details.duration_secs;
     let fill = if player.is_me { alpha(theme::ACCENT, 30) } else { white(5) };
     let stroke = if player.is_me { alpha(theme::ACCENT_LIGHT, 70) } else { Color32::TRANSPARENT };
     egui::Frame::new()
@@ -347,6 +389,31 @@ fn player_row(
                         }
                     });
                     ui.label(RichText::new(champion_name(stats)).size(11.0).color(theme::TEXT_MUTED));
+                });
+
+                // Ранг на сегодня (не на момент игры): в очереди этой игры, иначе в другой.
+                cell(ui, COL_RANK, |ui| {
+                    let queues = player.riot_id.as_ref().and_then(|id| ranks.known.get(id));
+                    match queues.map(|q| pick_rank(q, details.queue_id == QUEUE_FLEX)) {
+                        Some(Some((rank, note))) => {
+                            ui.label(RichText::new(rank.rank_label()).size(12.0).color(theme::TEXT));
+                            let mut line = format!("{} LP", rank.lp);
+                            if let Some(note) = note {
+                                line.push_str(&format!(" · {note}"));
+                            }
+                            ui.label(RichText::new(line).size(10.5).color(theme::TEXT_MUTED));
+                        }
+                        Some(None) => {
+                            ui.label(RichText::new("без ранга").size(12.0).color(theme::TEXT_MUTED));
+                        }
+                        None if ranks.loading && player.riot_id.is_some() => {
+                            ui.label(RichText::new("…").size(12.0).color(theme::TEXT_HINT));
+                        }
+                        None => {
+                            ui.label(RichText::new("—").size(12.0).color(theme::TEXT_HINT))
+                                .on_hover_text("Ранг узнать не удалось: игрок скрыт, сменил ник или нет источника данных");
+                        }
+                    }
                 });
 
                 // K/D/A, коэффициент и участие в убийствах.
@@ -447,6 +514,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rank_is_taken_from_the_game_queue_first() {
+        use crate::riot::{Division, Tier};
+        let rank = |tier, lp| RankedStats { tier, division: Division::Two, lp, wins: 10, losses: None };
+        let both = RankedQueues { solo: Some(rank(Tier::Gold, 40)), flex: Some(rank(Tier::Silver, 10)) };
+        // Обычная игра — соло-ранг; игра во флексе — флекс-ранг. Пометки нет.
+        assert_eq!(pick_rank(&both, false).map(|(r, note)| (r.tier, note)), Some((Tier::Gold, None)));
+        assert_eq!(pick_rank(&both, true).map(|(r, note)| (r.tier, note)), Some((Tier::Silver, None)));
+        // Нужного ранга нет — берём другой и подписываем, откуда он.
+        let flex_only = RankedQueues { solo: None, flex: Some(rank(Tier::Silver, 10)) };
+        assert_eq!(pick_rank(&flex_only, false).map(|(r, note)| (r.tier, note)), Some((Tier::Silver, Some("флекс"))));
+        let solo_only = RankedQueues { solo: Some(rank(Tier::Gold, 40)), flex: None };
+        assert_eq!(pick_rank(&solo_only, true).map(|(r, note)| (r.tier, note)), Some((Tier::Gold, Some("соло"))));
+        assert!(pick_rank(&RankedQueues::default(), false).is_none());
+    }
+
     fn dialog() -> MatchDialog {
         MatchDialog {
             account: 1,
@@ -479,7 +562,8 @@ mod tests {
                 ..Default::default()
             };
             ctx.run_ui(input, |ui| {
-                dialog.show(ui.ctx(), &images);
+                let known = HashMap::new();
+                dialog.show(ui.ctx(), &images, Ranks { known: &known, loading: true });
             })
             .drop_without_applying_deltas();
         };

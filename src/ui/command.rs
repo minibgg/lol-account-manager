@@ -83,6 +83,8 @@ enum Kind {
     Sort,
     Go(Screen),
     Help,
+    Update,
+    Quit,
 }
 
 struct Spec {
@@ -110,6 +112,8 @@ const COMMANDS: &[Spec] = &[
     Spec { kind: Kind::Go(Screen::Lobby), names: &["лобби", "lobby"], hint: "экран лобби" },
     Spec { kind: Kind::Go(Screen::Settings), names: &["настройки", "settings"], hint: "экран настроек" },
     Spec { kind: Kind::Help, names: &["помощь", "help", "?"], hint: "горячие клавиши" },
+    Spec { kind: Kind::Quit, names: &["выход", "quit", "exit"], hint: "закрыть программу совсем" },
+    Spec { kind: Kind::Update, names: &["обновление", "upgrade", "версия"], hint: "проверить новую версию приложения" },
 ];
 
 /// Сортировки: (порядок, русское слово, английское).
@@ -128,7 +132,7 @@ impl Kind {
             Self::Refresh => Arg::AccountOrAll,
             Self::Tag => Arg::Tag,
             Self::Sort => Arg::Sort,
-            Self::Add | Self::Go(_) | Self::Help => Arg::None,
+            Self::Add | Self::Go(_) | Self::Help | Self::Update | Self::Quit => Arg::None,
         }
     }
 
@@ -148,6 +152,8 @@ impl Kind {
             // Остальные аккаунт не принимают — сюда не попадают.
             Self::Add => Action::Add,
             Self::Tag | Self::Sort | Self::Go(_) | Self::Help => Action::Help,
+            Self::Update => Action::Update,
+            Self::Quit => Action::Quit,
         }
     }
 
@@ -157,6 +163,8 @@ impl Kind {
             Self::Add => Some(Action::Add),
             Self::Go(screen) => Some(Action::Screen(screen)),
             Self::Help => Some(Action::Help),
+            Self::Update => Some(Action::Update),
+            Self::Quit => Some(Action::Quit),
             _ => None,
         }
     }

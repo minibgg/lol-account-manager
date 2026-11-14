@@ -22,8 +22,9 @@ use crate::error::AppError;
 use crate::images::{ImageBytes, ImageKey};
 use crate::lcu::LcuStatus;
 use crate::lobby::LobbyState;
-use crate::riot::{DataSource, MatchDetails, MatchSummary};
+use crate::riot::{DataSource, MatchDetails, MatchSummary, RankedQueues, RiotId};
 use crate::storage::{Account, AccountId, AccountInput, Credentials, SecretChange};
+use crate::update::UpdateInfo;
 
 /// Папка игры: какую указал пользователь и где игра нашлась на самом деле.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -117,6 +118,19 @@ pub enum Command {
     LoadMatch { account: AccountId, match_id: String },
     /// Все игры аккаунта из архива — для окна «Все игры».
     LoadGames(AccountId),
+    /// Нынешние ранги игроков одной игры — для окна «Подробности игры».
+    /// `account` нужен ради сервера: игроки игры — с того же сервера, что и аккаунт.
+    LoadRanks {
+        account: AccountId,
+        match_id: String,
+        players: Vec<RiotId>,
+    },
+    /// Проверить, нет ли новой версии приложения (кнопка в настройках).
+    CheckUpdate,
+    /// Скачать установщик этой версии, проверить его и запустить.
+    InstallUpdate(UpdateInfo),
+    /// Проверять ли обновления при запуске.
+    SetUpdateCheck(bool),
 }
 
 /// Итог импорта.
@@ -136,6 +150,8 @@ pub enum Event {
     Ready {
         has_api_key: bool,
         league_dir: LeagueDirInfo,
+        /// Включена ли проверка обновлений при запуске.
+        update_check: bool,
     },
     /// База не открылась — без неё приложение работать не может.
     StartupFailed(AppError),
@@ -202,6 +218,25 @@ pub enum Event {
         account: AccountId,
         result: Result<Vec<MatchSummary>, AppError>,
     },
+
+    /// Ответ на `LoadRanks`: ранги тех игроков, кого удалось найти.
+    RanksLoaded {
+        match_id: String,
+        result: Result<Vec<(RiotId, RankedQueues)>, AppError>,
+    },
+
+    /// Проверка обновлений закончилась: `Ok(None)` — установлена последняя версия.
+    /// `manual` — проверку запустил пользователь (тогда показываем и «обновлений нет»,
+    /// и ошибку; о неудачной фоновой проверке окно вообще не узнаёт).
+    UpdateChecked {
+        result: Result<Option<UpdateInfo>, AppError>,
+        manual: bool,
+    },
+    /// Установщик скачивается: сколько байт получено из скольких.
+    UpdateProgress { received: u64, total: u64 },
+    /// Установщик проверен и запущен — окну пора закрыться, чтобы он заменил программу.
+    UpdateInstalling,
+    UpdateFailed(AppError),
 
     /// Ошибка, не привязанная к конкретному действию (например, хранилище паролей
     /// недоступно при запуске).

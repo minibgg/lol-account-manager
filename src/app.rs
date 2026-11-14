@@ -7,10 +7,13 @@
 //! картинки, тема. Здесь — состояние окна, страницы и обработка событий.
 
 use std::collections::{HashMap, HashSet};
+use std::net::TcpListener;
+use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Margin, RichText};
 
+use crate::autostart;
 use crate::backend::{Backend, is_same_account};
 use crate::error::AppError;
 use crate::history::{self, Queue, Session};
@@ -19,16 +22,19 @@ use crate::lcu::LcuStatus;
 use crate::lobby::{self, LobbyPhase, LobbyState};
 use crate::messages::{Command, CredentialKind, Event, LeagueDirInfo, Secret};
 use crate::riot::models::RECENT_MATCHES;
-use crate::riot::{Division, MatchDetails, MatchSummary, Region, RiotId};
+use crate::riot::{Division, MatchDetails, MatchSummary, RankedQueues, Region, RiotId};
 use crate::storage::{Account, AccountId, unix_now};
+use crate::single_instance;
 use crate::transfer;
+use crate::tray::{self, Tray, TrayAction};
+use crate::update::{self, UpdateInfo, Version};
 use crate::ui::account_card::CardAction;
 use crate::ui::account_form::{AccountForm, FormAction};
 use crate::ui::account_list::{self, ListView, SortOrder};
 use crate::ui::image_store::ImageStore;
 use crate::ui::theme::{self, Weight};
 use crate::ui::widgets::{self, Button, Icon, Tone};
-use crate::ui::match_view::{DialogAction, MatchDialog};
+use crate::ui::match_view::{DialogAction, MatchDialog, Ranks};
 use crate::ui::post_game::PostGame;
 use crate::ui::rank_history::{self, HistoryDialog};
 use crate::ui::command::{self, Invocation, Suggestion, Target};
@@ -45,6 +51,36 @@ const LOGIN_FLOW_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Ключ сортировки в window.ron.
 const SORT_KEY: &str = "sort";
+/// «Сворачивать в трей при закрытии» в window.ron: «1» — включено. Хранится там, а не
+/// в базе, потому что нужно сразу при создании окна, до ответа фонового потока.
+const TRAY_KEY: &str = "close_to_tray";
+
+/// Что `main` передаёт приложению при запуске.
+pub struct Startup {
+    /// Порт, по которому вторая копия программы просит показать окно
+    /// (см. single_instance.rs). `None` — проверки второй копии нет.
+    pub listener: Option<TcpListener>,
+    /// Программу запустила Windows при входе в систему (а не пользователь).
+    pub by_system: bool,
+}
+
+/// Трей и автозапуск.
+struct DesktopState {
+    /// Значок в трее. `Some` — «при закрытии сворачивать в трей» включено.
+    tray: Option<Tray>,
+    /// Запуск вместе с Windows (как записано в реестре).
+    autostart: bool,
+    /// Спрятать окно в первом же кадре (запуск вместе с Windows сразу в трей).
+    hide_on_start: bool,
+    /// Выходим по-настоящему: закрытие окна больше не перехватываем.
+    quitting: bool,
+    /// Вторая копия программы просит показать окно.
+    show_requests: Receiver<()>,
+    /// Только для отладки (LOLAM_DEBUG_QUIT_AFTER=секунды): когда выйти тем же путём,
+    /// что и пункт «Выход» в трее.
+    debug_quit_at: Option<Instant>,
+    result: Option<Result<&'static str, AppError>>,
+}
 
 /// Какой экран открыт: аккаунты, лобби, настройки (см. ui/keymap.rs).
 use crate::ui::keymap::Screen as Page;
@@ -93,6 +129,24 @@ struct TransferState {
     result: Option<Result<String, AppError>>,
 }
 
+/// Обновление приложения (настройки и метка в шапке).
+#[derive(Default)]
+struct UpdateState {
+    /// Проверять при запуске (галочка в настройках).
+    auto: bool,
+    /// Ждём ответа на «Проверить сейчас».
+    checking: bool,
+    /// Найденная новая версия.
+    available: Option<UpdateInfo>,
+    /// Установщик скачивается: (получено, всего) байт.
+    progress: Option<(u64, u64)>,
+    /// Установщик запущен — окно закрывается.
+    installing: bool,
+    /// Можно ли обновиться кнопкой (программа запущена из папки установки).
+    can_install: bool,
+    result: Option<Result<String, AppError>>,
+}
+
 #[derive(Default)]
 struct LeagueDirState {
     info: LeagueDirInfo,
@@ -123,6 +177,8 @@ pub struct App {
     league_dir: LeagueDirState,
     /// Экспорт / импорт списка (настройки).
     transfer: TransferState,
+    update: UpdateState,
+    desktop: DesktopState,
     /// Поиск, фильтр по тегу и сортировка над списком.
     view: ListView,
     images: ImageStore,
@@ -133,6 +189,10 @@ pub struct App {
     match_dialog: Option<MatchDialog>,
     /// Уже загруженные подробности: повторное открытие той же игры — без запроса.
     match_cache: HashMap<String, MatchDetails>,
+    /// Нынешние ранги игроков из открытых игр (на время работы программы).
+    player_ranks: HashMap<RiotId, RankedQueues>,
+    /// Игры, для которых ранги игроков сейчас загружаются.
+    ranks_loading: HashSet<String>,
     /// Окно «История ранга» (щелчок по рангу на строке аккаунта).
     history_dialog: Option<HistoryDialog>,
     /// Карточка «после игры» в правом нижнем углу.
@@ -164,8 +224,9 @@ impl App {
     /// Вызывается один раз при старте (из main.rs).
     /// `&eframe::CreationContext<'_>` — ссылка (заимствование): мы только читаем `cc`,
     /// владеет им eframe. `'_` — время жизни ссылки, компилятор выводит его сам.
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, startup: Startup) -> Self {
         theme::apply(&cc.egui_ctx);
+        let desktop = Self::desktop_state(cc, startup);
         // Декодеры картинок (PNG) из egui_extras: превращают байты в текстуры.
         egui_extras::install_image_loaders(&cc.egui_ctx);
         // Сортировка с прошлого запуска (см. `save` ниже). `cc.storage` — None,
@@ -182,7 +243,7 @@ impl App {
         // или форму сразу — чтобы проверять внешний вид по скриншотам без кликов.
         let (page, form) = match std::env::var("LOLAM_DEBUG_PAGE").as_deref() {
             Ok("lobby") if cfg!(debug_assertions) => (Page::Lobby, None),
-            Ok("settings") if cfg!(debug_assertions) => (Page::Settings, None),
+            Ok("settings" | "update") if cfg!(debug_assertions) => (Page::Settings, None),
             Ok("add") if cfg!(debug_assertions) => (Page::Accounts, Some(AccountForm::add(Region::Ru))),
             // «match» — открыть подробности первой игры первого аккаунта (см. Event::Accounts).
             Ok("match") if cfg!(debug_assertions) => (Page::Accounts, None),
@@ -206,12 +267,20 @@ impl App {
             settings: SettingsState::default(),
             league_dir: LeagueDirState::default(),
             transfer: TransferState::default(),
+            desktop,
+            update: UpdateState {
+                auto: true,
+                can_install: update::can_self_install(),
+                ..UpdateState::default()
+            },
             view,
             images: ImageStore::default(),
             form,
             confirm_delete: None,
             match_dialog: None,
             match_cache: HashMap::new(),
+            player_ranks: HashMap::new(),
+            ranks_loading: HashSet::new(),
             history_dialog: None,
             post_game: None,
             debug_page: std::env::var("LOLAM_DEBUG_PAGE")
@@ -229,6 +298,101 @@ impl App {
         }
     }
 
+    // ----- Трей, автозапуск, вторая копия -----------------------------------
+
+    fn desktop_state(cc: &eframe::CreationContext<'_>, startup: Startup) -> DesktopState {
+        // Канал: поток, слушающий порт, сообщает окну «вторая копия просит показаться».
+        let (show_tx, show_requests) = mpsc::channel();
+        if let Some(listener) = startup.listener {
+            let ctx = cc.egui_ctx.clone();
+            single_instance::listen(listener, move || {
+                let _ = show_tx.send(());
+                ctx.request_repaint(); // разбудить окно, даже если оно спрятано
+            });
+        }
+        let wants_tray = cc.storage.and_then(|s| s.get_string(TRAY_KEY)).as_deref() == Some("1");
+        let tray = if wants_tray {
+            Tray::new(cc.egui_ctx.clone())
+                .inspect_err(|error| tracing::warn!(%error, "значок в трее не создан"))
+                .ok()
+        } else {
+            None
+        };
+        let debug_quit_at = std::env::var("LOLAM_DEBUG_QUIT_AFTER")
+            .ok()
+            .filter(|_| cfg!(debug_assertions))
+            .and_then(|secs| secs.parse().ok())
+            .map(|secs| Instant::now() + Duration::from_secs(secs));
+        DesktopState {
+            // Windows запустила нас при входе в систему, и трей включён — сразу в трей.
+            hide_on_start: startup.by_system && tray.is_some(),
+            tray,
+            autostart: autostart::is_enabled(),
+            quitting: false,
+            show_requests,
+            debug_quit_at,
+            result: None,
+        }
+    }
+
+    /// Нажатия в трее и просьбы второй копии. Вызывается из `logic`, которая работает
+    /// и тогда, когда окно спрятано.
+    fn desktop_events(&mut self, ctx: &egui::Context) {
+        let mut show = self.desktop.show_requests.try_recv().is_ok();
+        let mut quit = false;
+        if let Some(tray) = &self.desktop.tray {
+            while let Some(action) = tray.poll() {
+                match action {
+                    TrayAction::Show => show = true,
+                    TrayAction::Quit => quit = true,
+                }
+            }
+        }
+        if let Some(at) = self.desktop.debug_quit_at {
+            let left = at.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                self.desktop.debug_quit_at = None;
+                quit = true;
+            } else {
+                ctx.request_repaint_after(left);
+            }
+        }
+        if quit {
+            self.quit(ctx);
+        } else if show {
+            self.show_window(ctx);
+        }
+    }
+
+    /// Закрыть программу совсем (а не спрятать в трей).
+    fn quit(&mut self, ctx: &egui::Context) {
+        self.desktop.quitting = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        ctx.request_repaint();
+    }
+
+    fn show_window(&mut self, ctx: &egui::Context) {
+        self.desktop.hide_on_start = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        ctx.request_repaint();
+    }
+
+    /// Перехват закрытия окна: с включённым треем крестик (и Alt+F4) прячет окно.
+    fn close_to_tray(&mut self, ctx: &egui::Context) {
+        // mem::take — забрать значение и оставить на его месте false.
+        let hide_now = std::mem::take(&mut self.desktop.hide_on_start);
+        let closing = ctx.input(|i| i.viewport().close_requested());
+        let to_tray = closing && self.desktop.tray.is_some() && !self.desktop.quitting;
+        if to_tray {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+        if to_tray || hide_now {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+    }
+
     // ----- События от фонового потока ---------------------------------------
 
     /// `match` обязан покрыть все варианты Event: если добавить новое событие
@@ -238,8 +402,10 @@ impl App {
             Event::Ready {
                 has_api_key,
                 league_dir,
+                update_check,
             } => {
                 self.state = BackendState::Ready;
+                self.update.auto = update_check;
                 self.has_api_key = has_api_key;
                 self.league_dir.input = league_dir.custom.clone().unwrap_or_default();
                 self.league_dir.info = league_dir;
@@ -438,12 +604,23 @@ impl App {
             Event::MatchLoaded { match_id, result } => {
                 if let Ok(details) = &result {
                     self.match_cache.insert(match_id.clone(), details.clone());
+                    // Игра пришла — теперь можно спросить ранги её игроков.
+                    if let Some(account) = self.match_dialog.as_ref().filter(|d| d.summary.id == match_id).map(|d| d.account) {
+                        self.request_ranks(account, details);
+                    }
                 }
                 // Окно могли закрыть или открыть другую игру — тогда ответ только в кэш.
                 if let Some(dialog) = &mut self.match_dialog
                     && dialog.summary.id == match_id
                 {
                     dialog.details = Some(result);
+                }
+            }
+            Event::RanksLoaded { match_id, result } => {
+                self.ranks_loading.remove(&match_id);
+                // Ошибка — не беда: в столбце «Ранг» останутся прочерки.
+                if let Ok(found) = result {
+                    self.player_ranks.extend(found);
                 }
             }
             Event::GamesLoaded { account, result } => {
@@ -453,8 +630,54 @@ impl App {
                     view.games = Some(result);
                 }
             }
+            Event::UpdateChecked { result, manual } => self.update_checked(result, manual),
+            Event::UpdateProgress { received, total } => self.update.progress = Some((received, total)),
+            Event::UpdateInstalling => {
+                self.update.progress = None;
+                self.update.installing = true; // окно закроется в `ui`
+            }
+            Event::UpdateFailed(error) => {
+                self.update.progress = None;
+                self.update.result = Some(Err(error));
+            }
+
             Event::Warning(error) => self.notify_error(&error),
         }
+    }
+
+    /// Ответ на проверку обновлений.
+    fn update_checked(&mut self, result: Result<Option<UpdateInfo>, AppError>, manual: bool) {
+        self.update.checking = false;
+        match result {
+            Ok(Some(info)) => {
+                // О каждой новой версии говорим один раз, а не каждые 6 часов.
+                if self.update.available.as_ref() != Some(&info) {
+                    self.notify(format!(
+                        "Доступна версия {} — настройки → обновление (или команда «обновление»)",
+                        info.version
+                    ));
+                }
+                self.update.available = Some(info);
+                self.update.result = None;
+            }
+            Ok(None) => {
+                self.update.available = None;
+                if manual {
+                    self.update.result = Some(Ok("Установлена последняя версия".into()));
+                }
+            }
+            Err(error) => self.update.result = Some(Err(error)),
+        }
+    }
+
+    /// «Проверить сейчас» (кнопка в настройках или команда «обновление»).
+    fn check_update(&mut self) {
+        if self.update.checking || self.update.progress.is_some() {
+            return;
+        }
+        self.update.checking = true;
+        self.update.result = None;
+        self.backend.send(Command::CheckUpdate);
     }
 
     fn replace_account(&mut self, account: Account) {
@@ -555,7 +778,11 @@ impl App {
     /// Окно «Подробности игры»: уже открывали — сразу, иначе просим фоновый поток
     /// (он возьмёт из архива, клиента League или Riot API).
     fn open_match(&mut self, id: AccountId, owner: RiotId, summary: MatchSummary) {
-        let details = self.match_cache.get(&summary.id).cloned().map(Ok);
+        let cached = self.match_cache.get(&summary.id).cloned();
+        if let Some(details) = &cached {
+            self.request_ranks(id, details);
+        }
+        let details = cached.map(Ok);
         if details.is_none() {
             self.backend.send(Command::LoadMatch {
                 account: id,
@@ -567,6 +794,26 @@ impl App {
             owner,
             summary,
             details,
+        });
+    }
+
+    /// Просит нынешние ранги игроков игры — тех, чьи ещё не знаем.
+    fn request_ranks(&mut self, account: AccountId, details: &MatchDetails) {
+        let players: Vec<RiotId> = details
+            .teams
+            .iter()
+            .flat_map(|team| &team.players)
+            .filter_map(|player| player.riot_id.clone())
+            .filter(|id| !self.player_ranks.contains_key(id))
+            .collect();
+        // `insert` возвращает false, если такой запрос уже идёт.
+        if players.is_empty() || !self.ranks_loading.insert(details.id.clone()) {
+            return;
+        }
+        self.backend.send(Command::LoadRanks {
+            account,
+            match_id: details.id.clone(),
+            players,
         });
     }
 
@@ -592,6 +839,18 @@ impl App {
                 }
             }
             "help" => self.help_open = true,
+            // Настройки с «найденной» новой версией — посмотреть панель обновления.
+            "update" => {
+                let current = Version::current();
+                self.update_checked(
+                    Ok(Some(UpdateInfo {
+                        version: Version { minor: current.minor + 1, patch: 0, ..current },
+                        page_url: update::RELEASES_PAGE.to_string(),
+                        installer: None,
+                    })),
+                    false,
+                );
+            }
             "lobby-demo" => {
                 self.page = Page::Lobby;
                 self.debug_lobby = true;
@@ -726,6 +985,7 @@ impl App {
         let session = self.client_session();
         let lobby_active = self.lobby.phase.is_active();
         let (status, status_color, status_hint) = terminal_status(&self.lcu, self.lobby.phase);
+        let new_version = self.update.available.as_ref().map(|info| info.version);
         let mut go = None;
         egui::Panel::top("header")
             .frame(egui::Frame::new().inner_margin(Margin {
@@ -761,6 +1021,16 @@ impl App {
                         }
                         ui.label(RichText::new(status).font(theme::mono(12.0)).color(status_color))
                             .on_hover_text(status_hint);
+                        if let Some(version) = new_version
+                            && link(
+                                ui,
+                                &format!("↑ {version}"),
+                                theme::ACCENT_TEXT,
+                                "Доступна новая версия приложения — открыть настройки",
+                            )
+                        {
+                            go = Some(Screen::Settings);
+                        }
                     });
                 });
             });
@@ -1153,6 +1423,11 @@ impl App {
             }
             A::CommandLine => self.command = Some(CommandLine::default()),
             A::Help => self.help_open = true,
+            A::Quit => self.quit(ctx),
+            A::Update => {
+                self.go_to(Page::Settings);
+                self.check_update();
+            }
             A::Screen(screen) => self.go_to(screen),
             A::Escape => {
                 self.view.search.clear();
@@ -1337,7 +1612,11 @@ impl App {
             }
         }
         if let Some(dialog) = &mut self.match_dialog {
-            match dialog.show(ctx, &self.images) {
+            let ranks = Ranks {
+                known: &self.player_ranks,
+                loading: self.ranks_loading.contains(&dialog.summary.id),
+            };
+            match dialog.show(ctx, &self.images, ranks) {
                 DialogAction::None => {}
                 DialogAction::Close => self.match_dialog = None,
                 DialogAction::Retry => {
@@ -1430,7 +1709,162 @@ impl App {
                 ui.set_width(ui.available_width());
                 self.transfer_settings(ui, frame);
             });
+            ui.add_space(12.0);
+            theme::panel().inner_margin(Margin::same(16)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                self.update_settings(ui);
+            });
+            ui.add_space(12.0);
+            theme::panel().inner_margin(Margin::same(16)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                self.desktop_settings(ui);
+            });
         });
+    }
+
+    /// Запуск вместе с Windows и сворачивание в трей.
+    fn desktop_settings(&mut self, ui: &mut egui::Ui) {
+        ui.label(theme::caps("Запуск и трей"));
+        ui.add_space(6.0);
+        let supported = tray::is_supported() && autostart::is_supported();
+        let label = |text: &str| RichText::new(text).size(12.5).color(theme::TEXT);
+        let mut autostart_on = self.desktop.autostart;
+        let mut tray_on = self.desktop.tray.is_some();
+        let (mut autostart_changed, mut tray_changed) = (false, false);
+        ui.add_enabled_ui(supported, |ui| {
+            autostart_changed = ui.checkbox(&mut autostart_on, label("запускать вместе с Windows")).changed();
+            tray_changed = ui.checkbox(&mut tray_on, label("при закрытии сворачивать в трей")).changed();
+        });
+        if autostart_changed {
+            // Запись в реестр — мгновенная, фоновый поток для неё не нужен.
+            self.desktop.result = Some(autostart::set_enabled(autostart_on).map(|()| {
+                if autostart_on { "Добавлено в автозапуск Windows" } else { "Убрано из автозапуска Windows" }
+            }));
+            self.desktop.autostart = autostart::is_enabled();
+        }
+        if tray_changed {
+            self.desktop.result = None;
+            if tray_on {
+                match Tray::new(ui.ctx().clone()) {
+                    Ok(tray) => self.desktop.tray = Some(tray),
+                    Err(error) => self.desktop.result = Some(Err(error)),
+                }
+            } else {
+                self.desktop.tray = None; // значок исчезает вместе со значением
+            }
+        }
+        ui.add_space(4.0);
+        let text = if supported {
+            "С треем крестик не закрывает программу, а прячет окно: она продолжает следить за \
+             клиентом League и обновлять аккаунты после игр. Вернуть окно — щелчок по значку \
+             рядом с часами или повторный запуск с ярлыка. Выйти совсем — правая кнопка по \
+             значку → «Выход» или команда «выход». Если включены обе галочки, при входе в \
+             Windows программа запускается сразу в трей, без окна."
+        } else {
+            "Автозапуск и трей есть только в Windows."
+        };
+        ui.add(egui::Label::new(RichText::new(text).size(12.0).color(theme::TEXT_MUTED)).wrap());
+        result_line(ui, self.desktop.result.as_ref());
+    }
+
+    /// Версия приложения и обновление из GitHub Releases (см. update.rs).
+    fn update_settings(&mut self, ui: &mut egui::Ui) {
+        ui.label(theme::caps("Обновление"));
+        ui.add_space(6.0);
+        let current = Version::current();
+        // Клон: ниже меняем self.update, пока смотрим на найденную версию.
+        let available = self.update.available.clone();
+        match &available {
+            Some(info) => status_line(
+                ui,
+                Icon::Download,
+                theme::ACCENT_TEXT,
+                &format!("Доступна версия {} (установлена {current})", info.version),
+            ),
+            None => {
+                ui.label(RichText::new(format!("Установлена версия {current}")).size(13.0).medium().color(theme::TEXT));
+            }
+        }
+        ui.add(
+            egui::Label::new(
+                RichText::new(
+                    "Новые версии публикуются на GitHub. Установщик скачивается только по вашей \
+                     команде, сверяется по контрольной сумме SHA-256 и ставит новую версию поверх \
+                     старой, после чего приложение откроется снова. Аккаунты, пароли и настройки \
+                     при этом не затрагиваются.",
+                )
+                .size(12.0)
+                .color(theme::TEXT_MUTED),
+            )
+            .wrap(),
+        );
+        ui.add_space(10.0);
+
+        let downloading = self.update.progress.is_some() || self.update.installing;
+        let busy = self.update.checking || downloading;
+        let mut install = None;
+        let mut check = false;
+        ui.horizontal(|ui| {
+            if let Some(info) = &available {
+                if self.update.can_install && info.installer.is_some() {
+                    let button = Button::primary(format!("Установить {}", info.version)).icon(Icon::Download);
+                    if ui.add_enabled(!busy, button).clicked() {
+                        install = Some(info.clone());
+                    }
+                    if ui.add(Button::outline("Что нового")).clicked() {
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(&info.page_url));
+                    }
+                } else if ui.add(Button::primary("Скачать на GitHub").icon(Icon::Download)).clicked() {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(&info.page_url));
+                }
+            }
+            if ui.add_enabled(!busy, Button::outline("Проверить сейчас")).clicked() {
+                check = true;
+            }
+            if busy {
+                widgets::spinner(ui, 14.0);
+            }
+        });
+        if let Some(info) = install {
+            self.update.progress = Some((0, info.installer.as_ref().map_or(0, |i| i.size)));
+            self.update.result = None;
+            self.backend.send(Command::InstallUpdate(info));
+        }
+        if check {
+            self.check_update();
+        }
+
+        if self.update.installing {
+            ui.add_space(6.0);
+            status_line(ui, Icon::Check, theme::GREEN_TEXT, "Установщик запущен — приложение сейчас перезапустится");
+        } else if let Some((received, total)) = self.update.progress {
+            ui.add_space(8.0);
+            download_progress(ui, received, total);
+        }
+        if available.is_some() && !self.update.can_install {
+            ui.add_space(6.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(
+                        "Эта копия запущена не из папки установки (переносная версия или сборка из \
+                         исходников), поэтому обновить её одной кнопкой нельзя — скачайте новую \
+                         версию со страницы выпуска.",
+                    )
+                    .size(12.0)
+                    .color(theme::TEXT_MUTED),
+                )
+                .wrap(),
+            );
+        }
+        result_line(ui, self.update.result.as_ref());
+
+        ui.add_space(8.0);
+        let mut auto = self.update.auto;
+        let label = RichText::new("проверять обновления при запуске").size(12.0).color(theme::TEXT_MUTED);
+        if ui.checkbox(&mut auto, label).changed() {
+            self.update.auto = auto;
+            self.backend.send(Command::SetUpdateCheck(auto));
+        }
     }
 
     /// Экспорт и импорт списка аккаунтов.
@@ -1678,6 +2112,27 @@ fn status_line(ui: &mut egui::Ui, icon: Icon, color: Color32, text: &str) {
     });
 }
 
+/// Ход скачивания установщика: полоска и «3.2 из 9.8 МБ».
+fn download_progress(ui: &mut egui::Ui, received: u64, total: u64) {
+    const MB: f32 = 1024.0 * 1024.0;
+    // `as f32` — явное преобразование числа: в Rust оно не происходит само.
+    let share = if total == 0 { 0.0 } else { (received as f32 / total as f32).clamp(0.0, 1.0) };
+    let (bar, _) = ui.allocate_exact_size(egui::vec2(ui.available_width().min(320.0), 4.0), egui::Sense::hover());
+    ui.painter().rect_filled(bar, 0, theme::BORDER);
+    let done = egui::Rect::from_min_size(bar.min, egui::vec2(bar.width() * share, bar.height()));
+    ui.painter().rect_filled(done, 0, theme::ACCENT);
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new(format!(
+            "скачивание: {:.1} из {:.1} МБ",
+            received as f32 / MB,
+            total as f32 / MB
+        ))
+        .font(theme::mono(11.5))
+        .color(theme::TEXT_MUTED),
+    );
+}
+
 /// Строка «✓ Готово» или текст ошибки под кнопками.
 /// `T: AsRef<str>` — подходит и `&'static str`, и `String`.
 fn result_line<T: AsRef<str>>(ui: &mut egui::Ui, result: Option<&Result<T, AppError>>) {
@@ -1885,10 +2340,11 @@ fn client_status(status: &LcuStatus, phase: LobbyPhase) -> ClientStatus {
 impl eframe::App for App {
     /// Вызывается перед каждым кадром. Забираем все накопившиеся события:
     /// `try_recv` не ждёт, поэтому окно не тормозит, даже если событий нет.
-    fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         while let Some(event) = self.backend.try_recv() {
             self.handle_event(event);
         }
+        self.desktop_events(ctx);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
@@ -1897,6 +2353,7 @@ impl eframe::App for App {
         self.request_images();
         // Context — дешёвый клон (указатель).
         let ctx = ui.ctx().clone();
+        self.close_to_tray(&ctx);
         self.expire_notice(&ctx);
         // Клавиши — до виджетов: найденные нажатия забираем, чтобы их не увидели кнопки.
         let mut actions = self.hotkeys(&ctx);
@@ -1932,6 +2389,11 @@ impl eframe::App for App {
             self.post_game = None;
         }
         self.dialogs(&ctx);
+        // Установщик новой версии запущен: закрываемся, чтобы он смог заменить exe-файл.
+        if self.update.installing {
+            self.desktop.quitting = true; // не в трей, а закрыться по-настоящему
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         window_frame::border(&ctx);
         // Последним: курсор «изменить размер» у краёв окна не должен перебиваться.
         window_frame::resize_edges(&ctx);
@@ -1942,6 +2404,8 @@ impl eframe::App for App {
     /// попадает в window.ron в папке данных. Только несекретное: сейчас — сортировка.
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         storage.set_string(SORT_KEY, self.view.sort.key().to_string());
+        let tray = if self.desktop.tray.is_some() { "1" } else { "0" };
+        storage.set_string(TRAY_KEY, tray.to_string());
     }
 
     /// Внутреннее состояние egui (прокрутка, раскрытые блоки и т. п.) не сохраняем:

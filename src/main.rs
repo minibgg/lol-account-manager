@@ -4,11 +4,13 @@
 
 // Модули объявлены в src/lib.rs (библиотека `lol_account_manager`),
 // а main.rs — отдельная программа, которая её использует.
+use std::net::TcpListener;
 use std::sync::Arc;
 
 use eframe::egui;
-use lol_account_manager::app::App;
-use lol_account_manager::storage;
+use lol_account_manager::app::{App, Startup};
+use lol_account_manager::single_instance::{self, Instance};
+use lol_account_manager::{autostart, storage};
 use tracing_subscriber::EnvFilter;
 
 /// Файл в папке данных, где eframe хранит размер и положение окна (и сортировку списка).
@@ -21,6 +23,17 @@ const WINDOW_STATE_FILE: &str = "window.ron";
 fn main() -> eframe::Result {
     init_logging();
     tracing::info!("запуск LoL Account Manager v{}", env!("CARGO_PKG_VERSION"));
+
+    // Программа уже запущена (например, сидит в трее) — она покажет своё окно,
+    // а эта копия не нужна.
+    let Some(listener) = only_instance() else {
+        tracing::info!("программа уже запущена — показываю её окно и выхожу");
+        return Ok(());
+    };
+    let startup = Startup {
+        listener,
+        by_system: autostart::started_by_system(),
+    };
 
     // Где запоминать окно. Нет папки данных — окно просто не запоминается.
     let window_state = storage::data_dir().ok().map(|dir| dir.join(WINDOW_STATE_FILE));
@@ -53,8 +66,31 @@ fn main() -> eframe::Result {
         // `cc` (CreationContext) даёт доступ к egui::Context: через него ставим тему.
         // Box::new(...) кладёт значение в кучу: eframe хранит приложение как `Box<dyn App>` —
         // «какой-то тип, реализующий трейт App», размер которого неизвестен заранее.
-        Box::new(|cc| Ok(Box::new(App::new(cc)))),
+        // `move` — замыкание забирает `startup` себе (оно вызывается позже).
+        Box::new(move |cc| Ok(Box::new(App::new(cc, startup)))),
     )
+}
+
+/// Проверяет, что эта копия программы — единственная (см. single_instance.rs).
+///
+/// - `None` — программа уже запущена, надо завершаться;
+/// - `Some(Some(порт))` — мы первые, порт надо слушать;
+/// - `Some(None)` — проверки нет.
+///
+/// С `LOLAM_DATA_DIR` (тесты и эксперименты с отдельной папкой данных) проверки нет:
+/// такая копия не мешает основной. `LOLAM_SINGLE_INSTANCE_PORT` задаёт другой порт.
+fn only_instance() -> Option<Option<TcpListener>> {
+    let custom_port = std::env::var("LOLAM_SINGLE_INSTANCE_PORT").ok().and_then(|p| p.parse().ok());
+    let port = match custom_port {
+        Some(port) => port,
+        None if std::env::var_os(storage::DATA_DIR_ENV).is_some() => return Some(None),
+        None => single_instance::DEFAULT_PORT,
+    };
+    match single_instance::acquire(port) {
+        Instance::First(listener) => Some(Some(listener)),
+        Instance::AlreadyRunning => None,
+        Instance::Unknown => Some(None),
+    }
 }
 
 /// Иконка окна (заголовок и панель задач). Та же картинка вшита в exe через build.rs —
