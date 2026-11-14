@@ -12,6 +12,7 @@ use eframe::egui::{
     StrokeKind, TextFormat, Ui, pos2, text::LayoutJob, vec2,
 };
 
+use crate::decay;
 use crate::error::AppError;
 use crate::history::{self, DAY};
 use crate::riot::{MatchSummary, RankedStats};
@@ -63,6 +64,14 @@ fn rank_cell(stats: Option<Option<&RankedStats>>) -> (String, Color32) {
         Some(None) => ("без ранга".into(), theme::TEXT_HINT),
         Some(Some(s)) => (rank_text(s), theme::tier_color(Some(s.tier))),
     }
+}
+
+/// Пометка «↓5д» рядом с рангом: ранг скоро начнёт сгорать (или уже сгорает).
+/// `None` — предупреждать не о чем.
+fn decay_mark(account: &Account, queue: history::Queue, now: i64) -> Option<(String, Color32)> {
+    let decay = decay::of_account(account, queue, now).filter(decay::Decay::is_warning)?;
+    let color = if decay.is_urgent() { theme::RED_TEXT } else { theme::AMBER_TEXT };
+    Some((format!(" {}", decay.short_label()), color))
 }
 
 /// «+62» / «−11» за неделю (Solo/Duo, а если там тихо — Flex).
@@ -173,6 +182,15 @@ impl Table<'_> {
         let (solo, solo_color) = rank_cell(ranked.map(|r| r.solo.as_ref()));
         let (flex, flex_color) = rank_cell(ranked.map(|r| r.flex.as_ref()));
         let (week, week_color) = week_cell(account);
+        let now = unix_now();
+        // Ячейка ранга: сам ранг и, если пора, пометка о сгорании.
+        let rank_job = |text: &str, color: Color32, queue: history::Queue| {
+            let mut cell = job(&[(text, ink(color))], &font);
+            if let Some((mark, mark_color)) = decay_mark(account, queue, now) {
+                cell.append(&mark, 0.0, TextFormat::simple(font.clone(), ink(mark_color)));
+            }
+            cell
+        };
 
         let games = match cache.map(|c| c.matches.as_deref()) {
             None => job(&[("—", ink(theme::TEXT_HINT))], &font),
@@ -211,8 +229,8 @@ impl Table<'_> {
                 &font,
             ),
             job(&[(account.region.label(), ink(theme::TEXT_MUTED))], &font),
-            job(&[(&solo, ink(solo_color))], &font),
-            job(&[(&flex, ink(flex_color))], &font),
+            rank_job(&solo, solo_color, history::Queue::Solo),
+            rank_job(&flex, flex_color, history::Queue::Flex),
             job(&[(&week, ink(week_color))], &font),
             games,
             extra,
@@ -275,7 +293,23 @@ impl Details<'_> {
                 let cache = account.cache.as_ref();
                 for (title, queue) in [("solo ", history::Queue::Solo), ("flex ", history::Queue::Flex)] {
                     let stats = cache.map(|c| queue.stats(&c.ranked));
-                    let left = rank_line(title, stats, &font);
+                    let mut left = rank_line(title, stats, &font);
+                    // Алмаз и выше: через сколько дней без игр ранг начнёт сгорать.
+                    if let Some(decay) = decay::of_account(account, queue, unix_now()) {
+                        let color = if decay.is_urgent() {
+                            theme::RED_TEXT
+                        } else if decay.is_warning() {
+                            theme::AMBER_TEXT
+                        } else {
+                            k
+                        };
+                        let text = if decay.is_active() {
+                            "  ↓ сгорает".to_string()
+                        } else {
+                            format!("  ↓ ≈{} дн", decay.days_left)
+                        };
+                        left.append(&text, 0.0, TextFormat::simple(font.clone(), color));
+                    }
                     let right = match (queue, stats) {
                         (history::Queue::Solo, Some(Some(s))) => record_line("всего ", s, &font),
                         (history::Queue::Flex, _) => self.status_line(&font),
@@ -317,6 +351,9 @@ impl Details<'_> {
                         ui.label(job(&[("архив ", k), (&total, theme::TEXT_MUTED)], &font));
                         if key_button(ui, "m", "все игры", false).clicked() {
                             action = Some(Invocation::on(Action::Games, account.id));
+                        }
+                        if key_button(ui, "i", "профиль", false).clicked() {
+                            action = Some(Invocation::on(Action::Profile, account.id));
                         }
                     });
                 }

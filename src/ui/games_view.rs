@@ -20,9 +20,9 @@ const COLUMNS: [f32; 8] = [16.0, 118.0, 26.0, 128.0, 92.0, 62.0, 70.0, 64.0];
 const HEADERS: [&str; 9] = ["", "когда", "", "чемпион", "k/d/a", "kda", "cs", "время", "режим"];
 const WIDTH: f32 = 820.0;
 
-/// Фильтр по очереди (Tab).
+/// Фильтр по очереди (Tab). Общий с окном «Профиль».
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Filter {
+pub enum Filter {
     All,
     Solo,
     Flex,
@@ -30,9 +30,9 @@ enum Filter {
 }
 
 impl Filter {
-    const ALL: [Self; 4] = [Self::All, Self::Solo, Self::Flex, Self::Other];
+    pub const ALL: [Self; 4] = [Self::All, Self::Solo, Self::Flex, Self::Other];
 
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::All => "все",
             Self::Solo => "solo/duo",
@@ -41,7 +41,7 @@ impl Filter {
         }
     }
 
-    fn accepts(self, game: &MatchSummary) -> bool {
+    pub fn accepts(self, game: &MatchSummary) -> bool {
         match self {
             Self::All => true,
             Self::Solo => game.queue_id == 420,

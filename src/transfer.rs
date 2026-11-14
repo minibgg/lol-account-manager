@@ -144,6 +144,7 @@ mod tests {
             cache: None,
             history: vec![],
             archived_games: 0,
+            ranked_games: vec![],
         }
     }
 

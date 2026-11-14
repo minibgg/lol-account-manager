@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Color32, Margin, RichText};
 
 use crate::autostart;
+use crate::decay;
+use crate::notify::{self, Message, Notifier};
 use crate::backend::{Backend, is_same_account};
 use crate::error::AppError;
 use crate::history::{self, Queue, Session};
@@ -36,6 +38,7 @@ use crate::ui::theme::{self, Weight};
 use crate::ui::widgets::{self, Button, Icon, Tone};
 use crate::ui::match_view::{DialogAction, MatchDialog, Ranks};
 use crate::ui::post_game::PostGame;
+use crate::ui::profile_view::ProfileView;
 use crate::ui::rank_history::{self, HistoryDialog};
 use crate::ui::command::{self, Invocation, Suggestion, Target};
 use crate::ui::games_view::{GamesAction, GamesView};
@@ -54,6 +57,13 @@ const SORT_KEY: &str = "sort";
 /// «Сворачивать в трей при закрытии» в window.ron: «1» — включено. Хранится там, а не
 /// в базе, потому что нужно сразу при создании окна, до ответа фонового потока.
 const TRAY_KEY: &str = "close_to_tray";
+/// Ключ в том же файле: показывать ли уведомления Windows («0» — нет).
+const NOTIFY_KEY: &str = "notifications";
+/// Сколько ждём после игры, прежде чем показать уведомление Windows: клиент League
+/// отдаёт новые LP и саму игру не одновременно — собираем всё в одно уведомление.
+const TOAST_DELAY: Duration = Duration::from_secs(8);
+/// Через сколько после запуска проверяем, не сгорает ли у какого-то аккаунта ранг.
+const DECAY_CHECK_DELAY: Duration = Duration::from_secs(4);
 
 /// Что `main` передаёт приложению при запуске.
 pub struct Startup {
@@ -74,8 +84,21 @@ struct DesktopState {
     hide_on_start: bool,
     /// Выходим по-настоящему: закрытие окна больше не перехватываем.
     quitting: bool,
-    /// Вторая копия программы просит показать окно.
+    /// Вторая копия программы (или щелчок по уведомлению) просит показать окно.
     show_requests: Receiver<()>,
+    /// Уведомления Windows. `None` — на этой системе их нет.
+    notifier: Option<Notifier>,
+    /// Галочка «уведомления Windows» в настройках.
+    notifications: bool,
+    /// Окно спрятано в трей.
+    hidden: bool,
+    /// Окно сейчас активно (с ним работают) — тогда уведомления Windows не нужны.
+    focused: bool,
+    /// Когда показать уведомление о результате игры (см. [`TOAST_DELAY`]).
+    toast_at: Option<Instant>,
+    /// Когда проверить сгорание рангов (один раз после запуска).
+    decay_check_at: Option<Instant>,
+    decay_checked: bool,
     /// Только для отладки (LOLAM_DEBUG_QUIT_AFTER=секунды): когда выйти тем же путём,
     /// что и пункт «Выход» в трее.
     debug_quit_at: Option<Instant>,
@@ -215,6 +238,8 @@ pub struct App {
     help_open: bool,
     /// Окно «Все игры» (архив игр аккаунта, клавиша m).
     games_view: Option<GamesView>,
+    /// Окно «Профиль» (статистика по архиву игр, клавиша i).
+    profile_view: Option<ProfileView>,
     /// Только для отладки (LOLAM_DEBUG_PAGE=lobby-demo): лобби из тестовых аккаунтов,
     /// клиент League его не перезаписывает.
     debug_lobby: bool,
@@ -294,6 +319,7 @@ impl App {
             command: None,
             help_open: false,
             games_view: None,
+            profile_view: None,
             debug_lobby: false,
         }
     }
@@ -303,6 +329,15 @@ impl App {
     fn desktop_state(cc: &eframe::CreationContext<'_>, startup: Startup) -> DesktopState {
         // Канал: поток, слушающий порт, сообщает окну «вторая копия просит показаться».
         let (show_tx, show_requests) = mpsc::channel();
+        // Щелчок по уведомлению Windows — тоже «покажи окно».
+        let notifier = notify::is_supported().then(|| {
+            let (tx, ctx) = (show_tx.clone(), cc.egui_ctx.clone());
+            Notifier::new(move || {
+                let _ = tx.send(());
+                ctx.request_repaint();
+            })
+        });
+        let notifications = cc.storage.and_then(|s| s.get_string(NOTIFY_KEY)).as_deref() != Some("0");
         if let Some(listener) = startup.listener {
             let ctx = cc.egui_ctx.clone();
             single_instance::listen(listener, move || {
@@ -330,6 +365,13 @@ impl App {
             autostart: autostart::is_enabled(),
             quitting: false,
             show_requests,
+            notifier,
+            notifications,
+            hidden: false,
+            focused: false,
+            toast_at: None,
+            decay_check_at: None,
+            decay_checked: false,
             debug_quit_at,
             result: None,
         }
@@ -338,6 +380,8 @@ impl App {
     /// Нажатия в трее и просьбы второй копии. Вызывается из `logic`, которая работает
     /// и тогда, когда окно спрятано.
     fn desktop_events(&mut self, ctx: &egui::Context) {
+        self.desktop.focused = ctx.input(|i| i.viewport().focused) == Some(true);
+        self.pending_notifications(ctx);
         let mut show = self.desktop.show_requests.try_recv().is_ok();
         let mut quit = false;
         if let Some(tray) = &self.desktop.tray {
@@ -364,6 +408,73 @@ impl App {
         }
     }
 
+    /// Показать уведомление Windows — если они включены и окно сейчас не перед глазами
+    /// (спрятано в трей, свёрнуто или закрыто другими окнами).
+    fn toast(&self, message: Message) {
+        let away = self.desktop.hidden || !self.desktop.focused;
+        if let Some(notifier) = &self.desktop.notifier
+            && self.desktop.notifications
+            && away
+        {
+            notifier.show(message);
+        }
+    }
+
+    /// Отложенные уведомления: результат игры и сгорание рангов.
+    fn pending_notifications(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        // `due` — пришло ли время; если нет, просим разбудить нас к этому моменту
+        // (иначе спрятанное окно просто спит и ничего не проверяет).
+        let due = |at: Option<Instant>| match at {
+            Some(at) if at <= now => true,
+            Some(at) => {
+                ctx.request_repaint_after(at - now);
+                false
+            }
+            None => false,
+        };
+        if due(self.desktop.toast_at) {
+            self.desktop.toast_at = None;
+            if let Some(card) = &self.post_game {
+                self.toast(card.notification());
+            }
+        }
+        if due(self.desktop.decay_check_at) {
+            self.desktop.decay_check_at = None;
+            self.warn_about_decay();
+        }
+    }
+
+    /// Один раз после запуска: если у какого-то аккаунта ранг вот-вот начнёт сгорать
+    /// (или уже сгорает) — говорим об этом внизу окна и уведомлением Windows.
+    fn warn_about_decay(&mut self) {
+        let now = unix_now();
+        let mut urgent: Vec<(String, decay::Decay)> = self
+            .accounts
+            .iter()
+            .filter_map(|account| {
+                let (queue, decay) = decay::warning(account, now).filter(|(_, d)| d.is_urgent())?;
+                Some((format!("{} ({})", account.riot_id, queue.label()), decay))
+            })
+            .collect();
+        urgent.sort_by_key(|(_, decay)| decay.days_left);
+        let Some((first, decay)) = urgent.first() else {
+            return;
+        };
+        let when = if decay.is_active() {
+            "уже сгорает".to_string()
+        } else {
+            format!("начнёт сгорать ≈ через {} дн.", decay.days_left)
+        };
+        let more = match urgent.len() - 1 {
+            0 => String::new(),
+            n => format!(" · и ещё аккаунтов: {n}"),
+        };
+        let text = format!("{first}: ранг {when}{more}");
+        self.toast(Message::new("Ранг сгорает без игр", text.clone()).detail("Сыграйте ранговую игру на этом аккаунте"));
+        self.notify(text);
+    }
+
     /// Закрыть программу совсем (а не спрятать в трей).
     fn quit(&mut self, ctx: &egui::Context) {
         self.desktop.quitting = true;
@@ -373,6 +484,7 @@ impl App {
 
     fn show_window(&mut self, ctx: &egui::Context) {
         self.desktop.hide_on_start = false;
+        self.desktop.hidden = false;
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -389,6 +501,7 @@ impl App {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
         if to_tray || hide_now {
+            self.desktop.hidden = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
     }
@@ -413,6 +526,10 @@ impl App {
             Event::StartupFailed(error) => self.state = BackendState::Failed(error),
             Event::Accounts(accounts) => {
                 self.accounts = accounts;
+                // Первый список после запуска — чуть позже проверим сгорание рангов.
+                if !std::mem::replace(&mut self.desktop.decay_checked, true) {
+                    self.desktop.decay_check_at = Some(Instant::now() + DECAY_CHECK_DELAY);
+                }
                 if let Some(page) = self.debug_page.take() {
                     self.debug_open(&page);
                 }
@@ -490,9 +607,13 @@ impl App {
                         Some(current) if current.account == account.id && !current.expired() => current.merge(card),
                         _ => self.post_game = Some(card),
                     }
+                    // Окно спрятано или не активно — расскажем уведомлением Windows.
+                    self.desktop.toast_at = Some(Instant::now() + TOAST_DELAY);
                 }
                 // Открыто «Все игры» этого аккаунта — в архиве могли появиться новые игры.
-                if self.games_view.as_ref().is_some_and(|v| v.account == account.id) {
+                if self.games_view.as_ref().is_some_and(|v| v.account == account.id)
+                    || self.profile_view.as_ref().is_some_and(|v| v.account == account.id)
+                {
                     self.backend.send(Command::LoadGames(account.id));
                 }
                 self.replace_account(account);
@@ -624,6 +745,12 @@ impl App {
                 }
             }
             Event::GamesLoaded { account, result } => {
+                // Тот же архив нужен и окну «Профиль».
+                if let Some(view) = &mut self.profile_view
+                    && view.account == account
+                {
+                    view.games = Some(result.clone());
+                }
                 if let Some(view) = &mut self.games_view
                     && view.account == account
                 {
@@ -652,6 +779,10 @@ impl App {
             Ok(Some(info)) => {
                 // О каждой новой версии говорим один раз, а не каждые 6 часов.
                 if self.update.available.as_ref() != Some(&info) {
+                    self.toast(
+                        Message::new(format!("Доступна версия {}", info.version), "Откройте настройки → обновление")
+                            .detail("LoL Account Manager"),
+                    );
                     self.notify(format!(
                         "Доступна версия {} — настройки → обновление (или команда «обновление»)",
                         info.version
@@ -855,6 +986,12 @@ impl App {
                 self.page = Page::Lobby;
                 self.debug_lobby = true;
                 self.lobby = debug_lobby(&self.accounts);
+            }
+            "profile" => {
+                if let Some(account) = self.accounts.iter().find(|a| a.archived_games > 0) {
+                    self.profile_view = Some(ProfileView::new(account.id));
+                    self.backend.send(Command::LoadGames(account.id));
+                }
             }
             "games" => {
                 if let Some(account) = self.accounts.iter().find(|a| a.archived_games > 0) {
@@ -1145,6 +1282,7 @@ impl App {
             Hint::new("r", "обновить", A::Refresh),
             Hint::new("h", "история", A::History),
             Hint::new("m", "все игры", A::Games),
+            Hint::new("i", "профиль", A::Profile),
             Hint::new("/", "поиск", A::Search),
             Hint::new(":", "команда", A::CommandLine),
             Hint::new("?", "помощь", A::Help),
@@ -1364,6 +1502,7 @@ impl App {
             || self.confirm_delete.is_some()
             || self.help_open
             || self.games_view.is_some()
+            || self.profile_view.is_some()
             || self.command.is_some()
             || ctx.text_edit_focused();
         if busy {
@@ -1444,6 +1583,7 @@ impl App {
             | A::History
             | A::Game(_)
             | A::Games
+            | A::Profile
             | A::OpGg
             | A::Edit
             | A::Delete => {}
@@ -1503,6 +1643,10 @@ impl App {
             A::History => self.card_action(CardAction::OpenHistory(Queue::Solo), id),
             A::Games => {
                 self.games_view = Some(GamesView::new(id, riot_id.clone()));
+                self.backend.send(Command::LoadGames(id));
+            }
+            A::Profile => {
+                self.profile_view = Some(ProfileView::new(id));
                 self.backend.send(Command::LoadGames(id));
             }
             A::Game(n) => match game {
@@ -1596,6 +1740,15 @@ impl App {
             };
             if close {
                 self.history_dialog = None;
+            }
+        }
+        if let Some(view) = &mut self.profile_view {
+            let close = match self.accounts.iter().find(|a| a.id == view.account) {
+                Some(account) => view.show(ctx, account),
+                None => true,
+            };
+            if close {
+                self.profile_view = None;
             }
         }
         // «Все игры» — под подробностями игры: клавиши ему, только когда подробности закрыты.
@@ -1731,6 +1884,9 @@ impl App {
         let mut autostart_on = self.desktop.autostart;
         let mut tray_on = self.desktop.tray.is_some();
         let (mut autostart_changed, mut tray_changed) = (false, false);
+        ui.add_enabled_ui(self.desktop.notifier.is_some(), |ui| {
+            ui.checkbox(&mut self.desktop.notifications, label("уведомления Windows: результат игры, сгорание ранга, новая версия"));
+        });
         ui.add_enabled_ui(supported, |ui| {
             autostart_changed = ui.checkbox(&mut autostart_on, label("запускать вместе с Windows")).changed();
             tray_changed = ui.checkbox(&mut tray_on, label("при закрытии сворачивать в трей")).changed();
@@ -1758,8 +1914,9 @@ impl App {
             "С треем крестик не закрывает программу, а прячет окно: она продолжает следить за \
              клиентом League и обновлять аккаунты после игр. Вернуть окно — щелчок по значку \
              рядом с часами или повторный запуск с ярлыка. Выйти совсем — правая кнопка по \
-             значку → «Выход» или команда «выход». Если включены обе галочки, при входе в \
-             Windows программа запускается сразу в трей, без окна."
+             значку → «Выход» или команда «выход». Если включены автозапуск и трей, при входе в \
+             Windows программа запускается сразу в трей, без окна. Уведомления появляются, \
+             только когда окно спрятано или не активно; щелчок по уведомлению открывает окно."
         } else {
             "Автозапуск и трей есть только в Windows."
         };
@@ -2406,6 +2563,8 @@ impl eframe::App for App {
         storage.set_string(SORT_KEY, self.view.sort.key().to_string());
         let tray = if self.desktop.tray.is_some() { "1" } else { "0" };
         storage.set_string(TRAY_KEY, tray.to_string());
+        let notifications = if self.desktop.notifications { "1" } else { "0" };
+        storage.set_string(NOTIFY_KEY, notifications.to_string());
     }
 
     /// Внутреннее состояние egui (прокрутка, раскрытые блоки и т. п.) не сохраняем:

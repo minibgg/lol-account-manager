@@ -1,6 +1,6 @@
 [package]
 name = "lol-account-manager"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "LoL Account Manager — менеджер аккаунтов League of Legends на Rust (eframe/egui)"
 publish = false
@@ -33,6 +33,8 @@ uuid = { version = "1.29.0", features = ["v4"] }
 # Только Windows: значок в трее и запись в реестр для запуска вместе с системой.
 [target.'cfg(windows)'.dependencies]
 tray-icon = { version = "0.26.1", default-features = false }
+# Уведомления Windows («игра закончилась, +18 LP»), src/notify.rs.
+tauri-winrt-notification = "0.8.1"
 winreg = "0.56.0"
 
 [build-dependencies]

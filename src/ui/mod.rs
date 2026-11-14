@@ -11,6 +11,7 @@ pub mod keymap;
 pub mod lobby_view;
 pub mod match_view;
 pub mod post_game;
+pub mod profile_view;
 pub mod rank_history;
 pub mod terminal;
 pub mod theme;

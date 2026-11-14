@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Align, Align2, Color32, Layout, Margin, Rect, RichText, Sense, Shadow, Stroke, StrokeKind, vec2};
 
 use crate::history::{self, Queue, RankChange};
+use crate::notify::Message;
 use crate::riot::{MatchSummary, RiotId};
 use crate::storage::{Account, AccountId};
 use crate::ui::image_store::ImageStore;
@@ -85,6 +86,34 @@ impl PostGame {
             self.change_at = Instant::now();
         }
         self.shown_at = Instant::now();
+    }
+
+    /// То же самое коротким текстом — для уведомления Windows, когда окно спрятано:
+    /// «Победа · Экко 14/5/7», «+18 LP → Золото II · 54 LP», чей аккаунт.
+    pub fn notification(&self) -> Message {
+        let (mut title, _) = self.title();
+        if let Some(game) = self.game.as_ref().filter(|_| self.new_games == 1) {
+            title = format!("{title} · {} {}", match_view::champion_name(&game.me), game.kda());
+        }
+        let rank = self.change.as_ref().map(|change| {
+            let after = &change.after;
+            let now = format!("{} · {} LP", after.rank_label(), after.lp);
+            let line = match change.progress() {
+                Some(progress) => format!("{} → {now}", history::signed_lp(progress.lp)),
+                None => now,
+            };
+            match change.promotion() {
+                Some(true) => format!("Повышение! {line}"),
+                Some(false) => format!("Понижение. {line}"),
+                None => line,
+            }
+        });
+        let owner = self.owner.to_string();
+        match (rank, &self.game) {
+            (Some(rank), _) => Message::new(title, rank).detail(owner),
+            (None, Some(game)) => Message::new(title, game.queue_label()).detail(owner),
+            (None, None) => Message::new(title, owner),
+        }
     }
 
     pub fn expired(&self) -> bool {
@@ -328,6 +357,7 @@ mod tests {
             }),
             history: vec![],
             archived_games: 0,
+            ranked_games: vec![],
         }
     }
 
@@ -350,5 +380,11 @@ mod tests {
         let progress = card.change.as_ref().and_then(|c| c.progress()).unwrap();
         assert_eq!((progress.lp, progress.wins), (19, 1));
         assert_eq!(card.game.as_ref().map(|g| g.id.as_str()), Some("RU_2"), "игра осталась");
+
+        // Уведомление Windows — то же самое текстом.
+        let message = card.notification();
+        assert_eq!(message.title, "Победа · чемпион #0 0/0/0");
+        assert_eq!(message.text, "+19 LP → Золото II · 59 LP");
+        assert_eq!(message.detail.as_deref(), Some("Name#RU1"));
     }
 }

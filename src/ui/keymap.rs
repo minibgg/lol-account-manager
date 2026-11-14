@@ -71,6 +71,8 @@ pub enum Action {
     Game(usize),
     /// Окно «Все игры» — архив игр аккаунта.
     Games,
+    /// Окно «Профиль» — статистика по архиву игр: чемпионы, винрейт, KDA.
+    Profile,
     OpGg,
     Edit,
     Delete,
@@ -109,6 +111,7 @@ impl Action {
                 | Self::History
                 | Self::Game(_)
                 | Self::Games
+                | Self::Profile
                 | Self::OpGg
                 | Self::Edit
                 | Self::Delete
@@ -174,6 +177,7 @@ pub fn for_key(key: Key, mods: Modifiers) -> Option<Action> {
             Key::Num5 => A::Game(4),
             Key::O => A::OpGg,
             Key::M => A::Games,
+            Key::I => A::Profile,
             Key::E => A::Edit,
             Key::Delete => A::Delete,
             Key::N => A::Add,
@@ -271,6 +275,7 @@ pub const HELP: &[HelpSection] = &[
             ("h", "история ранга"),
             ("1 … 5", "подробности последних игр"),
             ("m", "все игры аккаунта — архив без ограничений"),
+            ("i", "профиль: винрейт, KDA и чемпионы по архиву игр"),
             ("o", "профиль на op.gg"),
             ("e", "изменить"),
             ("Delete", "удалить (спросит подтверждение)"),

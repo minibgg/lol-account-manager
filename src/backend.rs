@@ -1597,6 +1597,7 @@ mod tests {
             }),
             history: vec![],
             archived_games: 0,
+            ranked_games: vec![],
         }
     }
 

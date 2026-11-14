@@ -95,6 +95,10 @@ const MIGRATIONS: &[&str] = &[
     "#,
 ];
 
+/// За сколько дней загружаем время ранговых игр вместе со списком аккаунтов.
+/// С запасом: самый большой запас дней до сгорания ранга — 30.
+pub const RANKED_GAMES_DAYS: i64 = 180;
+
 /// С этой версии схемы есть архив игр.
 const ARCHIVE_VERSION: i64 = 5;
 
@@ -145,6 +149,9 @@ pub struct Account {
     pub history: Vec<RankPoint>,
     /// Сколько игр в архиве (сами игры — `Db::archived_matches`, по запросу).
     pub archived_games: usize,
+    /// Когда игрались ранговые игры за последние [`RANKED_GAMES_DAYS`] дней (очередь
+    /// и unix-время, от старых к новым) — по ним оценивается сгорание ранга (decay.rs).
+    pub ranked_games: Vec<(Queue, i64)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -256,9 +263,11 @@ impl Db {
             .query_and_then([], account_from_row)?
             .collect::<AppResult<Vec<_>>>()?;
         let mut histories = self.rank_history(None)?;
+        let mut ranked_games = self.ranked_games(None)?;
         for account in &mut accounts {
             // remove — забрать из словаря (без копирования); нет истории — пустой список.
             account.history = histories.remove(&account.id).unwrap_or_default();
+            account.ranked_games = ranked_games.remove(&account.id).unwrap_or_default();
         }
         Ok(accounts)
     }
@@ -271,7 +280,32 @@ impl Db {
         // второй — что строка прочиталась без ошибки.
         let mut account = rows.next().ok_or(AppError::AccountMissing)??;
         account.history = self.rank_history(Some(id))?.remove(&id).unwrap_or_default();
+        account.ranked_games = self.ranked_games(Some(id))?.remove(&id).unwrap_or_default();
         Ok(account)
+    }
+
+    /// Время недавних ранговых игр из архива по аккаунтам (одного или всех — `None`).
+    /// Очередь и признак ремейка лежат внутри JSON игры — их достаёт сам SQLite
+    /// (`json_extract`). Ремейки не считаются: такая игра ранг не «продлевает».
+    fn ranked_games(&self, account: Option<AccountId>) -> AppResult<HashMap<AccountId, Vec<(Queue, i64)>>> {
+        let since = unix_now() - RANKED_GAMES_DAYS * DAY;
+        let mut stmt = self.conn.prepare(
+            "SELECT account_id, played_at, json_extract(summary_json, '$.queue_id') AS queue_id
+             FROM matches
+             WHERE played_at >= ?1 AND (?2 IS NULL OR account_id = ?2)
+               AND json_extract(summary_json, '$.queue_id') IN (420, 440)
+               AND COALESCE(json_extract(summary_json, '$.remake'), 0) = 0
+             ORDER BY played_at",
+        )?;
+        let mut rows = stmt.query(params![since, account])?;
+        let mut out: HashMap<AccountId, Vec<(Queue, i64)>> = HashMap::new();
+        while let Some(row) = rows.next()? {
+            let account_id: AccountId = row.get("account_id")?;
+            if let Some(queue) = Queue::from_queue_id(row.get("queue_id")?) {
+                out.entry(account_id).or_default().push((queue, row.get("played_at")?));
+            }
+        }
+        Ok(out)
     }
 
     /// История рангов по аккаунтам (одного или всех — `None`), см. [`SELECT_HISTORY`].
@@ -605,6 +639,7 @@ fn account_from_row(row: &Row<'_>) -> AppResult<Account> {
         cache,
         history: Vec::new(), // заполняют list_accounts / get_account
         archived_games: row.get::<_, i64>("archived_games")? as usize,
+        ranked_games: Vec::new(), // заполняют list_accounts / get_account
     })
 }
 
@@ -874,6 +909,34 @@ mod tests {
                 }],
             }],
         }
+    }
+
+    /// Время ранговых игр (для оценки сгорания ранга): только 420 и 440, без ремейков
+    /// и без давних игр, от старых к новым.
+    #[test]
+    fn ranked_games_come_from_the_archive() {
+        let mut db = Db::open_in_memory().unwrap();
+        let a = db.insert_account(&input("Name#EUW", Region::Euw)).unwrap();
+        let now = unix_now();
+        let played = |id: &str, queue_id: i32, days_ago: i64, remake: bool| MatchSummary {
+            queue_id,
+            remake,
+            played_at: now - days_ago * DAY,
+            ..game(id, true)
+        };
+        let mut snap = snapshot("p", "Name#EUW");
+        snap.matches = Some(vec![
+            played("EUW1_1", 420, 1, false),
+            played("EUW1_2", 450, 2, false), // ARAM
+            played("EUW1_3", 440, 3, false),
+            played("EUW1_4", 420, 4, true), // ремейк
+            played("EUW1_5", 420, 5, false),
+            played("EUW1_6", 420, RANKED_GAMES_DAYS + 5, false), // слишком давно
+        ]);
+        db.save_snapshot(a.id, &snap, now).unwrap();
+        let expected = vec![(Queue::Solo, now - 5 * DAY), (Queue::Flex, now - 3 * DAY), (Queue::Solo, now - DAY)];
+        assert_eq!(db.get_account(a.id).unwrap().ranked_games, expected);
+        assert_eq!(db.list_accounts().unwrap()[0].ranked_games, expected);
     }
 
     #[test]

@@ -75,6 +75,7 @@ enum Kind {
     Refresh,
     History,
     Games,
+    Profile,
     OpGg,
     Edit,
     Delete,
@@ -102,6 +103,7 @@ const COMMANDS: &[Spec] = &[
     Spec { kind: Kind::Refresh, names: &["обновить", "refresh", "update"], hint: "обновить ранги" },
     Spec { kind: Kind::History, names: &["история", "history"], hint: "история ранга" },
     Spec { kind: Kind::Games, names: &["игры", "games", "матчи"], hint: "все игры аккаунта (архив)" },
+    Spec { kind: Kind::Profile, names: &["профиль", "profile", "стата"], hint: "статистика по архиву игр" },
     Spec { kind: Kind::OpGg, names: &["opgg", "опгг"], hint: "профиль на op.gg" },
     Spec { kind: Kind::Edit, names: &["изменить", "edit"], hint: "изменить аккаунт" },
     Spec { kind: Kind::Delete, names: &["удалить", "delete"], hint: "удалить аккаунт" },
@@ -128,7 +130,7 @@ impl Kind {
     fn arg(self) -> Arg {
         match self {
             Self::Login | Self::Password | Self::UserName | Self::RiotId | Self::History | Self::Games
-            | Self::OpGg | Self::Edit | Self::Delete => Arg::Account,
+            | Self::Profile | Self::OpGg | Self::Edit | Self::Delete => Arg::Account,
             Self::Refresh => Arg::AccountOrAll,
             Self::Tag => Arg::Tag,
             Self::Sort => Arg::Sort,
@@ -146,6 +148,7 @@ impl Kind {
             Self::Refresh => Action::Refresh,
             Self::History => Action::History,
             Self::Games => Action::Games,
+            Self::Profile => Action::Profile,
             Self::OpGg => Action::OpGg,
             Self::Edit => Action::Edit,
             Self::Delete => Action::Delete,
@@ -422,6 +425,7 @@ mod tests {
         // Часть ника из середины.
         assert_eq!(first("история shroom"), Some(Invocation::on(Action::History, 3)));
         assert_eq!(first("игры benjm"), Some(Invocation::on(Action::Games, 1)));
+        assert_eq!(first("профиль benjm"), Some(Invocation::on(Action::Profile, 1)));
         // Без ника — выбранный курсором (id 3) первым.
         assert_eq!(first("войти "), Some(Invocation::on(Action::Login, 3)));
     }
