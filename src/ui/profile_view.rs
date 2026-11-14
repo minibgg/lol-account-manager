@@ -10,6 +10,7 @@ use eframe::egui::{self, Align, Layout, Margin, Rect, RichText, Sense, Stroke, p
 use crate::decay;
 use crate::error::AppError;
 use crate::history::{DAY, Queue};
+use crate::lobby::Position;
 use crate::profile::{self, ChampionSort, ChampionStats, Totals};
 use crate::riot::MatchSummary;
 use crate::storage::{Account, AccountId, unix_now};
@@ -415,6 +416,30 @@ fn summary(ui: &mut egui::Ui, games: &[MatchSummary]) {
         ],
         &font,
     ));
+
+    // Роли: «мид 12 (58%) · бот 5 (40%)» — только игры, где позиция известна.
+    let roles = profile::positions(games);
+    if !roles.is_empty() {
+        let texts: Vec<(String, String, egui::Color32)> = roles
+            .iter()
+            .map(|(position, totals)| {
+                let name = match Position::from_lcu(position) {
+                    Some(known) => known.label().to_lowercase(),
+                    None => position.clone(),
+                };
+                let winrate = totals.winrate().unwrap_or(0.0);
+                (format!("{name} {}", totals.games), format!(" {winrate:.0}%"), winrate_color(winrate))
+            })
+            .collect();
+        let mut line: Vec<(&str, egui::Color32)> = vec![("роли ", k)];
+        for (index, (name, winrate, color)) in texts.iter().enumerate() {
+            if index > 0 {
+                line.push(dot);
+            }
+            line.extend([(name.as_str(), theme::TEXT), (winrate.as_str(), *color)]);
+        }
+        ui.label(job(&line, &font));
+    }
 
     // Последние игры: новые слева.
     let mut form: Vec<(&str, egui::Color32)> = vec![("форма ", k)];

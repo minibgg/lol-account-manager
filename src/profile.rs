@@ -180,6 +180,24 @@ pub fn champions<'a>(games: impl IntoIterator<Item = &'a MatchSummary>, sort: Ch
     list
 }
 
+/// Итоги по позициям («top» … «utility»), чаще сыгранные — первыми. Игры, где позиция
+/// неизвестна (ARAM, старые записи архива), не учитываются.
+pub fn positions<'a>(games: impl IntoIterator<Item = &'a MatchSummary>) -> Vec<(String, Totals)> {
+    let mut by_position: HashMap<&str, Totals> = HashMap::new();
+    for game in games {
+        if !game.me.position.is_empty() {
+            by_position.entry(game.me.position.as_str()).or_default().add(game);
+        }
+    }
+    let mut list: Vec<(String, Totals)> = by_position
+        .into_iter()
+        .filter(|(_, totals)| totals.games > 0)
+        .map(|(position, totals)| (position.to_string(), totals))
+        .collect();
+    list.sort_by(|a, b| b.1.games.cmp(&a.1.games).then_with(|| a.0.cmp(&b.0)));
+    list
+}
+
 /// Текущая серия: (победы это или поражения, сколько подряд). `games` — новые первыми;
 /// ремейки серию не прерывают. `None` — игр нет.
 pub fn streak<'a>(games: impl IntoIterator<Item = &'a MatchSummary>) -> Option<(bool, usize)> {
@@ -258,6 +276,19 @@ mod tests {
         let ekko = &champions(&games, ChampionSort::Games)[0];
         assert_eq!((ekko.totals.games, ekko.totals.wins, ekko.last_played), (3, 1, 10));
         assert_eq!(ekko.name, "Чемпион 245");
+    }
+
+    #[test]
+    fn positions_count_only_known_ones() {
+        let at = |position: &str, win: bool, played_at: i64| {
+            let mut game = game(1, win, (1, 1, 1), played_at);
+            game.me.position = position.into();
+            game
+        };
+        let games = [at("middle", true, 1), at("middle", false, 2), at("top", true, 3), at("", true, 4), at("middle", true, 5)];
+        let list = positions(&games);
+        let short: Vec<(&str, u32, u32)> = list.iter().map(|(p, t)| (p.as_str(), t.games, t.wins)).collect();
+        assert_eq!(short, [("middle", 3, 2), ("top", 1, 1)]);
     }
 
     #[test]

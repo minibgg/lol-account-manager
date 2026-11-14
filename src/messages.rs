@@ -18,10 +18,12 @@
 use std::fmt;
 use std::path::PathBuf;
 
+use zeroize::Zeroize;
+
 use crate::error::AppError;
 use crate::images::{ImageBytes, ImageKey};
 use crate::lcu::LcuStatus;
-use crate::lobby::LobbyState;
+use crate::lobby::{LiveGame, LobbyState};
 use crate::riot::{DataSource, MatchDetails, MatchSummary, RankedQueues, RiotId};
 use crate::storage::{Account, AccountId, AccountInput, Credentials, SecretChange};
 use crate::update::UpdateInfo;
@@ -48,6 +50,15 @@ impl Secret {
     /// где секрет «раскрывается».
     pub fn expose(&self) -> &str {
         &self.0
+    }
+}
+
+/// Когда секрет больше не нужен, его байты в памяти затираются нулями (crate zeroize):
+/// иначе строка просто «освобождается» и её содержимое остаётся лежать в памяти,
+/// пока это место не займёт что-то другое.
+impl Drop for Secret {
+    fn drop(&mut self) {
+        self.0.zeroize();
     }
 }
 
@@ -161,6 +172,8 @@ pub enum Event {
     LcuStatus(LcuStatus),
     /// Изменилось лобби: группа, выбор чемпионов, игра.
     Lobby(LobbyState),
+    /// Кто из аккаунтов (кроме того, что в клиенте) сейчас в игре — по данным Riot API.
+    LiveGames(Vec<(AccountId, LiveGame)>),
 
     /// Аккаунт добавлен. `fetch_error` — почему не удалось сразу загрузить данные из Riot
     /// (нет ключа, нет сети...): аккаунт сохранён, обновить его можно позже.

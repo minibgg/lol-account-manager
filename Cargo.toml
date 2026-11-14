@@ -29,6 +29,8 @@ tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.29.0", features = ["v4"] }
+# Затирает секреты в памяти нулями, когда они больше не нужны.
+zeroize = "1.9.1"
 
 # Только Windows: значок в трее и запись в реестр для запуска вместе с системой.
 [target.'cfg(windows)'.dependencies]

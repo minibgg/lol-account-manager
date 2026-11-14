@@ -21,7 +21,7 @@ use crate::error::AppError;
 use crate::history::{self, Queue, Session};
 use crate::images::ImageKey;
 use crate::lcu::LcuStatus;
-use crate::lobby::{self, LobbyPhase, LobbyState};
+use crate::lobby::{self, LiveGame, LobbyPhase, LobbyState};
 use crate::messages::{Command, CredentialKind, Event, LeagueDirInfo, Secret};
 use crate::riot::models::RECENT_MATCHES;
 use crate::riot::{Division, MatchDetails, MatchSummary, RankedQueues, Region, RiotId};
@@ -187,6 +187,8 @@ pub struct App {
     lcu: LcuStatus,
     /// Группа, выбор чемпионов, игра — для вкладки «Лобби».
     lobby: LobbyState,
+    /// Аккаунты, у которых прямо сейчас идёт игра (кроме того, что в клиенте).
+    live: HashMap<AccountId, LiveGame>,
     accounts: Vec<Account>,
     /// Аккаунты, которые сейчас обновляются (показываем индикатор).
     refreshing: HashSet<AccountId>,
@@ -283,6 +285,7 @@ impl App {
             has_api_key: false,
             lcu: LcuStatus::NotRunning,
             lobby: LobbyState::default(),
+            live: HashMap::new(),
             accounts: Vec::new(),
             refreshing: HashSet::new(),
             errors: HashMap::new(),
@@ -537,6 +540,7 @@ impl App {
             Event::LcuStatus(status) => self.lcu = status,
             Event::Lobby(state) if !self.debug_lobby => self.lobby = state,
             Event::Lobby(_) => {}
+            Event::LiveGames(games) => self.live = games.into_iter().collect(),
 
             Event::AccountAdded {
                 account,
@@ -1374,6 +1378,11 @@ impl App {
         }
 
         let in_client = visible.iter().find(|a| self.is_in_client(a)).map(|a| a.id);
+        // Кто сейчас в игре: по данным Riot API и — для аккаунта из клиента — самого клиента.
+        let mut live = self.live.clone();
+        if let (Some(id), Some(game)) = (in_client, &self.lobby.game) {
+            live.insert(id, game.clone());
+        }
         let scroll_to_cursor = std::mem::take(&mut self.scroll_to_cursor);
         // Панели аккаунта нужно ~190 px, остальное — таблице.
         const DETAILS_HEIGHT: f32 = 196.0;
@@ -1381,6 +1390,7 @@ impl App {
             accounts: &visible,
             cursor: self.cursor,
             in_client,
+            live: &live,
             refreshing: &self.refreshing,
             errors: &self.errors,
             scroll_to_cursor,
@@ -1394,6 +1404,7 @@ impl App {
             let details = terminal::Details {
                 account,
                 in_client: in_client == Some(account.id),
+                live: live.get(&account.id),
                 refreshing: self.refreshing.contains(&account.id),
                 error: self.errors.get(&account.id),
                 login_pending: self.login_flow.as_ref().is_some_and(|f| f.id == account.id),
@@ -2339,6 +2350,7 @@ fn debug_lobby(accounts: &[Account]) -> LobbyState {
         ..LobbyPlayer::default()
     });
     LobbyState {
+        game: None,
         phase: LobbyPhase::ChampSelect,
         players,
         problem: None,

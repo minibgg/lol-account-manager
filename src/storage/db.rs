@@ -649,7 +649,14 @@ fn archive_summary(conn: &Connection, id: AccountId, game: &MatchSummary) -> App
         "INSERT INTO matches (account_id, match_id, played_at, summary_json) VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT(account_id, match_id) DO UPDATE SET
              played_at    = excluded.played_at,
-             summary_json = excluded.summary_json",
+             -- Позицию игрока иногда знаем только мы (запомнили во время игры), а в новой
+             -- записи от клиента её нет: тогда переносим её из старой записи.
+             summary_json = CASE
+                 WHEN COALESCE(json_extract(excluded.summary_json, '$.position'), '') = ''
+                  AND COALESCE(json_extract(matches.summary_json, '$.position'), '') <> ''
+                 THEN json_set(excluded.summary_json, '$.position', json_extract(matches.summary_json, '$.position'))
+                 ELSE excluded.summary_json
+             END",
         params![id, game.id, game.played_at, to_json(game)?],
     )?;
     Ok(())
@@ -909,6 +916,24 @@ mod tests {
                 }],
             }],
         }
+    }
+
+    /// Позиция, которую узнали во время игры, не стирается, когда клиент потом
+    /// присылает ту же игру без позиции.
+    #[test]
+    fn archive_keeps_a_known_position() {
+        let mut db = Db::open_in_memory().unwrap();
+        let a = db.insert_account(&input("Name#EUW", Region::Euw)).unwrap();
+        let mut with_position = game("EUW1_1", true);
+        with_position.me.position = "middle".into();
+        let mut snap = snapshot("p", "Name#EUW");
+        snap.matches = Some(vec![with_position]);
+        db.save_snapshot(a.id, &snap, 1).unwrap();
+        snap.matches = Some(vec![game("EUW1_1", false)]);
+        db.save_snapshot(a.id, &snap, 2).unwrap();
+        let saved = &db.archived_matches(a.id, None).unwrap()[0];
+        assert_eq!(saved.me.position, "middle");
+        assert!(!saved.win, "остальное обновилось");
     }
 
     /// Время ранговых игр (для оценки сгорания ранга): только 420 и 440, без ремейков

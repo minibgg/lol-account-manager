@@ -15,6 +15,7 @@ use eframe::egui::{
 use crate::decay;
 use crate::error::AppError;
 use crate::history::{self, DAY};
+use crate::lobby::LiveGame;
 use crate::riot::{MatchSummary, RankedStats};
 use crate::storage::{Account, AccountId, unix_now};
 use crate::ui::command::{Invocation, Suggestion};
@@ -120,6 +121,8 @@ pub struct Table<'a> {
     pub accounts: &'a [&'a Account],
     pub cursor: Option<AccountId>,
     pub in_client: Option<AccountId>,
+    /// У кого сейчас идёт игра.
+    pub live: &'a HashMap<AccountId, LiveGame>,
     pub refreshing: &'a HashSet<AccountId>,
     pub errors: &'a HashMap<AccountId, AppError>,
     /// Курсор сдвинули с клавиатуры — прокрутить к нему.
@@ -209,7 +212,9 @@ impl Table<'_> {
             }
         };
 
-        let extra = if self.in_client == Some(account.id) {
+        let extra = if let Some(game) = self.live.get(&account.id) {
+            job(&[(&format!("● {}", game.label(now)), ink(theme::GREEN_TEXT))], &font)
+        } else if self.in_client == Some(account.id) {
             job(&[("● в клиенте", ink(theme::GREEN_TEXT))], &font)
         } else if self.refreshing.contains(&account.id) {
             job(&[("обновляется…", ink(theme::ACCENT_TEXT))], &font)
@@ -253,6 +258,8 @@ impl Table<'_> {
 pub struct Details<'a> {
     pub account: &'a Account,
     pub in_client: bool,
+    /// Игра, которая идёт у аккаунта прямо сейчас.
+    pub live: Option<&'a LiveGame>,
     pub refreshing: bool,
     pub error: Option<&'a AppError>,
     /// Нажата «Войти»: логин в буфере, Enter скопирует пароль.
@@ -396,6 +403,11 @@ impl Details<'_> {
         let k = theme::TEXT_HINT;
         if self.refreshing {
             return job(&[("обновляется…", theme::ACCENT_TEXT)], font);
+        }
+        if let Some(game) = self.live {
+            let label = format!("● {}", game.label(unix_now()));
+            let queue = format!(" · {}", crate::riot::models::queue_label(game.queue_id).to_lowercase());
+            return job(&[(&label, theme::GREEN_TEXT), (&queue, k)], font);
         }
         let age = self
             .account

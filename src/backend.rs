@@ -31,7 +31,7 @@ use crate::launcher;
 use crate::lcu::models::ChatParticipant;
 use crate::lcu::riot_client::{self, RiotClientAuth};
 use crate::lcu::{LcuClient, LcuStatus, lockfile};
-use crate::lobby::{self, LobbyPhase, LobbyPlayer, LobbyState, PlayerProfile};
+use crate::lobby::{self, LiveGame, LobbyPhase, LobbyPlayer, LobbyState, PlayerProfile};
 use crate::messages::{Command, CredentialKind, Event, ImportReport, LeagueDirInfo, Secret};
 use crate::riot::{
     AccountSnapshot, ApiKey, DataSource, MatchDetails, MatchSummary, PlayerStats, RankedQueues, Region, RiotClient,
@@ -54,6 +54,11 @@ const LCU_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
 /// Как часто смотреть, что с лобби (выбор чемпионов идёт быстро — чаще, чем LCU_POLL_INTERVAL).
 const LOBBY_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Как часто спрашиваем Riot API, не в игре ли остальные аккаунты (по запросу на аккаунт).
+const LIVE_POLL_INTERVAL: Duration = Duration::from_secs(150);
+/// Первый такой опрос — вскоре после запуска.
+const LIVE_FIRST_POLL: Duration = Duration::from_secs(20);
 
 /// Сколько последних игр архива сверять с ответом Riot API (чтобы не загружать их снова).
 const KNOWN_MATCHES: usize = 100;
@@ -300,6 +305,9 @@ struct Worker {
     /// Семафор — «N пропусков»: задача берёт пропуск перед обновлением и
     /// возвращает после. Когда пропуска кончились, следующие ждут.
     refresh_slots: Arc<Semaphore>,
+    /// Позиции в недавних играх аккаунта из клиента (номер игры → «middle»): клиент
+    /// знает их во время игры, а в истории игр потом часто отдаёт пустыми.
+    positions: Arc<Mutex<HashMap<i64, String>>>,
     /// Проверка и скачивание новой версии приложения.
     updater: Updater,
     /// Установщик уже скачивается. `AtomicBool` — флажок, который можно менять из
@@ -351,6 +359,7 @@ impl Worker {
             clipboard_clear_after,
             refreshing: Arc::default(),
             refresh_slots: Arc::new(Semaphore::new(PARALLEL_REFRESHES)),
+            positions: Arc::default(),
             updater: Updater::new(update_dir)?,
             update_running: Arc::default(),
         };
@@ -380,6 +389,7 @@ impl Worker {
         // Отдельные задачи следят за клиентом League и за лобби всё время работы программы.
         tokio::spawn(worker.clone().watch_lcu());
         tokio::spawn(worker.clone().watch_lobby());
+        tokio::spawn(worker.clone().watch_live_games());
         if auto_update_check {
             tokio::spawn(worker.clone().watch_updates());
         }
@@ -490,6 +500,76 @@ impl Worker {
         }
     }
 
+    /// Раз в несколько минут спрашивает Riot API, не идёт ли игра у аккаунтов списка
+    /// (кроме того, что в клиенте: про него всё знает сам клиент). Нужен API-ключ.
+    async fn watch_live_games(self) {
+        let mut last: Vec<(AccountId, LiveGame)> = Vec::new();
+        tokio::time::sleep(LIVE_FIRST_POLL).await;
+        loop {
+            let now = self.live_games().await;
+            if now != last {
+                self.events.send(Event::LiveGames(now.clone()));
+                last = now;
+            }
+            tokio::time::sleep(LIVE_POLL_INTERVAL).await;
+        }
+    }
+
+    async fn live_games(&self) -> Vec<(AccountId, LiveGame)> {
+        if !self.riot.has_api_key() {
+            return Vec::new();
+        }
+        let Ok(accounts) = self.with_storage(|s| s.list_accounts()).await else {
+            return Vec::new();
+        };
+        let client = match self.lcu.status().await {
+            LcuStatus::Connected { region, riot_id, puuid } => Some((region, riot_id, puuid)),
+            _ => None,
+        };
+        let mut live = Vec::new();
+        for account in &accounts {
+            // Нужен PUUID Riot API: он появляется после первого обновления через API.
+            let Some(puuid) = &account.puuid else {
+                continue;
+            };
+            if client.as_ref().is_some_and(|(region, riot_id, lcu_puuid)| is_same_account(account, *region, riot_id, lcu_puuid)) {
+                continue;
+            }
+            match self.riot.active_game(puuid, account.region).await {
+                Ok(Some(game)) => {
+                    let champion_id = game
+                        .participants
+                        .iter()
+                        .find(|p| p.puuid.as_deref() == Some(puuid.as_str()))
+                        .map_or(0, |p| p.champion_id);
+                    let champion = match self.images.champion_names().await {
+                        Ok(names) => names.get(&champion_id).cloned().unwrap_or_default(),
+                        Err(_) => String::new(),
+                    };
+                    live.push((
+                        account.id,
+                        LiveGame {
+                            game_id: game.game_id,
+                            queue_id: game.game_queue_config_id,
+                            champion_id,
+                            champion,
+                            position: String::new(),
+                            // Пока идёт загрузка, времени начала ещё нет.
+                            started_at: if game.game_start_time > 0 { game.game_start_time / 1000 } else { unix_now() },
+                        },
+                    ));
+                }
+                Ok(None) => {}
+                // Ключ истёк, лимит, нет сети — просто не знаем; попробуем в следующий раз.
+                Err(error) => {
+                    debug!(id = account.id, %error, "не удалось узнать, идёт ли игра");
+                    break;
+                }
+            }
+        }
+        live
+    }
+
     async fn poll_lobby(&self, cache: &mut LobbyCache) -> LobbyState {
         let raw_phase = match self.lcu.gameflow_phase().await {
             Ok(phase) => Some(phase),
@@ -507,6 +587,9 @@ impl Worker {
         }
         // map_or(по умолчанию, функция): пока клиент загружается — «ничего не происходит».
         let phase = raw_phase.as_deref().map_or(LobbyPhase::Idle, LobbyPhase::from_gameflow);
+        if !cache.game_running {
+            cache.live = None;
+        }
         if cache.my_puuid.is_none() && phase != LobbyPhase::Idle {
             cache.my_puuid = self.lcu.current_summoner().await.ok().map(|s| s.puuid);
         }
@@ -551,6 +634,23 @@ impl Worker {
             player.is_self |= cache.my_puuid.as_deref() == Some(player.puuid.as_str());
         }
         self.fill_profiles(&mut players, cache).await;
+        // Идёт игра — один раз узнаём у клиента, какая: чемпион, очередь, позиция.
+        if cache.game_running
+            && cache.live.is_none()
+            && let Some(my_puuid) = cache.my_puuid.clone()
+            && let Ok(Some(session)) = self.lcu.gameflow_session().await
+        {
+            if cache.champions.is_empty()
+                && let Ok(names) = self.lcu.champion_names().await
+            {
+                cache.champions = names;
+            }
+            cache.live = LiveGame::from_session(&session, &my_puuid, &cache.champions, unix_now());
+            if let Some(game) = cache.live.as_ref().filter(|g| !g.position.is_empty()) {
+                let mut positions = self.positions.lock().unwrap_or_else(PoisonError::into_inner);
+                positions.insert(game.game_id, game.position.clone());
+            }
+        }
         if phase == LobbyPhase::ChampSelect {
             cache.last_team = players.clone();
         }
@@ -558,6 +658,7 @@ impl Worker {
             phase,
             players,
             problem,
+            game: cache.live.clone(),
         }
     }
 
@@ -1139,6 +1240,14 @@ impl Worker {
                 Err(e) => debug!(error = %e, "поражения из Riot API не загрузились"),
             }
         }
+        // Позиции, которые мы запомнили во время игры (в истории игр клиент их часто не отдаёт).
+        let positions = self.positions.lock().unwrap_or_else(PoisonError::into_inner);
+        for game in snapshot.matches.iter_mut().flatten().filter(|g| g.me.position.is_empty()) {
+            if let Some(position) = MatchSummary::game_id(&game.id).and_then(|id| positions.get(&id)) {
+                game.me.position.clone_from(position);
+            }
+        }
+        drop(positions);
         Ok(snapshot)
     }
 
@@ -1363,11 +1472,11 @@ impl Worker {
     }
 
     async fn try_copy(&self, id: AccountId, kind: CredentialKind) -> AppResult<u64> {
-        let credentials = self.with_storage(move |s| s.credentials(id)).await?;
-        // Забираем нужное поле во владение, второе уничтожится вместе с credentials.
+        let mut credentials = self.with_storage(move |s| s.credentials(id)).await?;
+        // Забираем нужное поле (take), второе затрётся в памяти вместе с credentials.
         let secret = match kind {
-            CredentialKind::Login => credentials.login,
-            CredentialKind::Password => credentials.password,
+            CredentialKind::Login => credentials.login.take(),
+            CredentialKind::Password => credentials.password.take(),
         }
         .ok_or(AppError::CredentialMissing(kind.label()))?;
         let clipboard = self.clipboard.clone();
@@ -1453,6 +1562,8 @@ struct LobbyCache {
     last_team: Vec<LobbyPlayer>,
     /// На прошлом опросе шла игра.
     game_running: bool,
+    /// Игра, которая сейчас идёт (узнаём один раз за игру).
+    live: Option<LiveGame>,
     /// Игра только что закончилась — пора обновить аккаунт (забирает `watch_lobby`).
     game_ended: bool,
 }

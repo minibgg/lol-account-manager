@@ -15,6 +15,7 @@ use std::fmt;
 
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::{AppError, AppResult};
 use crate::riot::ApiKey;
@@ -48,6 +49,15 @@ impl Credentials {
 
     pub fn is_empty(&self) -> bool {
         self.login.is_none() && self.password.is_none()
+    }
+}
+
+/// Логин и пароль затираются в памяти нулями, как только значение уничтожается
+/// (см. `Secret` в messages.rs).
+impl Drop for Credentials {
+    fn drop(&mut self) {
+        self.login.zeroize();
+        self.password.zeroize();
     }
 }
 
@@ -115,8 +125,11 @@ impl Secrets {
     pub fn credentials(&self, secret_ref: &str) -> AppResult<Credentials> {
         match self.entry(&account_user(secret_ref))?.get_password() {
             // Текст ошибки serde НЕ показываем: он может процитировать кусок секрета.
-            Ok(json) => serde_json::from_str(&json)
-                .map_err(|_| AppError::SecretStore("запись повреждена".into())),
+            Ok(json) => {
+                // Zeroizing — обёртка: строка с логином и паролем затрётся при выходе из блока.
+                let json = Zeroizing::new(json);
+                serde_json::from_str(&json).map_err(|_| AppError::SecretStore("запись повреждена".into()))
+            }
             Err(keyring::Error::NoEntry) => Ok(Credentials::default()),
             Err(e) => Err(e.into()),
         }
@@ -127,8 +140,9 @@ impl Secrets {
         if creds.is_empty() {
             return self.delete_credentials(secret_ref);
         }
-        let json = serde_json::to_string(creds)
-            .map_err(|_| AppError::SecretStore("не удалось подготовить запись".into()))?;
+        let json = Zeroizing::new(
+            serde_json::to_string(creds).map_err(|_| AppError::SecretStore("не удалось подготовить запись".into()))?,
+        );
         self.entry(&account_user(secret_ref))?.set_password(&json)?;
         Ok(())
     }

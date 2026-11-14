@@ -13,7 +13,7 @@ use tracing::{debug, warn};
 use super::lockfile::Lockfile;
 use super::models::{
     ChatParticipant, ChatParticipants, LcuChampSelectSession, LcuChampionSummary, LcuLobby,
-    LcuGame, LcuMatchHistory, LcuRankedStats, LcuRegionLocale, LcuSummoner,
+    LcuGame, LcuGameflowSession, LcuMatchHistory, LcuRankedStats, LcuRegionLocale, LcuSummoner,
 };
 use super::riot_client::RiotClientAuth;
 use crate::error::{AppError, AppResult};
@@ -226,6 +226,11 @@ impl LcuClient {
         self.get_json("/lol-gameflow/v1/gameflow-phase")
             .await?
             .ok_or(AppError::LcuNotReady)
+    }
+
+    /// Текущая игра (`None` — игры нет).
+    pub async fn gameflow_session(&self) -> AppResult<Option<LcuGameflowSession>> {
+        self.get_json("/lol-gameflow/v1/session").await
     }
 
     /// Выбор чемпионов (`None` — его сейчас нет).
