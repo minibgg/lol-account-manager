@@ -1,14 +1,10 @@
-//! Проверка частей автовхода (Shift+Enter) из консоли — БЕЗ ввода логина и пароля:
+//! Проверка связи с локальным API Riot Client для входа (Shift+Enter) — БЕЗ входа:
 //! `cargo run --example autologin_check`.
 //!
-//! Показывает, что отвечает Riot Client о состоянии входа, и раз в секунду (10 секунд) —
-//! видит ли программа окно Riot Client на переднем плане. Переключитесь на окно
-//! Riot Client, чтобы убедиться, что оно распознаётся.
+//! Показывает, запущен ли Riot Client и выполнен ли в нём вход. Сам вход не начинает
+//! (чтобы не трогать текущий сеанс) — запустите его в приложении через Shift+Enter.
 
-use std::time::Duration;
-
-use lol_account_manager::autologin;
-use lol_account_manager::lcu::{LcuClient, lockfile};
+use lol_account_manager::lcu::{LcuClient, RiotSession, lockfile};
 
 #[tokio::main]
 async fn main() {
@@ -17,11 +13,9 @@ async fn main() {
         Err(e) => return println!("ошибка: {e}"),
     };
     match lcu.riot_session().await {
-        Some(session) => println!("Riot Client: {session:?}"),
-        None => println!("Riot Client: не запущен или не отвечает"),
-    }
-    for second in 1..=10 {
-        println!("{second:>2} с: окно Riot Client на переднем плане — {}", autologin::riot_window_focused());
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        None => println!("Riot Client не запущен или ещё не отвечает"),
+        Some(RiotSession::Authenticated) => println!("Riot Client: выполнен вход (для входа в другой аккаунт сначала выйдите)"),
+        Some(RiotSession::NeedsLogin) => println!("Riot Client: показано окно входа — можно входить через Shift+Enter"),
+        Some(RiotSession::Multifactor) => println!("Riot Client: ждёт код подтверждения"),
     }
 }

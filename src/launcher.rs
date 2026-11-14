@@ -46,6 +46,23 @@ pub fn launch_riot_client() -> AppResult<bool> {
     Ok(true)
 }
 
+/// Открыть ссылку в браузере по умолчанию (страница капчи при входе). Блокирующая.
+pub fn open_url(url: &str) -> AppResult<()> {
+    if !cfg!(windows) {
+        return Ok(());
+    }
+    // cmd /C start "" <url> — так Windows открывает ссылку в браузере по умолчанию.
+    // Первый кавычный аргумент start воспринимает как заголовок окна, поэтому он пустой.
+    std::process::Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| AppError::Io(format!("не удалось открыть браузер: {e}")))?;
+    Ok(())
+}
+
 fn find_exe() -> Option<PathBuf> {
     let from_json = std::fs::read_to_string(INSTALLS_JSON)
         .map(|json| exe_candidates(&json))

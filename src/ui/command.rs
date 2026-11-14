@@ -103,7 +103,7 @@ struct Spec {
 const COMMANDS: &[Spec] = &[
     Spec { kind: Kind::Login, names: &["войти", "login", "enter"], hint: "логин в буфер и открыть Riot Client" },
     Spec { kind: Kind::Password, names: &["пароль", "password", "pass"], hint: "скопировать пароль" },
-    Spec { kind: Kind::AutoLogin, names: &["автовход", "autologin"], hint: "войти сразу: ввести логин и пароль в Riot Client" },
+    Spec { kind: Kind::AutoLogin, names: &["автовход", "autologin"], hint: "войти сразу: вход через Riot Client, от вас — только капча" },
     Spec { kind: Kind::UserName, names: &["логин", "user"], hint: "скопировать логин" },
     Spec { kind: Kind::RiotId, names: &["ник", "riotid", "nick"], hint: "скопировать Riot ID" },
     Spec { kind: Kind::Refresh, names: &["обновить", "refresh", "update"], hint: "обновить ранги" },
