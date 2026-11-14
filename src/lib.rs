@@ -8,6 +8,7 @@
 //! Снаружи модули доступны как `lol_account_manager::riot::RiotClient` и т.д.
 
 pub mod app;
+pub mod autologin;
 pub mod autostart;
 pub mod backend;
 pub mod clipboard;

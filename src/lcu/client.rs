@@ -79,6 +79,40 @@ impl LcuClient {
         Arc::clone(&self.dirs.read().unwrap_or_else(PoisonError::into_inner))
     }
 
+    /// Порт и пароль локального API Riot Client — из его собственного lockfile
+    /// (`%LOCALAPPDATA%\Riot Games\Riot Client\Config\lockfile`). `None` — он не запущен.
+    async fn riot_lockfile(&self) -> AppResult<Option<Lockfile>> {
+        let Some(dir) = dirs::data_local_dir() else {
+            return Ok(None);
+        };
+        Lockfile::find(&[dir.join("Riot Games").join("Riot Client").join("Config")]).await
+    }
+
+    /// Выполнен ли вход в Riot Client. `None` — он не запущен или ещё не отвечает.
+    pub async fn riot_session(&self) -> Option<RiotSession> {
+        let lock = self.riot_lockfile().await.ok()??;
+        let url = format!("https://127.0.0.1:{}/rso-auth/v1/session", lock.port);
+        let response = self.get(&url, lock.password()).await.ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let session: RiotSessionDto = response.json().await.ok()?;
+        Some(RiotSession::from_type(&session.r#type))
+    }
+
+    /// Выйти из аккаунта в Riot Client (то же, что «Выйти» в его окне).
+    pub async fn riot_sign_out(&self) -> AppResult<()> {
+        let lock = self.riot_lockfile().await?.ok_or(AppError::LcuNotRunning)?;
+        let url = format!("https://127.0.0.1:{}/rso-auth/v1/session", lock.port);
+        self.http
+            .delete(&url)
+            .basic_auth("riot", Some(lock.password()))
+            .send()
+            .await
+            .map_err(lcu_error)?;
+        Ok(())
+    }
+
     /// Состояние клиента для индикатора в окне. Ошибки сводятся к трём состояниям.
     pub async fn status(&self) -> LcuStatus {
         let region = match self.region().await {
@@ -343,6 +377,38 @@ impl LcuClient {
     }
 }
 
+/// Ответ `/rso-auth/v1/session` Riot Client.
+#[derive(serde::Deserialize)]
+struct RiotSessionDto {
+    #[serde(default)]
+    r#type: String,
+}
+
+/// Что с входом в Riot Client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RiotSession {
+    /// Вход выполнен.
+    Authenticated,
+    /// Клиент ждёт код подтверждения (из почты или приложения).
+    Multifactor,
+    /// Вход не выполнен — показано окно входа.
+    NeedsLogin,
+}
+
+impl RiotSession {
+    /// Из поля `type`: «authenticated», «needs_multifactor_verification», иначе — входа нет
+    /// («needs_authentication», «needs_credentials», «error»…).
+    pub fn from_type(kind: &str) -> Self {
+        if kind == "authenticated" {
+            Self::Authenticated
+        } else if kind.contains("multifactor") {
+            Self::Multifactor
+        } else {
+            Self::NeedsLogin
+        }
+    }
+}
+
 /// Ошибки соединения с LCU переводим в понятные состояния клиента.
 fn lcu_error(e: reqwest::Error) -> AppError {
     if e.is_connect() {
@@ -351,5 +417,20 @@ fn lcu_error(e: reqwest::Error) -> AppError {
         AppError::LcuNotReady
     } else {
         AppError::from(e)
+    }
+}
+
+#[cfg(test)]
+mod riot_session_tests {
+    use super::RiotSession;
+
+    #[test]
+    fn session_type_maps_to_three_states() {
+        assert_eq!(RiotSession::from_type("authenticated"), RiotSession::Authenticated);
+        assert_eq!(RiotSession::from_type("needs_multifactor_verification"), RiotSession::Multifactor);
+        assert_eq!(RiotSession::from_type("needs_authentication"), RiotSession::NeedsLogin);
+        // Незнакомое и пустое — «входа нет»: печатать пароль мы всё равно будем только
+        // в окно Riot Client.
+        assert_eq!(RiotSession::from_type(""), RiotSession::NeedsLogin);
     }
 }

@@ -68,6 +68,8 @@ pub enum Action {
     // Выбранный аккаунт
     /// Enter: «Войти» — логин в буфер и запустить Riot Client; второй Enter — пароль.
     Login,
+    /// Shift+Enter: войти сразу — программа сама вводит логин и пароль в Riot Client.
+    AutoLogin,
     CopyLogin,
     CopyPassword,
     /// Скопировать «Имя#TAG» (не секрет).
@@ -114,6 +116,7 @@ impl Action {
             Self::Select
                 | Self::Mark
                 | Self::Login
+                | Self::AutoLogin
                 | Self::CopyLogin
                 | Self::CopyPassword
                 | Self::CopyRiotId
@@ -165,6 +168,7 @@ pub fn for_key(key: Key, mods: Modifiers) -> Option<Action> {
         (false, true, Key::R) => A::RefreshAll,
         (false, true, Key::T) => A::PrevTag,
         (false, true, Key::G) => A::Last,
+        (false, true, Key::Enter) => A::AutoLogin,
         (false, true, _) => return None,
 
         (false, false, key) => match key {
@@ -283,6 +287,7 @@ pub const HELP: &[HelpSection] = &[
         title: "аккаунт",
         rows: &[
             ("Enter", "войти: логин в буфер и открыть Riot Client; ещё Enter — пароль"),
+            ("Shift+Enter", "войти сразу: программа сама введёт логин и пароль в Riot Client"),
             ("l", "скопировать логин"),
             ("p", "скопировать пароль"),
             ("c", "скопировать Riot ID"),
@@ -330,6 +335,8 @@ mod tests {
         assert_eq!(for_key(Key::Num2, NONE), Some(Action::Game(1)));
         assert_eq!(for_key(Key::Num2, Modifiers::CTRL), Some(Action::Screen(Screen::Lobby)));
         assert_eq!(for_key(Key::Enter, NONE), Some(Action::Login));
+        assert_eq!(for_key(Key::Enter, Modifiers::SHIFT), Some(Action::AutoLogin));
+        assert!(Action::AutoLogin.needs_account());
         // Чужие сочетания не перехватываем: Ctrl+C / Ctrl+V — копирование и вставка.
         assert_eq!(for_key(Key::C, Modifiers::CTRL), None);
         assert_eq!(for_key(Key::V, Modifiers::CTRL), None);

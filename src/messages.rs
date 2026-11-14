@@ -112,6 +112,9 @@ pub enum Command {
     /// Кнопка «Войти»: скопировать логин и запустить Riot Client (как ярлык на рабочем
     /// столе). В клиент ничего не вводится — логин и пароль пользователь вставляет сам.
     StartLogin(AccountId),
+    /// Shift+Enter: войти сразу — запустить Riot Client и самим ввести логин и пароль
+    /// в его окно входа (см. autologin.rs).
+    AutoLogin(AccountId),
     /// Иконка профиля или эмблема ранга (из кэша на диске или из сети).
     LoadImage(ImageKey),
     /// Папка игры из настроек (`None` — искать автоматически).
@@ -220,6 +223,10 @@ pub enum Event {
     ClipboardCleared,
     /// «Войти»: Riot Client запущен (или выведен на передний план).
     RiotClientLaunched,
+    /// Автовход: что происходит сейчас («жду окно входа…») — для строки внизу окна.
+    AutoLoginProgress(&'static str),
+    /// Автовход закончился: текст для строки внизу окна или ошибка.
+    AutoLoginDone(Result<&'static str, AppError>),
 
     ImageLoaded { key: ImageKey, bytes: ImageBytes },
     ImageFailed(ImageKey),

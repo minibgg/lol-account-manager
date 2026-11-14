@@ -685,6 +685,9 @@ impl App {
                 self.notify_error(&error);
             }
             Event::ClipboardCleared => self.notify("Буфер обмена очищен"),
+            Event::AutoLoginProgress(text) => self.notify(text),
+            Event::AutoLoginDone(Ok(text)) => self.notify(text),
+            Event::AutoLoginDone(Err(error)) => self.notify_error(&error),
             Event::RiotClientLaunched => self.notify(if self.login_flow.is_some() {
                 "Riot Client открывается. Вставьте логин (Ctrl+V), затем нажмите «Пароль» на карточке"
             } else {
@@ -1663,6 +1666,7 @@ impl App {
             A::Select
             | A::Mark
             | A::Login
+            | A::AutoLogin
             | A::CopyLogin
             | A::CopyPassword
             | A::CopyRiotId
@@ -1716,6 +1720,17 @@ impl App {
                     self.marked.insert(id);
                 }
                 self.move_cursor(1);
+            }
+            A::AutoLogin if in_client => self.notify("Вы уже вошли в этот аккаунт в клиенте League"),
+            A::AutoLogin if !(has_login && has_password) => {
+                self.notify_error_text(format!(
+                    "Для входа одним нажатием у {riot_id} должны быть сохранены логин и пароль — нажмите e, чтобы добавить"
+                ));
+            }
+            A::AutoLogin => {
+                self.login_flow = None;
+                self.backend.send(Command::AutoLogin(id));
+                self.notify(format!("Вхожу в {riot_id}…"));
             }
             A::Login if pending => self.card_action(CardAction::FinishLogin, id),
             A::Login if in_client => self.notify("Вы уже вошли в этот аккаунт в клиенте League"),
