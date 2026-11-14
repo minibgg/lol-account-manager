@@ -40,6 +40,7 @@ use crate::riot::{
 use crate::storage::{Account, AccountId, AccountInput, Credentials, SecretChange, Storage, unix_now};
 use crate::transfer;
 use crate::update::{self, UpdateInfo, Updater, Version};
+use crate::vault;
 
 /// Сколько аккаунтов обновляются одновременно. Остальные ждут в очереди:
 /// так карточки обновляются по одной сверху вниз, а не все разом в самом конце.
@@ -861,6 +862,11 @@ impl Worker {
                     worker.events.send(Event::Exported(result));
                 }
                 Command::ImportAccounts(path) => worker.import_accounts(path).await,
+                Command::ExportVault { path, password } => {
+                    let result = worker.export_vault(path, password).await;
+                    worker.events.send(Event::Exported(result));
+                }
+                Command::ImportVault { path, password } => worker.import_vault(path, password).await,
                 Command::LoadMatch { account, match_id } => {
                     let result = worker.load_match(account, &match_id).await;
                     if let Err(error) = &result {
@@ -895,6 +901,69 @@ impl Worker {
         tokio::fs::write(&path, json).await?;
         info!(count = accounts.len(), "список аккаунтов экспортирован");
         Ok(accounts.len())
+    }
+
+    /// Полная копия: список с логинами и паролями → зашифрованный файл (см. vault.rs).
+    async fn export_vault(&self, path: PathBuf, password: Secret) -> AppResult<usize> {
+        vault::check_password(password.expose())?;
+        let text = self
+            .with_storage(move |s| {
+                let mut entries = Vec::new();
+                for account in s.list_accounts()? {
+                    let credentials = s.credentials(account.id)?;
+                    entries.push((account, credentials));
+                }
+                // Шифрование намеренно медленное (Argon2) — оно уже в блокирующем потоке.
+                let text = vault::seal(&entries, password.expose(), unix_now())?;
+                Ok((text, entries.len()))
+            })
+            .await?;
+        let (text, count) = text;
+        tokio::fs::write(&path, text).await?;
+        info!(count, "зашифрованная копия сохранена");
+        Ok(count)
+    }
+
+    /// Зашифрованная копия → новые аккаунты вместе с логинами и паролями. Аккаунты,
+    /// которые уже есть в списке, пропускаются целиком (их логины и пароли не трогаем).
+    async fn import_vault(&self, path: PathBuf, password: Secret) {
+        let result: AppResult<(ImportReport, Vec<AccountId>)> = async {
+            if tokio::fs::metadata(&path).await?.len() > transfer::MAX_IMPORT_BYTES {
+                return Err(AppError::ImportTooLarge);
+            }
+            let bytes = tokio::fs::read(&path).await?;
+            self.with_storage(move |s| {
+                let plan = vault::open(&bytes, password.expose())?;
+                let (mut added, mut duplicates) = (Vec::new(), 0);
+                for entry in plan.entries {
+                    match s.add_account(&entry.input, entry.credentials) {
+                        Ok(account) => added.push(account.id),
+                        Err(AppError::DuplicateAccount) => duplicates += 1,
+                        Err(e) => return Err(e),
+                    }
+                }
+                let report = ImportReport {
+                    added: added.len(),
+                    duplicates,
+                    invalid: plan.invalid,
+                };
+                Ok((report, added))
+            })
+            .await
+        }
+        .await;
+        // Что бы ни случилось — показываем то, что успело добавиться.
+        self.reload_accounts().await;
+        match result {
+            Ok((report, added)) => {
+                info!(?report, "аккаунты восстановлены из зашифрованной копии");
+                self.events.send(Event::Imported(Ok(report)));
+                if !added.is_empty() {
+                    self.refresh(added).await;
+                }
+            }
+            Err(error) => self.events.send(Event::Imported(Err(error))),
+        }
     }
 
     /// Файл → новые аккаунты (без логинов и паролей). Уже существующие пропускаются.

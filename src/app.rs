@@ -30,6 +30,7 @@ use crate::single_instance;
 use crate::transfer;
 use crate::tray::{self, Tray, TrayAction};
 use crate::update::{self, UpdateInfo, Version};
+use crate::vault;
 use crate::ui::account_card::CardAction;
 use crate::ui::account_form::{AccountForm, FormAction};
 use crate::ui::account_list::{self, ListView, SortOrder};
@@ -152,6 +153,8 @@ struct SettingsState {
 struct TransferState {
     /// Ждём, пока фоновый поток запишет или прочитает файл.
     busy: bool,
+    /// Пароль зашифрованной копии (поле замаскировано, после отправки очищается).
+    vault_password: String,
     result: Option<Result<String, AppError>>,
 }
 
@@ -2237,12 +2240,84 @@ impl App {
                 widgets::spinner(ui, 14.0);
             }
         });
+        ui.add_space(14.0);
+        self.vault_settings(ui, frame, &mut command);
         if let Some(command) = command {
             self.transfer.busy = true;
             self.transfer.result = None;
             self.backend.send(command);
         }
         result_line(ui, self.transfer.result.as_ref());
+    }
+
+    /// Полная копия с логинами и паролями, зашифрованная паролем (см. vault.rs).
+    fn vault_settings(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame, command: &mut Option<Command>) {
+        ui.label(theme::caps("Полная копия с паролями"));
+        ui.add_space(6.0);
+        ui.add(
+            egui::Label::new(
+                RichText::new(
+                    "Сохраняет список вместе с логинами и паролями в один файл, зашифрованный \
+                     паролем, который вы придумаете здесь (Argon2id + XChaCha20-Poly1305). Нужна, \
+                     чтобы переехать на другой компьютер целиком. Без пароля копии файл бесполезен, \
+                     а забытый пароль восстановить нельзя. Восстановление добавляет только те \
+                     аккаунты, которых ещё нет в списке.",
+                )
+                .size(12.0)
+                .color(theme::TEXT_MUTED),
+            )
+            .wrap(),
+        );
+        ui.add_space(8.0);
+        let busy = self.transfer.busy;
+        ui.add_enabled(
+            !busy,
+            egui::TextEdit::singleline(&mut self.transfer.vault_password)
+                .password(true)
+                .hint_text(format!("Пароль копии — не меньше {} символов", vault::MIN_PASSWORD_CHARS))
+                .desired_width(360.0),
+        );
+        ui.add_space(8.0);
+        let strong = vault::check_password(&self.transfer.vault_password).is_ok();
+        let mut picked = None;
+        ui.horizontal(|ui| {
+            let save = ui
+                .add_enabled(!busy && strong && !self.accounts.is_empty(), Button::outline("Сохранить копию…").icon(Icon::Download))
+                .on_disabled_hover_text("Введите пароль копии (и в списке должен быть хотя бы один аккаунт)");
+            if save.clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .set_parent(frame)
+                    .set_title("Зашифрованная копия аккаунтов")
+                    .add_filter("Зашифрованная копия", &[vault::EXTENSION])
+                    .set_file_name(vault::default_file_name(unix_now()))
+                    .save_file()
+            {
+                let path = if path.extension().is_none() { path.with_extension(vault::EXTENSION) } else { path };
+                picked = Some((path, true));
+            }
+            let restore = ui
+                .add_enabled(!busy && !self.transfer.vault_password.is_empty(), Button::outline("Восстановить из копии…").icon(Icon::Upload))
+                .on_disabled_hover_text("Введите пароль, которым зашифрована копия");
+            if restore.clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .set_parent(frame)
+                    .set_title("Восстановить аккаунты из копии")
+                    .add_filter("Зашифрованная копия", &[vault::EXTENSION])
+                    .pick_file()
+            {
+                picked = Some((path, false));
+            }
+        });
+        if let Some((path, save)) = picked {
+            // Пароль уходит в фоновый поток, а поле ввода затираем и очищаем.
+            let password = Secret::new(self.transfer.vault_password.clone());
+            zeroize::Zeroize::zeroize(&mut self.transfer.vault_password);
+            *command = Some(if save {
+                Command::ExportVault { path, password }
+            } else {
+                Command::ImportVault { path, password }
+            });
+        }
     }
 
     fn league_settings(&mut self, ui: &mut egui::Ui) {

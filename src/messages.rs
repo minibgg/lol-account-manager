@@ -125,6 +125,11 @@ pub enum Command {
     ExportAccounts(PathBuf),
     /// Добавить аккаунты из файла экспорта (те, которых ещё нет в списке).
     ImportAccounts(PathBuf),
+    /// Сохранить полную копию — список вместе с логинами и паролями, — зашифрованную
+    /// этим паролем (см. vault.rs).
+    ExportVault { path: PathBuf, password: Secret },
+    /// Восстановить аккаунты (с логинами и паролями) из зашифрованной копии.
+    ImportVault { path: PathBuf, password: Secret },
     /// Подробности игры (обе команды) — для окна, которое открывается щелчком по игре.
     LoadMatch { account: AccountId, match_id: String },
     /// Все игры аккаунта из архива — для окна «Все игры».
@@ -283,6 +288,14 @@ mod tests {
             },
             Command::SaveApiKey(Secret::new("RGAPI-my-key")),
             Command::CheckApiKey(Some(Secret::new("RGAPI-my-key"))),
+            Command::ExportVault {
+                path: "copy.lolvault".into(),
+                password: Secret::new("my-pass"),
+            },
+            Command::ImportVault {
+                path: "copy.lolvault".into(),
+                password: Secret::new("my-pass"),
+            },
         ];
         for command in &commands {
             let text = format!("{command:?}");
