@@ -23,6 +23,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
+use crate::autologin;
 use crate::clipboard::{self, SecretClipboard};
 use crate::error::{AppError, AppResult};
 use crate::hello;
@@ -31,7 +32,7 @@ use crate::images::{self, ImageCache};
 use crate::launcher;
 use crate::lcu::models::ChatParticipant;
 use crate::lcu::riot_client::{self, RiotClientAuth};
-use crate::lcu::{LcuClient, LcuStatus, lockfile};
+use crate::lcu::{LcuClient, LcuStatus, RiotSession, lockfile};
 use crate::lobby::{self, LiveGame, LobbyPhase, LobbyPlayer, LobbyState, PlayerProfile};
 use crate::messages::{Command, CredentialKind, Event, ImportReport, LeagueDirInfo, Secret};
 use crate::riot::{
@@ -81,6 +82,14 @@ pub const LEAGUE_DIR_SETTING: &str = "league_dir";
 
 /// Настройка «проверять обновления при запуске»: «0» — выключено, иначе включено.
 pub const UPDATE_CHECK_SETTING: &str = "update_check";
+
+/// Автовход: сколько ждём, пока Riot Client запустится и покажет окно входа.
+const AUTOLOGIN_WINDOW_WAIT: Duration = Duration::from_secs(45);
+/// Сколько ждём, пока Riot Client примет введённые логин и пароль.
+const AUTOLOGIN_RESULT_WAIT: Duration = Duration::from_secs(25);
+/// Пауза после появления окна входа: странице нужно время, чтобы поля стали активны.
+const AUTOLOGIN_FORM_DELAY: Duration = Duration::from_millis(1800);
+const AUTOLOGIN_POLL: Duration = Duration::from_millis(500);
 
 /// Ключ настройки «спрашивать Windows Hello перед копированием пароля» («1» — да).
 pub const HELLO_LOCK_SETTING: &str = "hello_lock";
@@ -316,6 +325,8 @@ struct Worker {
     /// Позиции в недавних играх аккаунта из клиента (номер игры → «middle»): клиент
     /// знает их во время игры, а в истории игр потом часто отдаёт пустыми.
     positions: Arc<Mutex<HashMap<i64, String>>>,
+    /// Автовход уже идёт.
+    autologin_running: Arc<AtomicBool>,
     /// Включена ли проверка Windows Hello перед копированием пароля.
     hello_lock: Arc<AtomicBool>,
     /// До какого момента действует последняя успешная проверка Windows Hello.
@@ -375,6 +386,7 @@ impl Worker {
             positions: Arc::default(),
             hello_lock: Arc::new(AtomicBool::new(hello_lock)),
             hello_ok_until: Arc::default(),
+            autologin_running: Arc::default(),
             updater: Updater::new(update_dir)?,
             update_running: Arc::default(),
         };
@@ -922,6 +934,15 @@ impl Worker {
                 Command::RefreshAll => worker.refresh_all().await,
                 Command::CopyCredential { id, kind } => worker.copy_credential(id, kind).await,
                 Command::StartLogin(id) => worker.start_login(id).await,
+                Command::AutoLogin(id) => {
+                    // Два автовхода одновременно печатали бы в одно окно вперемешку.
+                    if worker.autologin_running.swap(true, Ordering::SeqCst) {
+                        return;
+                    }
+                    let result = worker.auto_login(id).await;
+                    worker.autologin_running.store(false, Ordering::SeqCst);
+                    worker.events.send(Event::AutoLoginDone(result));
+                }
                 Command::LoadImage(key) => match worker.images.load(key).await {
                     Ok(bytes) => worker.events.send(Event::ImageLoaded { key, bytes }),
                     Err(error) => {
@@ -1607,6 +1628,104 @@ impl Worker {
             Err(e) => self.events.send(Event::Warning(e)),
         }
         self.clear_clipboard_later(generation).await;
+    }
+
+    // ----- Автовход (Shift+Enter) -------------------------------------------
+
+    /// Ждёт, пока `check` не вернёт значение, но не дольше `limit`.
+    async fn wait_until<T, F, Fut>(limit: Duration, mut check: F) -> Option<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Option<T>>,
+    {
+        let deadline = Instant::now() + limit;
+        loop {
+            if let Some(value) = check().await {
+                return Some(value);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(AUTOLOGIN_POLL).await;
+        }
+    }
+
+    /// Вход одним нажатием: запускает Riot Client, дожидается окна входа и вводит в него
+    /// логин и пароль (см. autologin.rs). Пароль печатается, только пока окно Riot Client
+    /// на переднем плане.
+    async fn auto_login(&self, id: AccountId) -> AppResult<&'static str> {
+        let fail = |text: &str| AppError::AutoLogin(text.to_string());
+        if !autologin::is_supported() {
+            return Err(fail("работает только в Windows"));
+        }
+        self.confirm_user("LoL Account Manager: войти в аккаунт").await?;
+        let account = self.with_storage(move |s| s.get_account(id)).await?;
+        let mut credentials = self.with_storage(move |s| s.credentials(id)).await?;
+        // Zeroizing — логин и пароль затрутся в памяти, когда функция закончится.
+        let login = zeroize::Zeroizing::new(credentials.login.take().ok_or(AppError::CredentialMissing("Логин"))?);
+        let password = zeroize::Zeroizing::new(credentials.password.take().ok_or(AppError::CredentialMissing("Пароль"))?);
+
+        // В Riot Client уже кто-то вошёл?
+        if self.lcu.riot_session().await == Some(RiotSession::Authenticated) {
+            match self.lcu.status().await {
+                LcuStatus::Connected { region, riot_id, puuid } if is_same_account(&account, region, &riot_id, &puuid) => {
+                    return Ok("Вы уже вошли в этот аккаунт");
+                }
+                // Клиент League открыт под другим аккаунтом: выход из Riot Client закрыл бы
+                // его (и, возможно, идущую игру) — это решение оставляем человеку.
+                LcuStatus::Connected { .. } | LcuStatus::Loading => {
+                    return Err(fail(
+                        "клиент League открыт под другим аккаунтом — закройте его и нажмите Shift+Enter ещё раз",
+                    ));
+                }
+                LcuStatus::NotRunning => {
+                    self.events.send(Event::AutoLoginProgress("Выхожу из прежнего аккаунта в Riot Client…"));
+                    self.lcu.riot_sign_out().await?;
+                    let signed_out = Self::wait_until(Duration::from_secs(15), || async {
+                        (self.lcu.riot_session().await != Some(RiotSession::Authenticated)).then_some(())
+                    })
+                    .await;
+                    if signed_out.is_none() {
+                        return Err(fail("не удалось выйти из прежнего аккаунта — выйдите в окне Riot Client вручную"));
+                    }
+                }
+            }
+        }
+
+        self.events.send(Event::AutoLoginProgress("Открываю Riot Client и жду окно входа — не трогайте клавиатуру и мышь…"));
+        if !blocking(launcher::launch_riot_client).await? {
+            return Err(fail("работает только в Windows"));
+        }
+        // Ждём сразу двух вещей: клиент ждёт входа, и его окно на переднем плане.
+        let ready = Self::wait_until(AUTOLOGIN_WINDOW_WAIT, || async {
+            let waiting = self.lcu.riot_session().await == Some(RiotSession::NeedsLogin);
+            let focused = blocking(|| Ok(autologin::riot_window_focused())).await.unwrap_or(false);
+            (waiting && focused).then_some(())
+        })
+        .await;
+        if ready.is_none() {
+            return Err(fail(
+                "окно входа Riot Client не появилось на переднем плане — откройте его и нажмите Shift+Enter ещё раз",
+            ));
+        }
+        tokio::time::sleep(AUTOLOGIN_FORM_DELAY).await;
+        blocking(move || autologin::type_credentials(&login, &password)).await?;
+
+        self.events.send(Event::AutoLoginProgress("Логин и пароль введены — жду ответа Riot Client…"));
+        let outcome = Self::wait_until(AUTOLOGIN_RESULT_WAIT, || async {
+            self.lcu.riot_session().await.filter(|s| *s != RiotSession::NeedsLogin)
+        })
+        .await;
+        match outcome {
+            Some(RiotSession::Authenticated) => {
+                info!(id, "автовход выполнен");
+                Ok("Вход выполнен — League of Legends запускается")
+            }
+            Some(RiotSession::Multifactor) => Ok("Riot Client ждёт код подтверждения — введите его в окне клиента"),
+            _ => Err(fail(
+                "Riot Client не подтвердил вход — посмотрите в его окно: возможно, нужна проверка (капча) или неверны логин и пароль",
+            )),
+        }
     }
 
     /// Копирует и сообщает окну. `None` — не получилось (окно уже получило `CopyFailed`).

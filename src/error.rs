@@ -132,6 +132,10 @@ pub enum AppError {
     #[error("Пароль копии слишком короткий — нужно не меньше {0} символов")]
     VaultWeakPassword(usize),
 
+    /// Вход одним нажатием (Shift+Enter) не удался: почему и что делать.
+    #[error("Автовход: {0}")]
+    AutoLogin(String),
+
     // ----- Windows Hello -----
     /// Проверка Windows Hello не пройдена, отменена или недоступна.
     #[error("{0}")]

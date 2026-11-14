@@ -21,4 +21,4 @@ pub mod lockfile;
 pub mod models;
 pub mod riot_client;
 
-pub use client::{LcuClient, LcuStatus};
+pub use client::{LcuClient, LcuStatus, RiotSession};

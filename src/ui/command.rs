@@ -71,6 +71,7 @@ enum Arg {
 #[derive(Clone, Copy)]
 enum Kind {
     Login,
+    AutoLogin,
     Password,
     UserName,
     RiotId,
@@ -102,6 +103,7 @@ struct Spec {
 const COMMANDS: &[Spec] = &[
     Spec { kind: Kind::Login, names: &["войти", "login", "enter"], hint: "логин в буфер и открыть Riot Client" },
     Spec { kind: Kind::Password, names: &["пароль", "password", "pass"], hint: "скопировать пароль" },
+    Spec { kind: Kind::AutoLogin, names: &["автовход", "autologin"], hint: "войти сразу: ввести логин и пароль в Riot Client" },
     Spec { kind: Kind::UserName, names: &["логин", "user"], hint: "скопировать логин" },
     Spec { kind: Kind::RiotId, names: &["ник", "riotid", "nick"], hint: "скопировать Riot ID" },
     Spec { kind: Kind::Refresh, names: &["обновить", "refresh", "update"], hint: "обновить ранги" },
@@ -135,7 +137,7 @@ const SORTS: [(SortOrder, &str, &str); 4] = [
 impl Kind {
     fn arg(self) -> Arg {
         match self {
-            Self::Login | Self::Password | Self::UserName | Self::RiotId | Self::History | Self::Games
+            Self::Login | Self::AutoLogin | Self::Password | Self::UserName | Self::RiotId | Self::History | Self::Games
             | Self::Profile | Self::OpGg | Self::Edit | Self::Delete => Arg::Account,
             Self::Refresh => Arg::AccountOrAll,
             Self::Tag => Arg::Tag,
@@ -149,6 +151,7 @@ impl Kind {
     fn account_action(self) -> Action {
         match self {
             Self::Login => Action::Login,
+            Self::AutoLogin => Action::AutoLogin,
             Self::Password => Action::CopyPassword,
             Self::UserName => Action::CopyLogin,
             Self::RiotId => Action::CopyRiotId,
