@@ -5,7 +5,9 @@
 //! если ранг изменился. Здесь — только чистые функции над ними: без базы и egui,
 //! поэтому их легко проверить тестами.
 
-use crate::riot::{Division, RankedQueues, RankedStats, Tier};
+use std::collections::HashMap;
+
+use crate::riot::{Division, MatchSummary, RankedQueues, RankedStats, Tier};
 
 /// Секунд в сутках.
 pub const DAY: i64 = 86_400;
@@ -225,6 +227,57 @@ pub fn steps(history: &[RankPoint], queue: Queue) -> Vec<(&RankPoint, &RankPoint
     points.windows(2).rev().map(|pair| (pair[0], pair[1])).collect()
 }
 
+// ----- Ранг после игры ------------------------------------------------------
+
+/// Ранг аккаунта после ранговой игры — для столбца «ранг после игры» в окне «Все игры».
+#[derive(Debug, Clone, PartialEq)]
+pub struct GameRank {
+    pub after: RankedStats,
+    /// На сколько LP ранг изменился с предыдущей записи истории.
+    pub lp: i32,
+    /// Сколько игр сыграно между двумя записями. 1 — изменение именно за эту игру;
+    /// больше — приложение было закрыто, и `lp` — сумма за несколько игр.
+    pub games: usize,
+}
+
+/// Сопоставляет игры с историей рангов: номер игры → ранг после неё.
+///
+/// История — это записи «ранг в момент обновления». Игра, закончившаяся между двумя
+/// соседними записями своей очереди, и дала разницу между ними. Если между записями
+/// несколько игр, разница достаётся самой новой из них (с пометкой, за сколько игр),
+/// остальные остаются без ранга. Ремейки ранг не меняют и не учитываются.
+pub fn game_ranks(history: &[RankPoint], games: &[MatchSummary]) -> HashMap<String, GameRank> {
+    let mut out = HashMap::new();
+    for queue in Queue::ALL {
+        let points: Vec<&RankPoint> = of_queue(history, queue).collect();
+        // Ранговые игры очереди: (когда закончилась, игра), от старых к новым.
+        let mut played: Vec<(i64, &MatchSummary)> = games
+            .iter()
+            .filter(|g| !g.remake && Queue::from_queue_id(g.queue_id) == Some(queue))
+            .map(|g| (g.played_at + i64::from(g.duration_secs), g))
+            .collect();
+        played.sort_by_key(|(ended, _)| *ended);
+        // windows(2) — все пары соседних записей.
+        for pair in points.windows(2) {
+            let (before, after) = (pair[0], pair[1]);
+            // partition_point — двоичный поиск: сколько игр закончилось не позже момента.
+            let from = played.partition_point(|(ended, _)| *ended <= before.taken_at);
+            let to = played.partition_point(|(ended, _)| *ended <= after.taken_at);
+            if let Some((_, newest)) = played[from..to].last() {
+                out.insert(
+                    newest.id.clone(),
+                    GameRank {
+                        after: after.stats.clone(),
+                        lp: ladder(&after.stats) - ladder(&before.stats),
+                        games: to - from,
+                    },
+                );
+            }
+        }
+    }
+    out
+}
+
 // ----- Что изменилось после обновления --------------------------------------
 
 /// Изменение ранга в одной очереди (для карточки «после игры»).
@@ -341,6 +394,48 @@ mod tests {
 
     fn point(queue: Queue, taken_at: i64, stats: RankedStats) -> RankPoint {
         RankPoint { queue, taken_at, stats }
+    }
+
+    /// Ранговая игра: началась в `started`, шла 30 минут.
+    fn ranked_game(id: &str, queue_id: i32, started: i64) -> MatchSummary {
+        MatchSummary {
+            id: id.into(),
+            win: true,
+            remake: false,
+            queue_id,
+            played_at: started,
+            duration_secs: 1800,
+            stats_version: 0,
+            me: Default::default(),
+        }
+    }
+
+    #[test]
+    fn games_get_the_rank_recorded_after_them() {
+        let history = [
+            point(Queue::Solo, 1_000, gold(Division::Two, 40, 10, 5)),
+            point(Queue::Solo, 5_000, gold(Division::Two, 59, 11, 5)),
+            point(Queue::Flex, 6_000, gold(Division::Four, 10, 1, 1)),
+            // Приложение было закрыто: следующая запись — после двух игр и перехода дивизиона.
+            point(Queue::Solo, 20_000, gold(Division::One, 5, 12, 6)),
+        ];
+        let mut remake = ranked_game("RU_5", 420, 12_000);
+        remake.remake = true;
+        let games = [
+            ranked_game("RU_0", 420, -5_000),   // до первой записи — сравнить не с чем
+            ranked_game("RU_1", 420, 2_000),  // закончилась в 3800 → запись 5000
+            ranked_game("RU_2", 450, 5_500),  // ARAM
+            ranked_game("RU_3", 420, 8_000),  // обе — перед записью 20000
+            ranked_game("RU_4", 420, 15_000),
+            remake,
+            ranked_game("RU_6", 440, 7_000),  // Flex: одна запись — сравнить не с чем
+        ];
+        let ranks = game_ranks(&history, &games);
+        assert_eq!(ranks.len(), 2);
+        assert_eq!((ranks["RU_1"].lp, ranks["RU_1"].games, ranks["RU_1"].after.lp), (19, 1, 59));
+        // Самая новая из двух получает сумму: Золото II 59 → Золото I 5 = +46.
+        assert_eq!((ranks["RU_4"].lp, ranks["RU_4"].games), (46, 2));
+        assert_eq!(ranks["RU_4"].after.division, Division::One);
     }
 
     #[test]

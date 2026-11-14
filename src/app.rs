@@ -1753,7 +1753,13 @@ impl App {
         }
         // «Все игры» — под подробностями игры: клавиши ему, только когда подробности закрыты.
         let keys = self.match_dialog.is_none();
-        if let Some((id, action)) = self.games_view.as_mut().map(|v| (v.account, v.show(ctx, keys))) {
+        // История рангов аккаунта — для столбца «ранг после игры».
+        let accounts = &self.accounts;
+        let shown = self.games_view.as_mut().map(|view| {
+            let history = accounts.iter().find(|a| a.id == view.account).map_or(&[][..], |a| &a.history);
+            (view.account, view.show(ctx, keys, history))
+        });
+        if let Some((id, action)) = shown {
             match action {
                 GamesAction::None => {}
                 GamesAction::Close => self.games_view = None,
