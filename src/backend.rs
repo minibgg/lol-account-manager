@@ -24,6 +24,7 @@ use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
 use crate::captcha;
+use crate::clash::{self, ClashPhase, ClashPlayer, ClashState, ClashTeam};
 use crate::clipboard::{self, SecretClipboard};
 use crate::error::{AppError, AppResult};
 use crate::hello;
@@ -34,7 +35,7 @@ use crate::lcu::models::ChatParticipant;
 use crate::lcu::riot_client::{self, RiotClientAuth};
 use crate::lcu::{LcuClient, LcuStatus, RiotSession, lockfile};
 use crate::riot_login::AuthStep;
-use crate::lobby::{self, LiveGame, LobbyPhase, LobbyPlayer, LobbyState, PlayerProfile};
+use crate::lobby::{self, EnemyPlayer, LiveGame, LobbyPhase, LobbyPlayer, LobbyState, PlayerProfile, RecentForm};
 use crate::messages::{Command, CredentialKind, Event, ImportReport, LeagueDirInfo, Secret};
 use crate::riot::{
     AccountSnapshot, ApiKey, DataSource, Inventory, MatchDetails, MatchSummary, PlayerStats, RankedQueues, Region, RiotClient,
@@ -58,6 +59,8 @@ const LCU_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
 /// Как часто смотреть, что с лобби (выбор чемпионов идёт быстро — чаще, чем LCU_POLL_INTERVAL).
 const LOBBY_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Как часто смотреть турнир Clash. Сетка меняется раз в раунд — чаще не нужно.
+const CLASH_POLL_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Как часто спрашиваем Riot API, не в игре ли остальные аккаунты (по запросу на аккаунт).
 const LIVE_POLL_INTERVAL: Duration = Duration::from_secs(150);
@@ -420,6 +423,7 @@ impl Worker {
         tokio::spawn(worker.clone().watch_lcu());
         tokio::spawn(worker.clone().watch_lobby());
         tokio::spawn(worker.clone().watch_live_games());
+        tokio::spawn(worker.clone().watch_clash());
         if auto_update_check {
             tokio::spawn(worker.clone().watch_updates());
         }
@@ -692,6 +696,7 @@ impl Worker {
         let phase = raw_phase.as_deref().map_or(LobbyPhase::Idle, LobbyPhase::from_gameflow);
         if !cache.game_running {
             cache.live = None;
+            cache.enemies.clear();
         }
         if cache.my_puuid.is_none() && phase != LobbyPhase::Idle {
             cache.my_puuid = self.lcu.current_summoner().await.ok().map(|s| s.puuid);
@@ -754,6 +759,23 @@ impl Worker {
                 positions.insert(game.game_id, game.position.clone());
             }
         }
+        // С экрана загрузки и до конца игры — команда противника: состав берём из сессии
+        // игры один раз, профили и историю дозагружаем на следующих опросах.
+        if cache.game_running
+            && let Some(my_puuid) = cache.my_puuid.clone()
+        {
+            if cache.enemies.is_empty()
+                && let Ok(Some(session)) = self.lcu.gameflow_session().await
+            {
+                if cache.champions.is_empty()
+                    && let Ok(names) = self.lcu.champion_names().await
+                {
+                    cache.champions = names;
+                }
+                cache.enemies = lobby::enemy_team(&session.game_data, &my_puuid, &cache.champions);
+            }
+            self.fill_enemies(cache).await;
+        }
         if phase == LobbyPhase::ChampSelect {
             cache.last_team = players.clone();
         }
@@ -762,7 +784,29 @@ impl Worker {
             players,
             problem,
             game: cache.live.clone(),
+            enemies: cache.enemies.clone(),
         }
+    }
+
+    /// Ранги, Riot ID и последние игры противников (то, что ещё не загружено).
+    async fn fill_enemies(&self, cache: &mut LobbyCache) {
+        // mem::take — забираем список из кэша, чтобы менять его, пока кэш тоже нужен.
+        let mut enemies = std::mem::take(&mut cache.enemies);
+        for enemy in &mut enemies {
+            if enemy.profile.is_none()
+                && let Some((riot_id, profile)) = self.cached_profile(&enemy.puuid, cache).await
+            {
+                enemy.riot_id = riot_id;
+                enemy.profile = Some(profile);
+            }
+            if enemy.form.is_none() {
+                match self.lcu.recent_matches(&enemy.puuid).await {
+                    Ok(matches) => enemy.form = Some(RecentForm::from_matches(&matches, enemy.champion_id)),
+                    Err(e) => debug!(error = %e, "история противника не загрузилась"),
+                }
+            }
+        }
+        cache.enemies = enemies;
     }
 
     /// Участники чатов Riot Client. Порт и токен читаем из аргументов LeagueClientUx.exe
@@ -786,26 +830,34 @@ impl Worker {
     /// Загружаются один раз за лобби — дальше из `cache.profiles`.
     async fn fill_profiles(&self, players: &mut [LobbyPlayer], cache: &mut LobbyCache) {
         for player in players.iter_mut().filter(|p| !p.puuid.is_empty()) {
-            if !cache.profiles.contains_key(&player.puuid) {
-                match self.player_profile(&player.puuid).await {
-                    Ok(found) => {
-                        cache.profiles.insert(player.puuid.clone(), Some(found));
-                    }
-                    // Такого игрока нет — больше не спрашиваем.
-                    Err(AppError::AccountNotFound) => {
-                        cache.profiles.insert(player.puuid.clone(), None);
-                    }
-                    // Временная ошибка — попробуем на следующем опросе.
-                    Err(e) => debug!(error = %e, "профиль игрока лобби не загрузился"),
-                }
-            }
-            if let Some(Some((riot_id, profile))) = cache.profiles.get(&player.puuid) {
-                player.profile = Some(profile.clone());
+            if let Some((riot_id, profile)) = self.cached_profile(&player.puuid, cache).await {
+                player.profile = Some(profile);
                 if player.riot_id.is_none() {
-                    player.riot_id = riot_id.clone();
+                    player.riot_id = riot_id;
                 }
             }
         }
+    }
+
+    /// Профиль игрока из кэша лобби; если его там нет — загружает один раз.
+    async fn cached_profile(&self, puuid: &str, cache: &mut LobbyCache) -> Option<(Option<RiotId>, PlayerProfile)> {
+        if puuid.is_empty() {
+            return None;
+        }
+        if !cache.profiles.contains_key(puuid) {
+            match self.player_profile(puuid).await {
+                Ok(found) => {
+                    cache.profiles.insert(puuid.to_string(), Some(found));
+                }
+                // Такого игрока нет — больше не спрашиваем.
+                Err(AppError::AccountNotFound) => {
+                    cache.profiles.insert(puuid.to_string(), None);
+                }
+                // Временная ошибка — попробуем на следующем опросе.
+                Err(e) => debug!(error = %e, "профиль игрока лобби не загрузился"),
+            }
+        }
+        cache.profiles.get(puuid).cloned().flatten()
     }
 
     async fn player_profile(&self, puuid: &str) -> AppResult<(Option<RiotId>, PlayerProfile)> {
@@ -819,6 +871,186 @@ impl Worker {
                 ranked,
             },
         ))
+    }
+
+    // ----- Clash -----------------------------------------------------------------
+
+    /// Следит за турниром Clash аккаунта из клиента: команда, текущий соперник, ранги.
+    async fn watch_clash(self) {
+        let mut cache = ClashCache::default();
+        let mut last: Option<ClashState> = None;
+        let mut ticker = tokio::time::interval(CLASH_POLL_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let state = self.poll_clash(&mut cache).await;
+            if last.as_ref() != Some(&state) {
+                debug!(phase = ?state.phase, round = ?state.round, "clash");
+                self.events.send(Event::Clash(state.clone()));
+                last = Some(state);
+            }
+        }
+    }
+
+    async fn poll_clash(&self, cache: &mut ClashCache) -> ClashState {
+        let summaries = match self.lcu.clash_summary().await {
+            Ok(list) => list,
+            Err(AppError::LcuNotRunning) => {
+                *cache = ClashCache::default();
+                return ClashState::default();
+            }
+            // Клиент ещё загружается или Clash выключен на сервере.
+            Err(e) => {
+                return ClashState {
+                    phase: ClashPhase::Idle,
+                    problem: Some(e),
+                    ..ClashState::default()
+                };
+            }
+        };
+        // Обычно турнир один; если их несколько — тот, где уже есть сетка.
+        let Some(summary) = summaries
+            .iter()
+            .find(|s| s.bracket_id > 0)
+            .or(summaries.first())
+            .cloned()
+        else {
+            cache.players.clear();
+            cache.scouted.clear();
+            return ClashState {
+                phase: ClashPhase::NotRegistered,
+                ..ClashState::default()
+            };
+        };
+        // Другой турнир — ранги и разведку загрузим заново.
+        if cache.tournament_id != summary.tournament_id {
+            *cache = ClashCache {
+                tournament_id: summary.tournament_id,
+                ..ClashCache::default()
+            };
+        }
+        if cache.my_puuid.is_none() {
+            cache.my_puuid = self.lcu.current_summoner().await.ok().map(|s| s.puuid);
+        }
+        if cache.champions.is_empty()
+            && let Ok(names) = self.lcu.champion_names().await
+        {
+            cache.champions = names;
+        }
+
+        let mut state = ClashState {
+            phase: ClashPhase::from_lcu(&summary.state),
+            ..ClashState::default()
+        };
+        let my_roster: i64 = summary.roster_id.parse().unwrap_or(0);
+        if my_roster > 0 {
+            match self.clash_team(my_roster, cache).await {
+                Ok(team) => state.team = team,
+                Err(e) => state.problem = Some(e),
+            }
+        }
+        if summary.bracket_id > 0 {
+            match self.lcu.clash_bracket(summary.bracket_id).await {
+                Ok(Some(bracket)) => {
+                    let next = clash::next_match(&bracket, my_roster);
+                    state.bracket_size = bracket.size;
+                    state.round = next.round;
+                    state.round_start = next.start;
+                    state.wins = next.wins;
+                    state.losses = next.losses;
+                    state.opponent_pending = next.round.is_some() && next.opponent.is_none();
+                    if let Some(opponent) = next.opponent {
+                        match self.clash_team(opponent, cache).await {
+                            Ok(team) => state.opponent = team,
+                            Err(e) => state.problem = Some(e),
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => state.problem = Some(e),
+            }
+        }
+        state
+    }
+
+    /// Команда с Riot ID, рангами и разведкой игроков (из кэша, если уже загружали).
+    async fn clash_team(&self, roster_id: i64, cache: &mut ClashCache) -> AppResult<Option<ClashTeam>> {
+        let Some(roster) = self.lcu.clash_roster(roster_id).await? else {
+            return Ok(None);
+        };
+        let mut players = Vec::new();
+        for member in &roster.members {
+            let mut player = match cache.players.get(&member.summoner_id) {
+                Some(known) => known.clone(),
+                None => match self.clash_player(member.summoner_id).await {
+                    Ok(player) => {
+                        cache.players.insert(member.summoner_id, player.clone());
+                        player
+                    }
+                    // Временная ошибка — покажем без имени, попробуем на следующем опросе.
+                    Err(e) => {
+                        debug!(error = %e, "игрок Clash не загрузился");
+                        ClashPlayer {
+                            summoner_id: member.summoner_id,
+                            ..ClashPlayer::default()
+                        }
+                    }
+                },
+            };
+            // Позиции и капитан могут меняться до начала раунда — берём свежие.
+            player.position = clash::position(&member.position);
+            player.is_captain = member.summoner_id == roster.captain_summoner_id;
+            player.is_self = !player.puuid.is_empty() && cache.my_puuid.as_deref() == Some(player.puuid.as_str());
+            players.push(player);
+        }
+        // Разведка — одним запросом для тех, у кого её ещё нет.
+        let missing: Vec<String> = players
+            .iter()
+            .filter(|p| !p.puuid.is_empty() && !cache.scouted.contains(&p.summoner_id))
+            .map(|p| p.puuid.clone())
+            .collect();
+        if !missing.is_empty() {
+            match self.lcu.clash_scouting(&missing).await {
+                Ok(list) => {
+                    for scouting in list {
+                        let champions = clash::scout_champions(&scouting, &cache.champions);
+                        cache.scouted.insert(scouting.player_id);
+                        if let Some(known) = cache.players.get_mut(&scouting.player_id) {
+                            known.champions = champions;
+                        }
+                    }
+                }
+                Err(e) => debug!(error = %e, "разведка Clash не загрузилась"),
+            }
+        }
+        for player in &mut players {
+            if let Some(known) = cache.players.get(&player.summoner_id) {
+                player.champions = known.champions.clone();
+            }
+        }
+        players.sort_by_key(|p| clash::position_order(p.position));
+        Ok(Some(ClashTeam {
+            roster_id,
+            name: roster.name,
+            short_name: roster.short_name,
+            players,
+        }))
+    }
+
+    async fn clash_player(&self, summoner_id: u64) -> AppResult<ClashPlayer> {
+        let summoner = self.lcu.summoner_by_id(summoner_id).await?;
+        let ranked = self.lcu.ranked_by_puuid(&summoner.puuid).await?;
+        Ok(ClashPlayer {
+            summoner_id,
+            riot_id: lobby::riot_id(&summoner.game_name, &summoner.tag_line),
+            profile: Some(PlayerProfile {
+                profile_icon_id: summoner.profile_icon_id,
+                summoner_level: summoner.summoner_level,
+                ranked,
+            }),
+            puuid: summoner.puuid,
+            ..ClashPlayer::default()
+        })
     }
 
     /// Раз в несколько секунд проверяет клиент League и сообщает окну об изменениях.
@@ -1917,8 +2149,22 @@ struct LobbyCache {
     game_running: bool,
     /// Игра, которая сейчас идёт (узнаём один раз за игру).
     live: Option<LiveGame>,
+    /// Команда противника в идущей игре.
+    enemies: Vec<EnemyPlayer>,
     /// Игра только что закончилась — пора обновить аккаунт (забирает `watch_lobby`).
     game_ended: bool,
+}
+
+/// Что `watch_clash` помнит между опросами (сбрасывается при смене турнира).
+#[derive(Default)]
+struct ClashCache {
+    tournament_id: i64,
+    my_puuid: Option<String>,
+    champions: HashMap<i32, String>,
+    /// summonerId → игрок с Riot ID, рангами и разведкой.
+    players: HashMap<u64, ClashPlayer>,
+    /// У кого разведка уже загружена (даже если пустая).
+    scouted: HashSet<u64>,
 }
 
 /// Где искать клиент League с учётом папки из настроек, и где игра нашлась.

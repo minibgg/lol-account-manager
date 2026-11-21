@@ -23,6 +23,7 @@ use zeroize::Zeroize;
 use crate::error::AppError;
 use crate::images::{ImageBytes, ImageKey};
 use crate::lcu::LcuStatus;
+use crate::clash::ClashState;
 use crate::lobby::{LiveGame, LobbyState};
 use crate::riot::{DataSource, Inventory, MatchDetails, MatchSummary, RankedQueues, RiotId};
 use crate::storage::{Account, AccountId, AccountInput, Credentials, SecretChange};
@@ -198,6 +199,8 @@ pub enum Event {
     Lobby(LobbyState),
     /// Кто из аккаунтов (кроме того, что в клиенте) сейчас в игре — по данным Riot API.
     LiveGames(Vec<(AccountId, LiveGame)>),
+    /// Изменилось что-то в турнире Clash: этап, команда, соперник, ранги.
+    Clash(ClashState),
 
     /// Аккаунт добавлен. `fetch_error` — почему не удалось сразу загрузить данные из Riot
     /// (нет ключа, нет сети...): аккаунт сохранён, обновить его можно позже.

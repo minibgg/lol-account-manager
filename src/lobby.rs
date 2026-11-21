@@ -12,8 +12,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::error::AppError;
-use crate::lcu::models::{ChatParticipant, LcuChampSelectSession, LcuGameflowSession};
-use crate::riot::{RankedQueues, Region, RiotId};
+use crate::lcu::models::{ChatParticipant, LcuChampSelectSession, LcuGameData, LcuGameflowSession};
+use crate::riot::{MatchSummary, RankedQueues, Region, RiotId};
 
 /// Этап, на котором сейчас игрок.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -205,7 +205,149 @@ pub struct LobbyState {
     pub problem: Option<AppError>,
     /// Игра, которая сейчас идёт у аккаунта из клиента.
     pub game: Option<LiveGame>,
+    /// Команда противника — с загрузки игры и до её конца.
+    pub enemies: Vec<EnemyPlayer>,
 }
+
+// ----- Противники (с экрана загрузки) -------------------------------------------
+// Источник — `/lol-gameflow/v1/session`: там PUUID и чемпионы всех десяти игроков.
+// Проверено на живой ранговой (RU, 2026-11-21): в `teamOne`/`teamTwo` клиент пропускает
+// по одному игроку (видимо, со скрытым профилем), а в `playerChampionSelections` есть все
+// десять — первые пять из `teamOne`, следующие пять из `teamTwo`.
+
+/// Игрок команды противника.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct EnemyPlayer {
+    pub puuid: String,
+    pub riot_id: Option<RiotId>,
+    pub champion_id: i32,
+    pub champion: Option<String>,
+    pub position: Option<Position>,
+    /// `None` — ещё не загружен или не удалось.
+    pub profile: Option<PlayerProfile>,
+    /// Последние игры; `None` — ещё не загружены.
+    pub form: Option<RecentForm>,
+}
+
+/// Форма игрока по последним играм (без ремейков).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RecentForm {
+    pub games: u32,
+    pub wins: u32,
+    pub kills: u32,
+    pub deaths: u32,
+    pub assists: u32,
+    /// Игры и победы на чемпионе, которого он взял сейчас.
+    pub champion_games: u32,
+    pub champion_wins: u32,
+    /// Серия: +3 — три победы подряд, -2 — два поражения (с последней игры).
+    pub streak: i32,
+}
+
+impl RecentForm {
+    /// `matches` — новые первыми (так их отдаёт клиент).
+    pub fn from_matches(matches: &[MatchSummary], champion_id: i32) -> Self {
+        let mut form = Self::default();
+        let mut streak_open = true;
+        for game in matches.iter().filter(|m| !m.remake) {
+            form.games += 1;
+            form.wins += u32::from(game.win);
+            form.kills += game.me.kills;
+            form.deaths += game.me.deaths;
+            form.assists += game.me.assists;
+            if champion_id > 0 && game.me.champion_id == champion_id {
+                form.champion_games += 1;
+                form.champion_wins += u32::from(game.win);
+            }
+            // Серия идёт, пока результат совпадает с самой последней игрой.
+            if streak_open {
+                let step = if game.win { 1 } else { -1 };
+                if form.streak == 0 || form.streak.signum() == step {
+                    form.streak += step;
+                } else {
+                    streak_open = false;
+                }
+            }
+        }
+        form
+    }
+
+    /// Процент побед; `None` — игр нет.
+    pub fn winrate(&self) -> Option<u32> {
+        (self.games > 0).then(|| self.wins * 100 / self.games)
+    }
+
+    /// KDA: (убийства + помощь) / смерти.
+    pub fn kda(&self) -> f32 {
+        (self.kills + self.assists) as f32 / self.deaths.max(1) as f32
+    }
+}
+
+/// Команда противника из сессии игры. `my_puuid` — аккаунт из клиента.
+pub fn enemy_team(data: &LcuGameData, my_puuid: &str, champions: &HashMap<i32, String>) -> Vec<EnemyPlayer> {
+    let in_one = data.team_one.iter().any(|m| m.puuid == my_puuid);
+    let in_two = data.team_two.iter().any(|m| m.puuid == my_puuid);
+    let selections = &data.player_champion_selections;
+    // Сторона по порядку выбора: первые пять — teamOne (нужно, когда игрока нет в списках команд).
+    let first_half = |puuid: &str| {
+        (selections.len() == 10)
+            .then(|| selections.iter().position(|s| s.puuid == puuid).map(|i| i < 5))
+            .flatten()
+    };
+    let i_am_first = if in_one || in_two { in_one } else {
+        match first_half(my_puuid) {
+            Some(first) => first,
+            None => return Vec::new(), // не понять, где мы
+        }
+    };
+    let (enemy_members, ally_members) = if i_am_first {
+        (&data.team_two, &data.team_one)
+    } else {
+        (&data.team_one, &data.team_two)
+    };
+    let champion = |id: i32| (id > 0).then(|| champions.get(&id).cloned().unwrap_or_else(|| format!("чемпион #{id}")));
+
+    let mut enemies: Vec<EnemyPlayer> = enemy_members
+        .iter()
+        .filter(|m| !m.puuid.is_empty())
+        .map(|m| {
+            let champion_id = selections.iter().find(|s| s.puuid == m.puuid).map_or(0, |s| s.champion_id);
+            EnemyPlayer {
+                puuid: m.puuid.clone(),
+                champion_id,
+                champion: champion(champion_id),
+                position: Position::from_lcu(&m.selected_position.to_lowercase()),
+                ..EnemyPlayer::default()
+            }
+        })
+        .collect();
+    // Те, кого нет в списках команд, — по порядку выбора.
+    let listed = |puuid: &str| enemy_members.iter().chain(ally_members).any(|m| m.puuid == puuid);
+    for selection in selections.iter().filter(|s| !s.puuid.is_empty() && !listed(&s.puuid)) {
+        if first_half(&selection.puuid) == Some(!i_am_first) {
+            enemies.push(EnemyPlayer {
+                puuid: selection.puuid.clone(),
+                champion_id: selection.champion_id,
+                champion: champion(selection.champion_id),
+                ..EnemyPlayer::default()
+            });
+        }
+    }
+    // Одному игроку без позиции достаётся единственная оставшаяся.
+    const ALL: [Position; 5] = [Position::Top, Position::Jungle, Position::Middle, Position::Bottom, Position::Utility];
+    let free: Vec<Position> = ALL
+        .into_iter()
+        .filter(|p| !enemies.iter().any(|e| e.position == Some(*p)))
+        .collect();
+    let mut unknown = enemies.iter_mut().filter(|e| e.position.is_none());
+    // В ARAM позиций нет вовсе — там свободны все пять, и это условие не сработает.
+    if let (Some(player), None, [only]) = (unknown.next(), unknown.next(), free.as_slice()) {
+        player.position = Some(*only);
+    }
+    enemies.sort_by_key(|e| crate::clash::position_order(e.position));
+    enemies
+}
+
 
 /// Riot ID из имени и тега, если оба есть.
 pub fn riot_id(game_name: &str, tag: &str) -> Option<RiotId> {
@@ -433,6 +575,126 @@ mod tests {
         assert!(players[0].is_self);
         assert_eq!(players[1].riot_id, None);
         assert_eq!(players[1].position, Some(Position::Utility));
+    }
+
+    fn game_member(puuid: &str, position: &str) -> crate::lcu::models::LcuGameMember {
+        crate::lcu::models::LcuGameMember {
+            puuid: puuid.into(),
+            selected_position: position.into(),
+        }
+    }
+
+    fn selection(puuid: &str, champion: i32) -> crate::lcu::models::LcuChampionSelection {
+        crate::lcu::models::LcuChampionSelection {
+            champion_id: champion,
+            puuid: puuid.into(),
+        }
+    }
+
+    #[test]
+    fn enemy_team_like_live_ranked_game() {
+        // Как в живой ранговой: в каждой команде клиент пропустил по игроку,
+        // а в выборе чемпионов есть все десять (первые пять — teamOne).
+        let data = LcuGameData {
+            game_id: 1,
+            team_one: vec![
+                game_member("me", "BOTTOM"),
+                game_member("a1", "TOP"),
+                game_member("a2", "JUNGLE"),
+                game_member("a3", "MIDDLE"),
+            ],
+            team_two: vec![
+                game_member("e1", "UTILITY"),
+                game_member("e2", "MIDDLE"),
+                game_member("e3", "TOP"),
+                game_member("e4", "JUNGLE"),
+            ],
+            player_champion_selections: vec![
+                selection("a3", 91),
+                selection("me", 42),
+                selection("a4", 89),
+                selection("a2", 131),
+                selection("a1", 82),
+                selection("e3", 122),
+                selection("e2", 55),
+                selection("e5", 222),
+                selection("e4", 141),
+                selection("e1", 235),
+            ],
+            ..LcuGameData::default()
+        };
+        let champions = HashMap::from([(222, "Джинкс".to_string())]);
+        let enemies = enemy_team(&data, "me", &champions);
+        let list: Vec<_> = enemies.iter().map(|e| (e.puuid.as_str(), e.position)).collect();
+        assert_eq!(
+            list,
+            [
+                ("e3", Some(Position::Top)),
+                ("e4", Some(Position::Jungle)),
+                ("e2", Some(Position::Middle)),
+                ("e5", Some(Position::Bottom)), // пропущенный — по оставшейся позиции
+                ("e1", Some(Position::Utility)),
+            ]
+        );
+        assert_eq!(enemies[3].champion.as_deref(), Some("Джинкс"));
+        assert!(enemies.iter().all(|e| !e.puuid.starts_with('a')), "союзники не попадают");
+
+        // С другой стороны — противники наоборот, вместе с пропущенным a4.
+        let other = enemy_team(&data, "e1", &champions);
+        assert_eq!(other.len(), 5);
+        assert!(other.iter().any(|e| e.puuid == "a4" && e.position == Some(Position::Utility)));
+    }
+
+    #[test]
+    fn aram_without_positions() {
+        let data = LcuGameData {
+            team_one: vec![game_member("me", "NONE")],
+            team_two: vec![game_member("e1", "NONE"), game_member("e2", "NONE")],
+            ..LcuGameData::default()
+        };
+        let enemies = enemy_team(&data, "me", &HashMap::new());
+        assert_eq!(enemies.len(), 2);
+        assert!(enemies.iter().all(|e| e.position.is_none()));
+    }
+
+    fn played(champion: i32, win: bool, remake: bool) -> MatchSummary {
+        MatchSummary {
+            id: String::new(),
+            win,
+            remake,
+            queue_id: 420,
+            played_at: 0,
+            duration_secs: 0,
+            stats_version: 0,
+            me: crate::riot::PlayerStats {
+                champion_id: champion,
+                kills: 5,
+                deaths: 2,
+                assists: 5,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn recent_form_counts_champion_and_streak() {
+        let games = [
+            played(222, true, false),
+            played(222, true, false),
+            played(1, false, true), // ремейк не считаем — и серию он не рвёт
+            played(1, true, false),
+            played(222, false, false),
+        ];
+        let form = RecentForm::from_matches(&games, 222);
+        assert_eq!((form.games, form.wins), (4, 3));
+        assert_eq!((form.champion_games, form.champion_wins), (3, 2));
+        assert_eq!(form.streak, 3);
+        assert_eq!(form.winrate(), Some(75));
+        assert!((form.kda() - 5.0).abs() < 0.01);
+
+        let losing = [played(1, false, false), played(1, false, false), played(1, true, false)];
+        assert_eq!(RecentForm::from_matches(&losing, 0).streak, -2);
+        assert_eq!(RecentForm::from_matches(&[], 0).winrate(), None);
     }
 
     #[test]

@@ -423,6 +423,118 @@ impl LcuRankedStats {
     }
 }
 
+// ----- Clash ------------------------------------------------------------------
+// Проверено на живом клиенте (RU, 2026-11-21) во время фазы «Разведка».
+
+/// `/lol-clash/v1/tournament-summary` — турниры, в которых вы зарегистрированы.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LcuClashSummary {
+    /// "UPCOMING", "LOCK_IN", "SCOUTING", "IN_GAME", "RESULTS", "IDLE".
+    pub state: String,
+    pub tournament_id: i64,
+    /// Здесь строкой, в сетке — числом.
+    pub roster_id: String,
+    /// 0 — сетки ещё нет.
+    pub bracket_id: i64,
+}
+
+/// `/lol-clash/v1/bracket/{bracketId}` — сетка турнира: все матчи и команды.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LcuClashBracket {
+    pub id: i64,
+    pub size: i32,
+    pub matches: Vec<LcuBracketMatch>,
+    pub rosters: Vec<LcuBracketRoster>,
+    pub is_complete: bool,
+}
+
+/// Матч сетки. У будущих матчей вместо команд — отрицательные id матчей, из которых
+/// придут победитель или проигравший (`-1048662`), или 0.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LcuBracketMatch {
+    pub id: i64,
+    pub round: i32,
+    pub roster_id1: i64,
+    pub roster_id2: i64,
+    /// "UPCOMING", "COMPLETED", …
+    pub status: String,
+    /// 0 — ещё не сыгран.
+    pub winner_id: i64,
+    pub loser_bracket: bool,
+    /// Когда начнётся раунд (мс unix); -1 — неизвестно.
+    pub round_start_time: i64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LcuBracketRoster {
+    pub roster_id: i64,
+    pub name: String,
+    pub short_name: String,
+}
+
+/// `/lol-clash/v1/roster/{rosterId}` — команда (своя или любая из вашей сетки).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LcuClashRoster {
+    pub id: String,
+    pub name: String,
+    pub short_name: String,
+    pub captain_summoner_id: u64,
+    pub members: Vec<LcuClashRosterMember>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LcuClashRosterMember {
+    pub summoner_id: u64,
+    /// "TOP", "JUNGLE", "MIDDLE", "BOTTOM", "UTILITY", "FILL", "UNSELECTED".
+    /// У соперников клиент показывает "FILL", пока те не выбрали позиции.
+    pub position: String,
+}
+
+/// `/lol-summoner/v1/summoners/{summonerId}` — участники Clash-команд даны по summonerId.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LcuSummonerById {
+    pub summoner_id: u64,
+    pub puuid: String,
+    pub game_name: String,
+    pub tag_line: String,
+    pub profile_icon_id: i32,
+    pub summoner_level: i64,
+}
+
+/// `/lol-clash/v1/scouting/champions?puuids=[…]` — то же, что вкладка «Разведка» в клиенте.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LcuScoutingChampions {
+    /// summonerId.
+    pub player_id: u64,
+    pub top_masteries: Vec<LcuScoutingMastery>,
+    pub top_season_champions: Vec<LcuScoutingSeasonChampion>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LcuScoutingMastery {
+    pub champion_id: i32,
+    pub champion_points: i64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LcuScoutingSeasonChampion {
+    pub champion_id: i32,
+    pub game_count: u32,
+    pub win_count: u32,
+    /// Например "3.4".
+    pub kda: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -13,7 +13,8 @@ use tracing::{debug, warn};
 
 use super::lockfile::Lockfile;
 use super::models::{
-    ChatParticipant, ChatParticipants, LcuChampSelectSession, LcuChampionSummary, LcuLobby,
+    ChatParticipant, ChatParticipants, LcuChampSelectSession, LcuChampionSummary, LcuClashBracket,
+    LcuClashRoster, LcuClashSummary, LcuLobby, LcuScoutingChampions, LcuSummonerById,
     LcuGame, LcuGameflowSession, LcuInventoryItem, LcuMatchHistory, LcuOwnedChampion, LcuRankedStats, LcuRegionLocale, LcuSummoner,
 };
 use super::riot_client::RiotClientAuth;
@@ -379,6 +380,41 @@ impl LcuClient {
             s if s.is_server_error() => Err(AppError::ChatUnavailable),
             s => Err(AppError::UnexpectedStatus(s.as_u16())),
         }
+    }
+
+    // ----- Clash (только чтение) ------------------------------------------------
+
+    /// Турниры Clash, в которых зарегистрирован аккаунт из клиента (пусто — ни в одном).
+    pub async fn clash_summary(&self) -> AppResult<Vec<LcuClashSummary>> {
+        Ok(self.get_json("/lol-clash/v1/tournament-summary").await?.unwrap_or_default())
+    }
+
+    /// Сетка турнира (`None` — её ещё нет).
+    pub async fn clash_bracket(&self, bracket_id: i64) -> AppResult<Option<LcuClashBracket>> {
+        self.get_json(&format!("/lol-clash/v1/bracket/{bracket_id}")).await
+    }
+
+    /// Состав команды. Клиент отдаёт свою команду и любую команду из вашей сетки.
+    pub async fn clash_roster(&self, roster_id: i64) -> AppResult<Option<LcuClashRoster>> {
+        self.get_json(&format!("/lol-clash/v1/roster/{roster_id}")).await
+    }
+
+    /// Игрок по summonerId (в Clash участники команд даны именно так).
+    pub async fn summoner_by_id(&self, summoner_id: u64) -> AppResult<LcuSummonerById> {
+        self.get_json(&format!("/lol-summoner/v1/summoners/{summoner_id}"))
+            .await?
+            .ok_or(AppError::AccountNotFound)
+    }
+
+    /// Данные вкладки «Разведка»: мастерство и чемпионы сезона.
+    /// Параметр — JSON-массив PUUID: `puuids=["…","…"]`.
+    pub async fn clash_scouting(&self, puuids: &[String]) -> AppResult<Vec<LcuScoutingChampions>> {
+        if puuids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let list = serde_json::to_string(puuids).unwrap_or_default();
+        let path = format!("/lol-clash/v1/scouting/champions?puuids={}", encode_segment(&list));
+        Ok(self.get_json(&path).await?.unwrap_or_default())
     }
 
     // ----- HTTP ---------------------------------------------------------------

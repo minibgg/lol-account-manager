@@ -17,6 +17,7 @@ use crate::autostart;
 use crate::decay;
 use crate::notify::{self, Message, Notifier};
 use crate::backend::{Backend, is_same_account};
+use crate::clash::ClashState;
 use crate::error::AppError;
 use crate::hello;
 use crate::history::{self, Queue, Session};
@@ -47,7 +48,7 @@ use crate::ui::command::{self, Invocation, Suggestion, Target};
 use crate::ui::games_view::{GamesAction, GamesView};
 use crate::ui::keymap::{self, Action, Screen};
 use crate::ui::terminal::{self, CommandEvent, CommandLine, Hint};
-use crate::ui::{lobby_view, wallpapers_view, window_frame};
+use crate::ui::{clash_view, lobby_view, wallpapers_view, window_frame};
 
 /// Сколько сообщение видно в нижней строке.
 const NOTICE_DURATION: Duration = Duration::from_secs(8);
@@ -211,6 +212,8 @@ pub struct App {
     lcu: LcuStatus,
     /// Группа, выбор чемпионов, игра — для вкладки «Лобби».
     lobby: LobbyState,
+    /// Турнир Clash: команда и соперник. Пока турнир идёт, вкладка «Лобби» показывает его.
+    clash: ClashState,
     /// Каталог образов и поиск — для вкладки «Обои».
     wallpapers: wallpapers_view::State,
     /// Аккаунты, у которых прямо сейчас идёт игра (кроме того, что в клиенте).
@@ -320,6 +323,7 @@ impl App {
             has_api_key: false,
             lcu: LcuStatus::NotRunning,
             lobby: LobbyState::default(),
+            clash: ClashState::default(),
             wallpapers: wallpapers_view::State::default(),
             live: HashMap::new(),
             accounts: Vec::new(),
@@ -582,6 +586,7 @@ impl App {
             Event::LcuStatus(status) => self.lcu = status,
             Event::Lobby(state) if !self.debug_lobby => self.lobby = state,
             Event::Lobby(_) => {}
+            Event::Clash(state) => self.clash = state,
             Event::LiveGames(games) => self.live = games.into_iter().collect(),
 
             Event::SkinsLoaded(result) => {
@@ -1213,6 +1218,7 @@ impl App {
     fn header(&mut self, ui: &mut egui::Ui) {
         let session = self.client_session();
         let lobby_active = self.lobby.phase.is_active();
+        let lobby_active = lobby_active || self.clash.is_shown();
         let (status, status_color, status_hint) = terminal_status(&self.lcu, self.lobby.phase);
         let new_version = self.update.available.as_ref().map(|info| info.version);
         let mut go = None;
@@ -1636,6 +1642,24 @@ impl App {
     fn run(&mut self, invocation: Invocation, ctx: &egui::Context) {
         use Action as A;
         let Invocation { action, account } = invocation;
+        // На «Лобби» во время турнира Clash c и o — про соперника (или свою команду,
+        // пока соперника нет).
+        if self.page == Page::Lobby
+            && self.clash.is_shown()
+            && account.is_none()
+            && matches!(action, A::CopyRiotId | A::OpGg)
+        {
+            let result = if action == A::CopyRiotId {
+                clash_view::copy_names(ctx, &self.clash)
+            } else {
+                clash_view::open_multisearch(ctx, &self.clash, self.client_region())
+            };
+            match result {
+                Ok(text) => self.notify(text),
+                Err(text) => self.notify_error_text(text.to_string()),
+            }
+            return;
+        }
         // На «Лобби» c и o — про игроков лобби: ники и мультипоиск op.gg.
         if self.page == Page::Lobby && account.is_none() && matches!(action, A::CopyRiotId | A::OpGg) {
             let result = if action == A::CopyRiotId {
@@ -2757,11 +2781,35 @@ fn debug_lobby(accounts: &[Account]) -> LobbyState {
         position: Some(Position::Utility),
         ..LobbyPlayer::default()
     });
+    // Противники — те же аккаунты, с выдуманной формой (только для скриншотов).
+    let enemies = players
+        .iter()
+        .enumerate()
+        .map(|(index, p)| crate::lobby::EnemyPlayer {
+            puuid: p.puuid.clone(),
+            riot_id: p.riot_id.clone(),
+            champion: p.champion.clone(),
+            position: p.position,
+            profile: p.profile.clone(),
+            form: (index < 4).then(|| crate::lobby::RecentForm {
+                games: 20,
+                wins: [13, 8, 11, 6][index],
+                kills: 120,
+                deaths: 80,
+                assists: 140,
+                champion_games: [9, 0, 2, 1][index],
+                champion_wins: [7, 0, 1, 0][index],
+                streak: [4, -3, 1, -1][index],
+            }),
+            ..crate::lobby::EnemyPlayer::default()
+        })
+        .collect();
     LobbyState {
         game: None,
-        phase: LobbyPhase::ChampSelect,
+        phase: LobbyPhase::InGame,
         players,
         problem: None,
+        enemies,
     }
 }
 
@@ -2953,7 +3001,13 @@ impl eframe::App for App {
             .show(ui, |ui| match self.page {
                 Page::Accounts => actions.extend(self.accounts_page(ui)),
                 Page::Lobby => {
-                    if lobby_view::show(ui, &self.lobby, self.client_region()) {
+                    // Клиент сообщает об идущем турнире Clash — показываем его вместо лобби.
+                    let opened = if self.clash.is_shown() {
+                        clash_view::show(ui, &self.clash, self.client_region())
+                    } else {
+                        lobby_view::show(ui, &self.lobby, self.client_region())
+                    };
+                    if opened {
                         self.notify("Профиль открыт в браузере");
                     }
                 }
