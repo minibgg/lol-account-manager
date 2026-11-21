@@ -10,6 +10,7 @@
 pub mod app;
 pub mod autostart;
 pub mod backend;
+pub mod clash;
 pub mod clipboard;
 pub mod decay;
 pub mod error;

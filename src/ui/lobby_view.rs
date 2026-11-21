@@ -4,7 +4,7 @@
 
 use eframe::egui::{self, Align, Color32, CursorIcon, Layout, Rect, RichText, Sense, Stroke, pos2, vec2};
 
-use crate::lobby::{self, LobbyPhase, LobbyPlayer, LobbyState};
+use crate::lobby::{self, EnemyPlayer, LobbyPhase, LobbyPlayer, LobbyState, RecentForm};
 use crate::riot::{RankedStats, Region, RiotId};
 use crate::ui::terminal::{self, FONT, ROW_HEIGHT, job};
 use crate::ui::theme::{self, white};
@@ -12,9 +12,15 @@ use crate::ui::theme::{self, white};
 /// Ширины колонок: позиция, игрок, чемпион, solo/duo, flex; дальше — уровень.
 const COLUMNS: [f32; 5] = [96.0, 260.0, 150.0, 190.0, 190.0];
 const HEADERS: [&str; 6] = ["поз", "игрок", "чемпион", "solo/duo", "flex", "ур."];
+/// Противники: позиция, игрок, чемпион, solo/duo, игры на этом чемпионе; дальше — форма.
+const ENEMY_COLUMNS: [f32; 5] = [96.0, 240.0, 150.0, 180.0, 150.0];
+const ENEMY_HEADERS: [&str; 6] = ["поз", "игрок", "чемпион", "solo/duo", "на чемпионе", "последние игры"];
 
-/// Все известные Riot ID игроков лобби.
+/// Riot ID для `c` / `o`: противники, если идёт игра и они известны, иначе игроки лобби.
 pub fn riot_ids(state: &LobbyState) -> Vec<RiotId> {
+    if !state.enemies.is_empty() {
+        return state.enemies.iter().filter_map(|p| p.riot_id.clone()).collect();
+    }
     state.players.iter().filter_map(|p| p.riot_id.clone()).collect()
 }
 
@@ -52,11 +58,177 @@ pub fn show(ui: &mut egui::Ui, state: &LobbyState, region: Option<Region>) -> bo
     }
     ui.add_space(10.0);
 
-    if state.players.is_empty() {
+    if state.players.is_empty() && state.enemies.is_empty() {
         empty_state(ui, state.phase);
         return false;
     }
-    table(ui, state, region, (ui.available_height() - 30.0).max(ROW_HEIGHT * 3.0))
+    let mut opened = false;
+    egui::ScrollArea::vertical()
+        .id_salt("lobby_page")
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            let both = !state.players.is_empty() && !state.enemies.is_empty();
+            if !state.enemies.is_empty() {
+                section_title(ui, "противники", theme::RED_TEXT);
+                opened |= enemy_table(ui, &state.enemies, region);
+                ui.add_space(14.0);
+            }
+            if !state.players.is_empty() {
+                if both {
+                    section_title(ui, "ваша команда", theme::ACCENT_TEXT);
+                }
+                opened |= table(ui, state, region);
+            }
+        });
+    opened
+}
+
+fn section_title(ui: &mut egui::Ui, title: &str, color: Color32) {
+    ui.label(RichText::new(title).font(theme::mono(12.5)).color(color));
+    ui.add_space(4.0);
+}
+
+/// Шапка таблицы: названия колонок и черта под ними.
+fn table_head(ui: &mut egui::Ui, headers: &[&str], columns: &[f32]) {
+    let font = theme::mono(FONT);
+    let (head, _) = ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::hover());
+    let painter = ui.painter();
+    let mut x = head.left();
+    for (index, title) in headers.iter().enumerate() {
+        painter.text(pos2(x, head.center().y), egui::Align2::LEFT_CENTER, *title, font.clone(), theme::TEXT_HINT);
+        x += columns.get(index).copied().unwrap_or(0.0);
+    }
+    painter.hline(head.x_range(), head.bottom() - 0.5, Stroke::new(1.0, theme::BORDER));
+    ui.add_space(4.0);
+}
+
+/// Строка таблицы, по которой можно щёлкнуть (профиль на op.gg). Возвращает
+/// (место строки, наведена ли, щёлкнули ли).
+fn link_row(ui: &mut egui::Ui, region: Option<Region>, riot_id: Option<&RiotId>) -> (Rect, bool, bool) {
+    let link = match (region, riot_id) {
+        (Some(region), Some(id)) => Some(lobby::opgg_profile_url(region, id)),
+        _ => None,
+    };
+    let sense = if link.is_some() { Sense::click() } else { Sense::hover() };
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), sense);
+    let Some(url) = link else {
+        return (rect, false, false);
+    };
+    let response = response
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_text("Открыть профиль на op.gg");
+    let clicked = response.clicked();
+    if clicked {
+        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+    }
+    (rect, response.hovered(), clicked)
+}
+
+/// Таблица противников. Возвращает true, если по щелчку открыли профиль.
+fn enemy_table(ui: &mut egui::Ui, enemies: &[EnemyPlayer], region: Option<Region>) -> bool {
+    table_head(ui, &ENEMY_HEADERS, &ENEMY_COLUMNS);
+    let mut opened = false;
+    ui.push_id("lobby_enemies", |ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        for enemy in enemies {
+            let (rect, hovered, clicked) = link_row(ui, region, enemy.riot_id.as_ref());
+            enemy_row(ui, rect, enemy, hovered);
+            opened |= clicked;
+        }
+    });
+    opened
+}
+
+/// «3 игры · 67%»; ни одной игры на нём среди последних — «0 из 20» (возможно, первая).
+pub(crate) fn champion_form(form: Option<&RecentForm>) -> (String, Color32) {
+    match form {
+        None => ("…".into(), theme::TEXT_HINT),
+        Some(f) if f.games == 0 => ("нет игр".into(), theme::TEXT_HINT),
+        Some(f) if f.champion_games == 0 => (format!("0 из {}", f.games), theme::AMBER_TEXT),
+        Some(f) => {
+            let wr = f.champion_wins * 100 / f.champion_games;
+            let color = if f.champion_games * 4 >= f.games { theme::ACCENT_TEXT } else { theme::TEXT };
+            (format!("{} · {wr}%", games_word(f.champion_games)), color)
+        }
+    }
+}
+
+/// «55% из 20 · kda 3.1 · ▲3».
+pub(crate) fn recent_form(form: Option<&RecentForm>) -> Vec<(String, Color32)> {
+    let Some(f) = form else {
+        return vec![("загружаю…".into(), theme::TEXT_HINT)];
+    };
+    let Some(wr) = f.winrate() else {
+        return vec![("—".into(), theme::TEXT_HINT)];
+    };
+    let wr_color = match wr {
+        60.. => theme::GREEN_TEXT,
+        0..=40 => theme::RED_TEXT,
+        _ => theme::TEXT,
+    };
+    let mut parts = vec![
+        (format!("{wr}%"), wr_color),
+        (format!(" из {} · kda {:.1}", f.games, f.kda()), theme::TEXT_MUTED),
+    ];
+    match f.streak {
+        3.. => parts.push((format!(" · ▲{}", f.streak), theme::GREEN_TEXT)),
+        ..=-3 => parts.push((format!(" · ▼{}", -f.streak), theme::RED_TEXT)),
+        _ => {}
+    }
+    parts
+}
+
+/// «1 игра», «3 игры», «5 игр».
+fn games_word(n: u32) -> String {
+    let word = match (n % 10, n % 100) {
+        (1, 11) => "игр",
+        (1, _) => "игра",
+        (2..=4, 12..=14) => "игр",
+        (2..=4, _) => "игры",
+        _ => "игр",
+    };
+    format!("{n} {word}")
+}
+
+/// Строка противника: «бот  ник#тег  джинкс  алмаз II 64lp · 120W  3 игры · 67%  55% из 20 …».
+fn enemy_row(ui: &egui::Ui, rect: Rect, enemy: &EnemyPlayer, hovered: bool) {
+    let painter = ui.painter_at(rect);
+    if hovered {
+        painter.rect_filled(rect, 0, white(7));
+    }
+    let font = theme::mono(FONT);
+    let ranked = enemy.profile.as_ref().map(|p| &p.ranked);
+    let (solo, solo_color) = rank_cell(ranked.map(|r| r.solo.as_ref()));
+    let position = enemy.position.map(|p| p.label().to_lowercase()).unwrap_or_else(|| "—".into());
+    let champion = enemy.champion.as_deref().map(str::to_lowercase).unwrap_or_else(|| "—".into());
+    let (on_champion, on_champion_color) = champion_form(enemy.form.as_ref());
+    let form = recent_form(enemy.form.as_ref());
+    let form: Vec<(&str, Color32)> = form.iter().map(|(t, c)| (t.as_str(), *c)).collect();
+    let name = match &enemy.riot_id {
+        Some(id) => vec![
+            (id.game_name.clone(), theme::TEXT),
+            (format!("#{}", id.tag_line), theme::TEXT_MUTED),
+        ],
+        None => vec![("загружаю…".into(), theme::TEXT_HINT)],
+    };
+    let name: Vec<(&str, Color32)> = name.iter().map(|(t, c)| (t.as_str(), *c)).collect();
+
+    let cells = [
+        job(&[(&position, theme::TEXT_MUTED)], &font),
+        job(&name, &font),
+        job(&[(&champion, theme::TEXT)], &font),
+        job(&[(&solo, solo_color)], &font),
+        job(&[(&on_champion, on_champion_color)], &font),
+        job(&form, &font),
+    ];
+    let mut x = rect.left();
+    for (index, mut cell) in cells.into_iter().enumerate() {
+        let width = ENEMY_COLUMNS.get(index).copied().unwrap_or(rect.right() - x) - 8.0;
+        cell.wrap = egui::text::TextWrapping::truncate_at_width(width.max(8.0));
+        let galley = painter.layout_job(cell);
+        painter.galley(pos2(x, rect.center().y - galley.size().y / 2.0), galley, theme::TEXT);
+        x += ENEMY_COLUMNS.get(index).copied().unwrap_or(0.0);
+    }
 }
 
 /// «лобби · выбор чемпионов    найдено 4/5» и строка пояснения под ним.
@@ -76,7 +248,13 @@ fn header(ui: &mut egui::Ui, state: &LobbyState, found: usize) {
         ),
         LobbyPhase::InGame => (
             Some("игра идёт"),
-            if state.players.is_empty() { "клиент League в игре" } else { "ваша команда" },
+            if !state.enemies.is_empty() {
+                "противники: ранг, игры на этом чемпионе и форма по последним 20 играм"
+            } else if state.players.is_empty() {
+                "клиент League в игре"
+            } else {
+                "ваша команда"
+            },
         ),
     };
     let font = theme::mono(12.5);
@@ -138,7 +316,7 @@ fn empty_state(ui: &mut egui::Ui, phase: LobbyPhase) {
 }
 
 /// «алмаз II 64lp · 52%» / «алмаз II 64lp · 119 побед» (поражения чужих аккаунтов клиент скрывает).
-fn rank_cell(stats: Option<Option<&RankedStats>>) -> (String, Color32) {
+pub(crate) fn rank_cell(stats: Option<Option<&RankedStats>>) -> (String, Color32) {
     match stats {
         None => ("—".into(), theme::TEXT_HINT),
         Some(None) => ("без ранга".into(), theme::TEXT_HINT),
@@ -153,44 +331,17 @@ fn rank_cell(stats: Option<Option<&RankedStats>>) -> (String, Color32) {
 }
 
 /// Таблица игроков. Возвращает true, если по щелчку открыли профиль.
-fn table(ui: &mut egui::Ui, state: &LobbyState, region: Option<Region>, max_height: f32) -> bool {
-    let font = theme::mono(FONT);
-    let (head, _) = ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::hover());
-    let painter = ui.painter();
-    let mut x = head.left();
-    for (index, title) in HEADERS.iter().enumerate() {
-        painter.text(pos2(x, head.center().y), egui::Align2::LEFT_CENTER, *title, font.clone(), theme::TEXT_HINT);
-        x += COLUMNS.get(index).copied().unwrap_or(0.0);
-    }
-    painter.hline(head.x_range(), head.bottom() - 0.5, Stroke::new(1.0, theme::BORDER));
-    ui.add_space(4.0);
-
+fn table(ui: &mut egui::Ui, state: &LobbyState, region: Option<Region>) -> bool {
+    table_head(ui, &HEADERS, &COLUMNS);
     let mut opened = false;
-    egui::ScrollArea::vertical()
-        .id_salt("lobby_table")
-        .max_height(max_height)
-        .auto_shrink([false, true])
-        .show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 0.0;
-            for player in &state.players {
-                let link = match (region, &player.riot_id) {
-                    (Some(region), Some(id)) => Some(lobby::opgg_profile_url(region, id)),
-                    _ => None,
-                };
-                let sense = if link.is_some() { Sense::click() } else { Sense::hover() };
-                let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), sense);
-                row(ui, rect, player, link.is_some() && response.hovered());
-                if let Some(url) = link {
-                    let response = response
-                        .on_hover_cursor(CursorIcon::PointingHand)
-                        .on_hover_text("Открыть профиль на op.gg");
-                    if response.clicked() {
-                        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
-                        opened = true;
-                    }
-                }
-            }
-        });
+    ui.push_id("lobby_table", |ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        for player in &state.players {
+            let (rect, hovered, clicked) = link_row(ui, region, player.riot_id.as_ref());
+            row(ui, rect, player, hovered);
+            opened |= clicked;
+        }
+    });
     opened
 }
 
@@ -249,5 +400,49 @@ fn row(ui: &egui::Ui, rect: Rect, player: &LobbyPlayer, hovered: bool) {
     if player.is_self {
         ui.painter()
             .vline(rect.left() - 6.0, rect.y_range().shrink(5.0), Stroke::new(2.0, theme::ACCENT));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn games_word_declension() {
+        let words: Vec<String> = [1, 2, 5, 11, 12, 21, 22, 25].into_iter().map(games_word).collect();
+        assert_eq!(words, ["1 игра", "2 игры", "5 игр", "11 игр", "12 игр", "21 игра", "22 игры", "25 игр"]);
+    }
+
+    #[test]
+    fn champion_form_marks_first_time_and_main() {
+        let form = |games, champion_games, champion_wins| RecentForm {
+            games,
+            wins: games / 2,
+            champion_games,
+            champion_wins,
+            ..RecentForm::default()
+        };
+        assert_eq!(champion_form(None).0, "…");
+        assert_eq!(champion_form(Some(&form(20, 0, 0))), ("0 из 20".into(), theme::AMBER_TEXT));
+        assert_eq!(champion_form(Some(&form(20, 12, 9))), ("12 игр · 75%".into(), theme::ACCENT_TEXT));
+        assert_eq!(champion_form(Some(&form(20, 2, 1))).0, "2 игры · 50%");
+    }
+
+    #[test]
+    fn enemies_are_the_target_for_keys() {
+        let id = |name: &str| RiotId::parse(&format!("{name}#RU1")).ok();
+        let mut state = LobbyState {
+            players: vec![LobbyPlayer {
+                riot_id: id("Союзник"),
+                ..LobbyPlayer::default()
+            }],
+            ..LobbyState::default()
+        };
+        assert_eq!(riot_ids(&state)[0].game_name, "Союзник");
+        state.enemies = vec![EnemyPlayer {
+            riot_id: id("Враг"),
+            ..EnemyPlayer::default()
+        }];
+        assert_eq!(riot_ids(&state)[0].game_name, "Враг");
     }
 }
