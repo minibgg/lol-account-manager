@@ -303,6 +303,8 @@ impl App {
         // или форму сразу — чтобы проверять внешний вид по скриншотам без кликов.
         let (page, form) = match std::env::var("LOLAM_DEBUG_PAGE").as_deref() {
             Ok("lobby") if cfg!(debug_assertions) => (Page::Lobby, None),
+            // «wallpapers-selected» — то же, и сразу выбрать третий образ (см. Event::SkinsLoaded).
+            Ok("wallpapers" | "wallpapers-selected") if cfg!(debug_assertions) => (Page::Wallpapers, None),
             Ok("settings" | "update") if cfg!(debug_assertions) => (Page::Settings, None),
             Ok("add") if cfg!(debug_assertions) => (Page::Accounts, Some(AccountForm::add(Region::Ru))),
             // «match» — открыть подробности первой игры первого аккаунта (см. Event::Accounts).
@@ -586,6 +588,11 @@ impl App {
                 self.wallpapers.loading = false;
                 match result {
                     Ok(skins) => {
+                        if cfg!(debug_assertions)
+                            && std::env::var("LOLAM_DEBUG_PAGE").as_deref() == Ok("wallpapers-selected")
+                        {
+                            self.wallpapers.selected = skins.get(2).map(|s| s.id);
+                        }
                         self.wallpapers.skins = skins;
                         self.wallpapers.load_error = None;
                     }
@@ -2958,7 +2965,12 @@ impl eframe::App for App {
                         self.backend.send(Command::LoadSkins);
                     }
                     let connected = self.lcu_connected();
-                    match wallpapers_view::show(ui, &mut self.wallpapers, connected) {
+                    let (action, needed) = wallpapers_view::show(ui, &mut self.wallpapers, &self.images, connected);
+                    // Арты видимых плиток и превью — каждый просим один раз.
+                    for key in self.images.take_missing(needed) {
+                        self.backend.send(Command::LoadImage(key));
+                    }
+                    match action {
                         wallpapers_view::Action::Load => {
                             self.wallpapers.loading = true;
                             self.wallpapers.load_error = None;

@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
 use reqwest::StatusCode;
@@ -46,10 +46,16 @@ const CHAMPION_ICON_SIZE: u32 = 64;
 /// Сколько картинок скачивается одновременно.
 const PARALLEL_DOWNLOADS: usize = 4;
 
+/// Арт образа в сетке вкладки «Обои» — ~200 px (400 px на экране с масштабом 200%).
+/// Оригинал 1280×720 уменьшаем до 400×225 и храним в кэше JPG-файлом (~25 КБ).
+const SKIN_THUMB_WIDTH: u32 = 400;
+
 /// Первые 8 байт любого PNG-файла.
 const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+/// Первые 3 байта любого JPG-файла.
+const JPEG_SIGNATURE: &[u8] = b"\xFF\xD8\xFF";
 
-/// Иконка или эмблема больше 2 МБ — явно что-то не то.
+/// Картинка больше 2 МБ — явно что-то не то (арт образа весит 100–300 КБ).
 const MAX_DOWNLOAD: usize = 2 * 1024 * 1024;
 
 /// Какая картинка нужна.
@@ -62,6 +68,10 @@ pub enum ImageKey {
     Champion(i32),
     /// Иконка предмета по его id (Data Dragon).
     Item(i32),
+    /// Арт образа, уменьшенный — плитка в сетке «Обоев». Число — id образа.
+    SkinThumb(i64),
+    /// Арт образа целиком — превью выбранного образа на «Обоях».
+    SkinSplash(i64),
 }
 
 impl ImageKey {
@@ -72,15 +82,29 @@ impl ImageKey {
             Self::Emblem(tier) => format!("emblem-{}.png", emblem_name(tier)),
             Self::Champion(id) => format!("champion-{id}.png"),
             Self::Item(id) => format!("item-{id}.png"),
+            Self::SkinThumb(id) => format!("skin-thumb-{id}.jpg"),
+            Self::SkinSplash(id) => format!("skin-splash-{id}.jpg"),
         }
     }
 
     /// Адрес картинки для egui: по нему egui кэширует готовую текстуру,
-    /// а расширение `.png` подсказывает загрузчику формат.
+    /// а расширение (`.png` / `.jpg`) подсказывает загрузчику формат.
     pub fn uri(self) -> String {
         format!("bytes://{}", self.file_name())
     }
 
+    /// Арты образов — JPG, всё остальное — PNG.
+    fn is_jpeg(self) -> bool {
+        matches!(self, Self::SkinThumb(_) | Self::SkinSplash(_))
+    }
+
+    /// Похожи ли байты на картинку нужного формата (а не на страницу с ошибкой).
+    fn looks_valid(self, bytes: &[u8]) -> bool {
+        bytes.starts_with(if self.is_jpeg() { JPEG_SIGNATURE } else { PNG_SIGNATURE })
+    }
+
+    /// Адрес иконки или эмблемы. Адреса артов образов здесь не вычислить — они
+    /// приходят из каталога (см. [`ImageCache::set_skin_urls`]).
     fn url(self, ddragon_version: Option<&str>) -> String {
         match self {
             Self::ProfileIcon(id) => {
@@ -89,6 +113,7 @@ impl ImageKey {
             Self::Emblem(tier) => format!("{EMBLEM_BASE_URL}/{}.png", emblem_name(tier)),
             Self::Champion(id) => format!("{CHAMPION_ICON_BASE_URL}/{id}.png"),
             Self::Item(id) => RiotClient::item_icon_url(ddragon_version.unwrap_or_default(), id),
+            Self::SkinThumb(_) | Self::SkinSplash(_) => String::new(),
         }
     }
 }
@@ -133,6 +158,8 @@ pub struct ImageCache {
     ddragon_version: Arc<OnceCell<String>>,
     /// Названия чемпионов — тоже один раз за запуск (см. [`Self::champion_names`]).
     champion_names: Arc<OnceCell<Arc<HashMap<i32, String>>>>,
+    /// Адреса артов образов по id — заполняются, когда загрузился каталог «Обоев».
+    skin_urls: Arc<RwLock<HashMap<i64, String>>>,
     slots: Arc<Semaphore>,
 }
 
@@ -150,8 +177,23 @@ impl ImageCache {
             riot,
             ddragon_version: Arc::default(),
             champion_names: Arc::default(),
+            skin_urls: Arc::default(),
             slots: Arc::new(Semaphore::new(PARALLEL_DOWNLOADS)),
         })
+    }
+
+    /// Запомнить адреса артов образов (id → адрес) из каталога «Обоев».
+    pub fn set_skin_urls(&self, urls: HashMap<i64, String>) {
+        *self.skin_urls.write().unwrap_or_else(PoisonError::into_inner) = urls;
+    }
+
+    fn skin_url(&self, id: i64) -> AppResult<String> {
+        self.skin_urls
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| AppError::Image("у этого образа нет арта".into()))
     }
 
     /// Русские названия чемпионов по id. Свежий список берём из сети (появляются новые
@@ -188,50 +230,56 @@ impl ImageCache {
         }
     }
 
-    /// PNG-байты картинки: из кэша, а если там нет — скачать и сохранить.
+    /// Байты картинки (PNG, у артов образов — JPG): из кэша, а если там нет —
+    /// скачать и сохранить.
     pub async fn load(&self, key: ImageKey) -> AppResult<ImageBytes> {
         let path = self.dir.join(key.file_name());
 
-        // 1. Уже в кэше? Испорченный файл (не PNG) просто скачаем заново.
+        // 1. Уже в кэше? Испорченный файл просто скачаем заново.
         if let Ok(bytes) = tokio::fs::read(&path).await
-            && bytes.starts_with(PNG_SIGNATURE)
+            && key.looks_valid(&bytes)
         {
             return Ok(ImageBytes(bytes.into()));
         }
 
         // 2. Скачать. Пропуск семафора держим до конца функции (`_slot`).
         let _slot = self.slots.acquire().await.ok();
-        let version = match key {
-            ImageKey::ProfileIcon(_) | ImageKey::Item(_) => Some(
-                self.ddragon_version
+        let url = match key {
+            ImageKey::ProfileIcon(_) | ImageKey::Item(_) => {
+                let version = self
+                    .ddragon_version
                     .get_or_try_init(|| self.riot.ddragon_latest_version())
-                    .await?
-                    .as_str(),
-            ),
-            ImageKey::Emblem(_) | ImageKey::Champion(_) => None,
+                    .await?;
+                key.url(Some(version))
+            }
+            ImageKey::Emblem(_) | ImageKey::Champion(_) => key.url(None),
+            ImageKey::SkinThumb(id) | ImageKey::SkinSplash(id) => self.skin_url(id)?,
         };
-        let url = key.url(version);
         debug!(%url, "скачиваем картинку");
         let response = self.http.get(&url).send().await?;
         if response.status() == StatusCode::NOT_FOUND {
             return Err(AppError::Image("её нет на сервере".into()));
         }
         let bytes = response.error_for_status()?.bytes().await?;
-        if bytes.len() > MAX_DOWNLOAD || !bytes.starts_with(PNG_SIGNATURE) {
-            return Err(AppError::Image("сервер прислал не PNG".into()));
+        if bytes.len() > MAX_DOWNLOAD || !key.looks_valid(&bytes) {
+            return Err(AppError::Image("сервер прислал не картинку".into()));
         }
 
-        // 3. Эмблемы уменьшаем. Декодирование и масштабирование — работа для
-        //    процессора на десятки миллисекунд, поэтому в пуле блокирующих задач.
-        let shrink_to = match key {
-            ImageKey::Emblem(_) => Some(EMBLEM_SIZE),
-            ImageKey::Champion(_) => Some(CHAMPION_ICON_SIZE),
-            ImageKey::ProfileIcon(_) | ImageKey::Item(_) => None,
+        // 3. Эмблемы, иконки и арты для сетки уменьшаем. Декодирование и масштабирование —
+        //    работа для процессора на десятки миллисекунд, поэтому в пуле блокирующих задач.
+        let shrink = match key {
+            ImageKey::Emblem(_) => Some(Shrink::Png(EMBLEM_SIZE)),
+            ImageKey::Champion(_) => Some(Shrink::Png(CHAMPION_ICON_SIZE)),
+            ImageKey::SkinThumb(_) => Some(Shrink::Jpeg(SKIN_THUMB_WIDTH)),
+            ImageKey::ProfileIcon(_) | ImageKey::Item(_) | ImageKey::SkinSplash(_) => None,
         };
-        let bytes: Vec<u8> = match shrink_to {
-            Some(size) => tokio::task::spawn_blocking(move || shrink_png(&bytes, size))
-                .await
-                .map_err(|_| AppError::Internal("уменьшение картинки аварийно завершилось".into()))??,
+        let bytes: Vec<u8> = match shrink {
+            Some(shrink) => tokio::task::spawn_blocking(move || match shrink {
+                Shrink::Png(size) => shrink_png(&bytes, size),
+                Shrink::Jpeg(width) => shrink_jpeg(&bytes, width),
+            })
+            .await
+            .map_err(|_| AppError::Internal("уменьшение картинки аварийно завершилось".into()))??,
             None => bytes.to_vec(),
         };
 
@@ -252,6 +300,30 @@ fn parse_champion_names(bytes: &[u8]) -> AppResult<HashMap<i32, String>> {
     }
     let list: Vec<Champion> = serde_json::from_slice(bytes).map_err(|e| AppError::Decode(e.to_string()))?;
     Ok(list.into_iter().filter(|c| c.id > 0).map(|c| (c.id, c.name)).collect())
+}
+
+/// Как уменьшить скачанную картинку.
+#[derive(Clone, Copy)]
+enum Shrink {
+    /// Обрезать прозрачные поля до квадрата и уменьшить до N×N (эмблемы, иконки).
+    Png(u32),
+    /// Уменьшить до ширины N с сохранением пропорций и сохранить JPG (арты образов).
+    Jpeg(u32),
+}
+
+/// Уменьшить JPG до ширины `width` (высота — по пропорциям) и снова сжать в JPG.
+fn shrink_jpeg(bytes: &[u8], width: u32) -> AppResult<Vec<u8>> {
+    let image_error = |e: image::ImageError| AppError::Image(e.to_string());
+    let image = image::load_from_memory_with_format(bytes, image::ImageFormat::Jpeg).map_err(image_error)?;
+    // resize вписывает картинку в рамку width×width, не искажая: 1280×720 → 400×225.
+    let small = image.resize(width, width, image::imageops::FilterType::Triangle);
+    let mut out = Vec::new();
+    // Качество 85 — на глаз как оригинал, а файл в разы меньше.
+    let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85);
+    image::DynamicImage::ImageRgb8(small.to_rgb8())
+        .write_with_encoder(encoder)
+        .map_err(image_error)?;
+    Ok(out)
 }
 
 /// Пиксели прозрачнее этого считаем пустыми полями (слабое свечение вокруг эмблемы).
@@ -363,6 +435,25 @@ mod tests {
 
         let debug = format!("{:?}", ImageBytes(small.into()));
         assert!(debug.starts_with("ImageBytes(") && debug.ends_with(" байт)"), "{debug}");
+    }
+
+    #[test]
+    fn shrinks_skin_art_to_jpeg_thumbnail() {
+        // «Сплэш» 1280×720 → миниатюра 400×225, снова JPG.
+        let splash = image::RgbImage::from_pixel(1280, 720, image::Rgb([120, 60, 200]));
+        let mut jpg = Vec::new();
+        image::DynamicImage::from(splash)
+            .write_to(&mut std::io::Cursor::new(&mut jpg), image::ImageFormat::Jpeg)
+            .unwrap();
+        let key = ImageKey::SkinThumb(103001);
+        assert!(key.looks_valid(&jpg));
+        assert!(!key.looks_valid(PNG_SIGNATURE), "PNG вместо JPG не принимаем");
+        let thumb = shrink_jpeg(&jpg, SKIN_THUMB_WIDTH).unwrap();
+        assert!(thumb.starts_with(JPEG_SIGNATURE));
+        let decoded = image::load_from_memory(&thumb).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (400, 225));
+        assert_eq!(key.uri(), "bytes://skin-thumb-103001.jpg");
+        assert_eq!(ImageKey::SkinSplash(7).file_name(), "skin-splash-7.jpg");
     }
 
     #[test]
