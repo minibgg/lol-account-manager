@@ -27,6 +27,7 @@ use crate::lobby::{LiveGame, LobbyState};
 use crate::riot::{DataSource, Inventory, MatchDetails, MatchSummary, RankedQueues, RiotId};
 use crate::storage::{Account, AccountId, AccountInput, Credentials, SecretChange};
 use crate::update::UpdateInfo;
+use crate::wallpapers::Skin;
 
 /// Папка игры: какую указал пользователь и где игра нашлась на самом деле.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -158,6 +159,11 @@ pub enum Command {
     /// Включить или выключить «спрашивать Windows Hello перед копированием пароля».
     /// И включение, и выключение сами требуют проверки Windows Hello.
     SetHelloLock(bool),
+    /// Загрузить каталог образов (CommunityDragon) — для вкладки «Обои».
+    LoadSkins,
+    /// Поставить образ фоном профиля того аккаунта, в который сейчас выполнен вход
+    /// в клиенте League.
+    SetBackground { skin_id: i64 },
 }
 
 /// Итог импорта.
@@ -283,6 +289,11 @@ pub enum Event {
 
     /// Ответ на `SetHelloLock`: новое состояние настройки или почему оно не изменилось.
     HelloLockSaved(Result<bool, AppError>),
+
+    /// Ответ на `LoadSkins`: весь каталог образов или ошибка загрузки.
+    SkinsLoaded(Result<Vec<Skin>, AppError>),
+    /// Ответ на `SetBackground`: удалось ли сменить фон.
+    BackgroundSet(Result<(), AppError>),
 
     /// Ошибка, не привязанная к конкретному действию (например, хранилище паролей
     /// недоступно при запуске).

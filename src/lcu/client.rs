@@ -419,6 +419,44 @@ impl LcuClient {
             s => Err(AppError::UnexpectedStatus(s.as_u16())),
         }
     }
+
+    /// Поставить образ (skin) фоном профиля. Фон меняется у того аккаунта, в который
+    /// сейчас выполнен вход в клиенте League, — так устроен сам LCU.
+    ///
+    /// Это ЕДИНСТВЕННЫЙ запрос приложения, который что-то меняет в клиенте (POST).
+    /// Всё остальное — только чтение. `skin_id` — id образа из каталога CommunityDragon
+    /// (см. [`crate::wallpapers`]).
+    pub async fn set_background_skin(&self, skin_id: i64) -> AppResult<()> {
+        // lockfile League (не Riot Client) — порт и пароль, как в get_json.
+        let dirs = self.current_dirs();
+        let lock = Lockfile::find(&dirs).await?.ok_or(AppError::LcuNotRunning)?;
+        let url = format!(
+            "https://127.0.0.1:{}/lol-summoner/v1/current-summoner/summoner-profile",
+            lock.port
+        );
+        let body = json!({ "key": "backgroundSkinId", "value": skin_id });
+        let response = self
+            .http
+            .post(&url)
+            // basic_auth сам помечает заголовок секретным (пароль не попадёт в лог).
+            .basic_auth("riot", Some(lock.password()))
+            .header(ACCEPT, "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(lcu_error)?;
+        let status = response.status();
+        debug!(skin_id, status = status.as_u16(), "LCU: смена фона профиля");
+        match status {
+            s if s.is_success() => Ok(()),
+            // Остался lockfile от прошлого запуска (клиент упал) — пароль уже не тот.
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(AppError::LcuNotRunning),
+            // Профиль ещё не готов — обычно вход не выполнен.
+            StatusCode::NOT_FOUND => Err(AppError::LcuNotLoggedIn),
+            s if s.is_server_error() => Err(AppError::LcuNotReady),
+            s => Err(AppError::UnexpectedStatus(s.as_u16())),
+        }
+    }
 }
 
 /// Ответ `/rso-auth/v1/session` Riot Client.

@@ -16,5 +16,6 @@ pub mod profile_view;
 pub mod rank_history;
 pub mod terminal;
 pub mod theme;
+pub mod wallpapers_view;
 pub mod widgets;
 pub mod window_frame;
