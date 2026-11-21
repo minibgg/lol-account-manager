@@ -21,26 +21,29 @@ use crate::ui::account_list::SortOrder;
 pub enum Screen {
     Accounts,
     Lobby,
+    Wallpapers,
     Settings,
 }
 
 impl Screen {
-    pub const ALL: [Self; 3] = [Self::Accounts, Self::Lobby, Self::Settings];
+    pub const ALL: [Self; 4] = [Self::Accounts, Self::Lobby, Self::Wallpapers, Self::Settings];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Accounts => "аккаунты",
             Self::Lobby => "лобби",
+            Self::Wallpapers => "обои",
             Self::Settings => "настройки",
         }
     }
 
-    /// Номер для Ctrl+1…3.
+    /// Номер для Ctrl+1…4.
     pub fn number(self) -> usize {
         match self {
             Self::Accounts => 1,
             Self::Lobby => 2,
-            Self::Settings => 3,
+            Self::Wallpapers => 3,
+            Self::Settings => 4,
         }
     }
 }
@@ -162,7 +165,8 @@ pub fn for_key(key: Key, mods: Modifiers) -> Option<Action> {
         (true, false, Key::A) => A::MarkAll,
         (true, false, Key::Num1) => A::Screen(Screen::Accounts),
         (true, false, Key::Num2) => A::Screen(Screen::Lobby),
-        (true, false, Key::Num3) => A::Screen(Screen::Settings),
+        (true, false, Key::Num3) => A::Screen(Screen::Wallpapers),
+        (true, false, Key::Num4) => A::Screen(Screen::Settings),
         (true, _, _) => return None,
 
         (false, true, Key::R) => A::RefreshAll,
@@ -246,7 +250,9 @@ pub fn works_on(action: &Action, screen: Screen) -> bool {
     match screen {
         Screen::Accounts => true,
         Screen::Lobby => action.is_global() || matches!(action, Action::CopyRiotId | Action::OpGg),
-        Screen::Settings => action.is_global(),
+        // На «Обоях» и в «Настройках» буквы отдаём полям ввода (поиск, API-ключ):
+        // перехватываем только общие сочетания (Ctrl+…, Esc и т.п.).
+        Screen::Wallpapers | Screen::Settings => action.is_global(),
     }
 }
 
@@ -313,7 +319,7 @@ pub const HELP: &[HelpSection] = &[
             (": выход", "закрыть программу совсем (с треем крестик только прячет окно)"),
             ("n  Ctrl+N", "добавить аккаунт"),
             ("Shift+R  F5", "обновить все аккаунты"),
-            ("Ctrl+1 2 3", "аккаунты / лобби / настройки"),
+            ("Ctrl+1 … 4", "аккаунты / лобби / обои / настройки"),
             ("?  F1", "эта справка"),
             ("Esc", "закрыть окно или командную строку"),
         ],
@@ -421,6 +427,6 @@ mod tests {
         assert!(!Action::RefreshAll.needs_account());
         assert!(Action::Screen(Screen::Settings).is_global());
         assert!(!Action::Down.is_global());
-        assert_eq!(Screen::ALL.map(Screen::number), [1, 2, 3]);
+        assert_eq!(Screen::ALL.map(Screen::number), [1, 2, 3, 4]);
     }
 }

@@ -47,7 +47,7 @@ use crate::ui::command::{self, Invocation, Suggestion, Target};
 use crate::ui::games_view::{GamesAction, GamesView};
 use crate::ui::keymap::{self, Action, Screen};
 use crate::ui::terminal::{self, CommandEvent, CommandLine, Hint};
-use crate::ui::{lobby_view, window_frame};
+use crate::ui::{lobby_view, wallpapers_view, window_frame};
 
 /// Сколько сообщение видно в нижней строке.
 const NOTICE_DURATION: Duration = Duration::from_secs(8);
@@ -211,6 +211,8 @@ pub struct App {
     lcu: LcuStatus,
     /// Группа, выбор чемпионов, игра — для вкладки «Лобби».
     lobby: LobbyState,
+    /// Каталог образов и поиск — для вкладки «Обои».
+    wallpapers: wallpapers_view::State,
     /// Аккаунты, у которых прямо сейчас идёт игра (кроме того, что в клиенте).
     live: HashMap<AccountId, LiveGame>,
     accounts: Vec<Account>,
@@ -316,6 +318,7 @@ impl App {
             has_api_key: false,
             lcu: LcuStatus::NotRunning,
             lobby: LobbyState::default(),
+            wallpapers: wallpapers_view::State::default(),
             live: HashMap::new(),
             accounts: Vec::new(),
             refreshing: HashSet::new(),
@@ -578,6 +581,24 @@ impl App {
             Event::Lobby(state) if !self.debug_lobby => self.lobby = state,
             Event::Lobby(_) => {}
             Event::LiveGames(games) => self.live = games.into_iter().collect(),
+
+            Event::SkinsLoaded(result) => {
+                self.wallpapers.loading = false;
+                match result {
+                    Ok(skins) => {
+                        self.wallpapers.skins = skins;
+                        self.wallpapers.load_error = None;
+                    }
+                    Err(error) => self.wallpapers.load_error = Some(error.to_string()),
+                }
+            }
+            Event::BackgroundSet(result) => {
+                self.wallpapers.setting = false;
+                self.wallpapers.status = Some(match result {
+                    Ok(()) => "Готово. Откройте профиль в клиенте заново, чтобы увидеть фон.".into(),
+                    Err(error) => format!("Не удалось: {error}"),
+                });
+            }
 
             Event::AccountAdded {
                 account,
@@ -1319,6 +1340,14 @@ impl App {
                     Hint::new("c", "скопировать ники", A::CopyRiotId),
                     Hint::new("o", "мультипоиск op.gg", A::OpGg),
                     Hint::new("ctrl+1", "аккаунты", A::Screen(Screen::Accounts)),
+                    Hint::new(":", "команда", A::CommandLine),
+                    Hint::new("?", "помощь", A::Help),
+                ];
+            }
+            Page::Wallpapers => {
+                return vec![
+                    Hint::new("ctrl+1", "аккаунты", A::Screen(Screen::Accounts)),
+                    Hint::new("ctrl+2", "лобби", A::Screen(Screen::Lobby)),
                     Hint::new(":", "команда", A::CommandLine),
                     Hint::new("?", "помощь", A::Help),
                 ];
@@ -2919,6 +2948,28 @@ impl eframe::App for App {
                 Page::Lobby => {
                     if lobby_view::show(ui, &self.lobby, self.client_region()) {
                         self.notify("Профиль открыт в браузере");
+                    }
+                }
+                Page::Wallpapers => {
+                    // Каталог грузим один раз — при первом открытии вкладки.
+                    if !self.wallpapers.requested {
+                        self.wallpapers.requested = true;
+                        self.wallpapers.loading = true;
+                        self.backend.send(Command::LoadSkins);
+                    }
+                    let connected = self.lcu_connected();
+                    match wallpapers_view::show(ui, &mut self.wallpapers, connected) {
+                        wallpapers_view::Action::Load => {
+                            self.wallpapers.loading = true;
+                            self.wallpapers.load_error = None;
+                            self.backend.send(Command::LoadSkins);
+                        }
+                        wallpapers_view::Action::Set(id) => {
+                            self.wallpapers.setting = true;
+                            self.wallpapers.status = None;
+                            self.backend.send(Command::SetBackground { skin_id: id });
+                        }
+                        wallpapers_view::Action::None => {}
                     }
                 }
                 Page::Settings => self.settings_page(ui, frame),

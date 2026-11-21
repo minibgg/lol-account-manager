@@ -1014,6 +1014,19 @@ impl Worker {
                     let result = worker.set_hello_lock(enabled).await;
                     worker.events.send(Event::HelloLockSaved(result));
                 }
+                Command::LoadSkins => {
+                    let result = crate::wallpapers::load().await;
+                    if let Err(error) = &result {
+                        warn!(%error, "каталог образов не загрузился");
+                    }
+                    worker.events.send(Event::SkinsLoaded(result));
+                }
+                Command::SetBackground { skin_id } => {
+                    // Faker's Ahri и т.п. — подменяем id перед отправкой (см. wallpapers::remap).
+                    let id = crate::wallpapers::remap(skin_id);
+                    let result = worker.lcu.set_background_skin(id).await;
+                    worker.events.send(Event::BackgroundSet(result));
+                }
             }
         });
     }
