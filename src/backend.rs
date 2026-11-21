@@ -1016,8 +1016,12 @@ impl Worker {
                 }
                 Command::LoadSkins => {
                     let result = crate::wallpapers::load().await;
-                    if let Err(error) = &result {
-                        warn!(%error, "каталог образов не загрузился");
+                    match &result {
+                        // Адреса артов — в кэш картинок: окно будет просить их по id образа.
+                        Ok(skins) => worker.images.set_skin_urls(
+                            skins.iter().filter_map(|s| Some((s.id, s.splash_url.clone()?))).collect(),
+                        ),
+                        Err(error) => warn!(%error, "каталог образов не загрузился"),
                     }
                     worker.events.send(Event::SkinsLoaded(result));
                 }

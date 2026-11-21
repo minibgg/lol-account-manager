@@ -2,11 +2,12 @@
 //!
 //! Данные берём из CommunityDragon — это открытая выгрузка игровых данных Riot,
 //! без ключа и без лимитов. Нужны четыре файла: список чемпионов и список образов,
-//! по-английски и по-русски. Из них собираем плоский список образов, по которому
-//! можно искать (по имени чемпиона, имени образа или числовому id), а затем поставить
-//! выбранный образ фоном профиля (см. [`crate::lcu::LcuClient::set_background_skin`]).
+//! по-английски и по-русски. Из них собираем плоский список образов с артами,
+//! по которому можно искать (по имени чемпиона, имени образа или числовому id),
+//! а затем поставить выбранный образ фоном профиля
+//! (см. [`crate::lcu::LcuClient::set_background_skin`]).
 //!
-//! Приложение сами игровые файлы не трогает: один POST к локальному клиенту —
+//! Сами игровые файлы приложение не трогает: один POST к локальному клиенту —
 //! и всё (как это делает проект league-bg-changer, который взят за основу).
 
 use std::collections::HashMap;
@@ -20,24 +21,31 @@ use crate::error::AppResult;
 /// Откуда берём данные (последняя версия, глобальная выгрузка).
 const BASE: &str = "https://raw.communitydragon.org/latest/plugins/rcp-be-lol-game-data/global";
 
-/// Один образ в списке результатов.
+/// Так в файлах CommunityDragon начинаются пути к картинкам.
+const ASSET_PREFIX: &str = "/lol-game-data/assets/";
+
+/// Один образ в каталоге.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skin {
     /// id образа — его и отправляем клиенту.
     pub id: i64,
-    /// Как показать в списке: «Ари — K/DA ALL OUT Ари».
-    pub name: String,
+    /// Название образа: «Ари Династии». У базового образа — имя чемпиона.
+    pub title: String,
+    /// Чемпион: «Ари».
+    pub champion: String,
+    /// Адрес арта (центрированный сплэш 1280×720, JPG). `None` — арта нет.
+    pub splash_url: Option<String>,
     /// По чему ищем — имена чемпиона и образа (рус. и англ.), уже в нижнем регистре.
     search: Vec<String>,
 }
 
 impl Skin {
     /// Подходит ли образ под запрос: точное совпадение по числовому id либо подстрока
-    /// в любом из имён. Пустой запрос не подходит никому (список прячем).
+    /// в любом из имён. Пустой запрос подходит всем (показываем весь каталог).
     pub fn matches(&self, query: &str) -> bool {
         let q = query.trim().to_lowercase();
         if q.is_empty() {
-            return false;
+            return true;
         }
         if q.parse::<i64>().is_ok_and(|n| n == self.id) {
             return true;
@@ -55,12 +63,19 @@ pub fn remap(skin_id: i64) -> i64 {
     }
 }
 
+/// Путь из файла CommunityDragon → адрес картинки. На сервере все пути в нижнем регистре.
+fn asset_url(path: &str) -> Option<String> {
+    let relative = path.strip_prefix(ASSET_PREFIX)?;
+    Some(format!("{BASE}/default/{}", relative.to_lowercase()))
+}
+
 /// Загрузить весь каталог образов из CommunityDragon.
 pub async fn load() -> AppResult<Vec<Skin>> {
     let http = reqwest::Client::builder()
         .user_agent(concat!("lol-account-manager/", env!("CARGO_PKG_VERSION")))
+        .https_only(true)
         .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(30))
         .build()?;
 
     // Четыре файла: чемпионы и образы, по-английски и по-русски.
@@ -74,13 +89,15 @@ pub async fn load() -> AppResult<Vec<Skin>> {
     Ok(skins)
 }
 
-/// Элемент с полями `id` и `name` (и чемпион, и образ выглядят так). Остальные поля
-/// в файлах нам не нужны — serde их просто пропустит.
+/// Элемент с полями `id` и `name` (так выглядят и чемпион, и образ). У образа есть
+/// ещё путь к арту. Остальные поля в файлах нам не нужны — serde их пропустит.
 #[derive(Debug, Deserialize)]
 struct NamedById {
     id: i64,
     #[serde(default)]
     name: String,
+    #[serde(default, rename = "splashPath")]
+    splash_path: Option<String>,
 }
 
 /// Файл CommunityDragon бывает массивом (чемпионы) или объектом id→элемент (образы).
@@ -107,8 +124,8 @@ async fn fetch(http: &reqwest::Client, path: &str) -> AppResult<Vec<NamedById>> 
     Ok(listing.into_vec())
 }
 
-/// Собрать плоский список образов из четырёх выгрузок. Основа — английский список
-/// образов; русские имена и имена чемпионов добавляем как варианты для поиска.
+/// Собрать список образов из четырёх выгрузок. Основа — английский список образов
+/// (в нём пути к артам); показываем русские названия, ищем по обоим языкам.
 fn build(
     champs_en: Vec<NamedById>,
     skins_en: Vec<NamedById>,
@@ -127,23 +144,31 @@ fn build(
             // id образа = id чемпиона * 1000 + номер образа.
             let champ_id = skin.id / 1000;
             let champ_en = names_en.get(&champ_id);
-            let name = match champ_en {
-                Some(champ) if *champ != skin.name => format!("{champ} — {}", skin.name),
-                _ => skin.name.clone(),
-            };
+            let champ_ru = names_ru.get(&champ_id);
+            let title_ru = skin_ru.get(&skin.id);
             let mut search = vec![skin.name.to_lowercase()];
-            add_name(&mut search, champ_en);
-            add_name(&mut search, names_ru.get(&champ_id));
-            add_name(&mut search, skin_ru.get(&skin.id));
-            Skin { id: skin.id, name, search }
+            for name in [champ_en, champ_ru, title_ru].into_iter().flatten() {
+                let lower = name.to_lowercase();
+                if !search.contains(&lower) {
+                    search.push(lower);
+                }
+            }
+            Skin {
+                id: skin.id,
+                title: title_ru.unwrap_or(&skin.name).clone(),
+                champion: champ_ru.or(champ_en).cloned().unwrap_or_default(),
+                splash_url: skin.splash_path.as_deref().and_then(asset_url),
+                search,
+            }
         })
         .collect();
 
-    // Два особых образа, которых нет в обычной выгрузке (как в оригинале).
-    push_manual(&mut skins, 103087, "Ари — Signature Immortalized Legend (Faker)", &["ари", "ahri", "faker", "фейкер"]);
-    push_manual(&mut skins, 145071, "Кайса — Signature Immortalized Legend", &["кайса", "kaisa", "kai'sa"]);
+    // Два особых образа, которых может не быть в обычной выгрузке (как в оригинале).
+    push_manual(&mut skins, 103087, "Ари", "Signature Immortalized Legend (Faker)", &["ahri", "faker", "фейкер"]);
+    push_manual(&mut skins, 145071, "Кайса", "Signature Immortalized Legend", &["kaisa", "kai'sa"]);
 
-    skins.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    // По чемпиону, внутри — по порядку выхода образов (id растёт).
+    skins.sort_by_cached_key(|s| (s.champion.to_lowercase(), s.id));
     skins
 }
 
@@ -151,23 +176,23 @@ fn by_id(items: Vec<NamedById>) -> HashMap<i64, String> {
     items.into_iter().filter(|i| !i.name.is_empty()).map(|i| (i.id, i.name)).collect()
 }
 
-fn add_name(search: &mut Vec<String>, name: Option<&String>) {
-    if let Some(name) = name {
-        let lower = name.to_lowercase();
-        if !search.contains(&lower) {
-            search.push(lower);
-        }
-    }
-}
-
-/// Добавить образ вручную, если его ещё нет (по id).
-fn push_manual(skins: &mut Vec<Skin>, id: i64, name: &str, aliases: &[&str]) {
+/// Добавить образ вручную, если его ещё нет (по id). Арт берём у образа, на который
+/// он подменяется при установке (см. [`remap`]), если такой есть.
+fn push_manual(skins: &mut Vec<Skin>, id: i64, champion: &str, title: &str, aliases: &[&str]) {
     if skins.iter().any(|s| s.id == id) {
         return;
     }
+    let splash_url = skins.iter().find(|s| s.id == remap(id)).and_then(|s| s.splash_url.clone());
     let mut search: Vec<String> = aliases.iter().map(|a| a.to_lowercase()).collect();
-    search.push(name.to_lowercase());
-    skins.push(Skin { id, name: name.to_string(), search });
+    search.push(champion.to_lowercase());
+    search.push(title.to_lowercase());
+    skins.push(Skin {
+        id,
+        title: title.to_string(),
+        champion: champion.to_string(),
+        splash_url,
+        search,
+    });
 }
 
 #[cfg(test)]
@@ -175,7 +200,7 @@ mod tests {
     use super::*;
 
     fn named(id: i64, name: &str) -> NamedById {
-        NamedById { id, name: name.to_string() }
+        NamedById { id, name: name.to_string(), splash_path: None }
     }
 
     #[test]
@@ -187,34 +212,49 @@ mod tests {
     }
 
     #[test]
+    fn asset_paths_become_lowercase_urls() {
+        let path = "/lol-game-data/assets/ASSETS/Characters/Ahri/Skins/Skin01/Images/ahri_splash_centered_1.jpg";
+        assert_eq!(
+            asset_url(path).unwrap(),
+            "https://raw.communitydragon.org/latest/plugins/rcp-be-lol-game-data/global/default/assets/characters/ahri/skins/skin01/images/ahri_splash_centered_1.jpg"
+        );
+        assert_eq!(asset_url("/something/else.jpg"), None);
+    }
+
+    #[test]
     fn builds_and_searches() {
         let champs_en = vec![named(103, "Ahri")];
         let champs_ru = vec![named(103, "Ари")];
-        let skins_en = vec![named(103000, "Ahri"), named(103001, "K/DA ALL OUT Ahri"), named(-1, "None")];
+        let mut kda_en = named(103001, "K/DA ALL OUT Ahri");
+        kda_en.splash_path = Some("/lol-game-data/assets/ASSETS/X.jpg".into());
+        let skins_en = vec![named(103000, "Ahri"), kda_en, named(-1, "None")];
         let skins_ru = vec![named(103001, "K/DA ALL OUT Ари")];
         let skins = build(champs_en, skins_en, champs_ru, skins_ru);
 
-        // Мусорный id -1 отброшен; остались два образа + два ручных.
-        assert!(skins.iter().any(|s| s.id == 103001));
+        // Мусорный id -1 отброшен; ручной образ Faker добавлен.
         assert!(skins.iter().any(|s| s.id == 103087), "ручной образ Faker добавлен");
         assert!(!skins.iter().any(|s| s.id == -1));
 
         let kda = skins.iter().find(|s| s.id == 103001).unwrap();
+        // Показываем по-русски.
+        assert_eq!(kda.title, "K/DA ALL OUT Ари");
+        assert_eq!(kda.champion, "Ари");
+        assert!(kda.splash_url.as_deref().unwrap().ends_with("/default/assets/x.jpg"));
         // Ищем и по-английски, и по-русски, и по id.
         assert!(kda.matches("ahri"));
         assert!(kda.matches("ари"));
         assert!(kda.matches("k/da"));
         assert!(kda.matches("103001"));
         assert!(!kda.matches("garen"));
-        // Пустой запрос ничего не находит.
-        assert!(!kda.matches("   "));
+        // Пустой запрос — весь каталог.
+        assert!(kda.matches("   "));
     }
 
     #[test]
     fn parses_both_array_and_object() {
         let arr: Listing = serde_json::from_str(r#"[{"id":1,"name":"A"}]"#).unwrap();
-        let obj: Listing = serde_json::from_str(r#"{"1":{"id":1,"name":"A"}}"#).unwrap();
+        let obj: Listing = serde_json::from_str(r#"{"1":{"id":1,"name":"A","splashPath":"/x.jpg"}}"#).unwrap();
         assert_eq!(arr.into_vec().len(), 1);
-        assert_eq!(obj.into_vec().len(), 1);
+        assert_eq!(obj.into_vec()[0].splash_path.as_deref(), Some("/x.jpg"));
     }
 }
