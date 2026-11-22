@@ -15,7 +15,7 @@ use super::lockfile::Lockfile;
 use super::models::{
     ChatParticipant, ChatParticipants, LcuChampSelectSession, LcuChampionSummary, LcuChatRestriction, LcuClashBracket,
     LcuClashRoster, LcuClashSummary, LcuClashTournament, LcuHonorProfile, LcuLeaverNotification, LcuLobby,
-    LcuRankedRestriction, LcuScoutingChampions, LcuSkinMinimal, LcuSummonerById,
+    LcuRankedRestriction, LcuClashRosterStats, LcuRecommendedPage, LcuRecommendedPositions, LcuScoutingChampions, LcuSkinMinimal, LcuSummonerById,
     LcuGame, LcuGameflowSession, LcuInventoryItem, LcuMatchHistory, LcuOwnedChampion, LcuRankedStats, LcuRegionLocale, LcuSummoner,
 };
 use super::riot_client::RiotClientAuth;
@@ -27,6 +27,10 @@ use crate::riot::{
     RestrictionKind, RiotId,
 };
 use crate::riot_login::{self, AuthStep};
+
+/// Сколько последних игр смотреть в истории клиента, чтобы найти игры Clash
+/// (см. [`LcuClient::clash_matches`]).
+pub const LCU_CLASH_DEPTH: usize = 100;
 
 /// Что сейчас происходит с клиентом League.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -236,6 +240,22 @@ impl LcuClient {
         );
         let history: Option<LcuMatchHistory> = self.get_json(&path).await?;
         Ok(history.map(|h| h.to_summaries()).unwrap_or_default())
+    }
+
+    /// Игры Clash из истории клиента: среди последних [`LCU_CLASH_DEPTH`] игр — только
+    /// очереди Clash, новые первыми. Проверено 2026-11-22: у ЧУЖИХ игроков клиент отдаёт
+    /// историю с опозданием и неполную (сегодняшних игр Clash в ней не было), а 100 игр
+    /// грузятся ~10 с — поэтому это запасной путь, когда нет ключа Riot API.
+    pub async fn clash_matches(&self, puuid: &str) -> AppResult<Vec<MatchSummary>> {
+        let path = format!(
+            "/lol-match-history/v1/products/lol/{}/matches?begIndex=0&endIndex={}",
+            encode_segment(puuid),
+            LCU_CLASH_DEPTH - 1 // endIndex включительно
+        );
+        let history: Option<LcuMatchHistory> = self.get_json(&path).await?;
+        let mut games = history.map(|h| h.all_summaries()).unwrap_or_default();
+        games.retain(|g| crate::clash::CLASH_QUEUES.contains(&g.queue_id));
+        Ok(games)
     }
 
     /// Одна игра целиком — все десять игроков (окно «Подробности игры»).
@@ -508,6 +528,31 @@ impl LcuClient {
         self.get_json(&format!("/lol-summoner/v1/summoners/{summoner_id}"))
             .await?
             .ok_or(AppError::AccountNotFound)
+    }
+
+    /// Итоги команды Clash в турнире: кто на ком играл в каждом раунде (`None` — команды нет).
+    pub async fn clash_roster_stats(&self, roster_id: i64) -> AppResult<Option<LcuClashRosterStats>> {
+        self.get_json(&format!("/lol-clash/v1/roster/{roster_id}/stats")).await
+    }
+
+    /// Основные линии каждого чемпиона, как их рекомендует клиент (для рун):
+    /// id чемпиона строкой → позиции по порядку. Проверено на живом клиенте (RU, 2026-11-22).
+    pub async fn champion_positions(&self) -> AppResult<HashMap<String, LcuRecommendedPositions>> {
+        Ok(self
+            .get_json("/lol-perks/v1/recommended-champion-positions")
+            .await?
+            .unwrap_or_default())
+    }
+
+    /// Основная линия чемпиона ("TOP" … "UTILITY"): с позицией NONE клиент отдаёт
+    /// рекомендуемые руны для основной линии, она и записана в странице.
+    /// Проверено на живом клиенте (RU, 2026-11-22): Darius → TOP, Swain → UTILITY.
+    /// `None` — клиент не знает чемпиона.
+    pub async fn champion_main_position(&self, champion_id: i32) -> AppResult<Option<String>> {
+        let path = format!("/lol-perks/v1/recommended-pages/champion/{champion_id}/position/NONE/map/11");
+        let pages: Vec<LcuRecommendedPage> = self.get_json(&path).await?.unwrap_or_default();
+        let main = pages.iter().find(|p| p.is_default_position).or(pages.first());
+        Ok(main.map(|p| p.position.clone()).filter(|p| !p.is_empty()))
     }
 
     /// Данные вкладки «Разведка»: мастерство и чемпионы сезона.

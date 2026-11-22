@@ -17,7 +17,7 @@ use crate::autostart;
 use crate::decay;
 use crate::notify::{self, Message, Notifier};
 use crate::backend::{Backend, is_same_account};
-use crate::clash::ClashState;
+use crate::clash::{ClashHistory, ClashState, HistoryRequest};
 use crate::error::AppError;
 use crate::hello;
 use crate::hotkey::{self, GlobalHotkey};
@@ -50,6 +50,7 @@ use crate::ui::command::{self, Invocation, Suggestion, Target};
 use crate::ui::games_view::{GamesAction, GamesView};
 use crate::ui::keymap::{self, Action, Screen};
 use crate::ui::terminal::{self, CommandEvent, CommandLine, Hint};
+use crate::ui::clash_history_view::{self, HistoryAction};
 use crate::ui::{clash_view, lobby_view, wallpapers_view, window_frame};
 
 /// Сколько сообщение видно в нижней строке.
@@ -256,6 +257,10 @@ pub struct App {
     player_ranks: HashMap<RiotId, RankedQueues>,
     /// Игры, для которых ранги игроков сейчас загружаются.
     ranks_loading: HashSet<String>,
+    /// Окно «прошлые Clash» (щелчок по нику на вкладке Clash): чьё.
+    clash_history: Option<HistoryRequest>,
+    /// Загруженные прошлые Clash (на время работы программы); `None` — ещё загружаются.
+    clash_histories: HashMap<RiotId, Option<Result<ClashHistory, AppError>>>,
     /// Окно «История ранга» (щелчок по рангу на строке аккаунта).
     history_dialog: Option<HistoryDialog>,
     /// Карточка «после игры» в правом нижнем углу.
@@ -361,6 +366,8 @@ impl App {
             match_cache: HashMap::new(),
             player_ranks: HashMap::new(),
             ranks_loading: HashSet::new(),
+            clash_history: None,
+            clash_histories: HashMap::new(),
             history_dialog: None,
             post_game: None,
             debug_page: std::env::var("LOLAM_DEBUG_PAGE")
@@ -630,6 +637,9 @@ impl App {
             Event::Lobby(state) if !self.debug_lobby => self.lobby = state,
             Event::Lobby(_) => {}
             Event::Clash(state) => self.clash = state,
+            Event::ClashHistoryLoaded { riot_id, result } => {
+                self.clash_histories.insert(riot_id, Some(result));
+            }
             Event::LiveGames(games) => self.live = games.into_iter().collect(),
 
             Event::SkinsLoaded(result) => {
@@ -1244,6 +1254,20 @@ impl App {
     }
 
     /// `impl Into<String>` — принимает и `&str`, и `String`.
+    /// Окно «прошлые Clash» игрока: загруженное — сразу, иначе (или после ошибки) — с запросом.
+    fn open_clash_history(&mut self, request: HistoryRequest) {
+        let loaded = matches!(self.clash_histories.get(&request.riot_id), Some(None | Some(Ok(_))));
+        if !loaded {
+            self.load_clash_history(request.clone());
+        }
+        self.clash_history = Some(request);
+    }
+
+    fn load_clash_history(&mut self, request: HistoryRequest) {
+        self.clash_histories.insert(request.riot_id.clone(), None);
+        self.backend.send(Command::LoadClashHistory(request));
+    }
+
     fn notify(&mut self, text: impl Into<String>) {
         self.notice = Some(Notice {
             text: text.into(),
@@ -1673,6 +1697,7 @@ impl App {
     fn hotkeys(&self, ctx: &egui::Context) -> Vec<Invocation> {
         let busy = self.form.is_some()
             || self.match_dialog.is_some()
+            || self.clash_history.is_some()
             || self.history_dialog.is_some()
             || self.confirm_delete.is_some()
             || self.login_code_prompt.is_some()
@@ -2127,6 +2152,16 @@ impl App {
                         match_id: dialog.summary.id.clone(),
                     });
                 }
+            }
+        }
+        if let Some(request) = self.clash_history.clone() {
+            let state = self.clash_histories.get(&request.riot_id).and_then(Option::as_ref);
+            match clash_history_view::show(ctx, &request.riot_id, state, self.client_region()) {
+                HistoryAction::None => {}
+                HistoryAction::Close => self.clash_history = None,
+                // Повторный запрос, только если прошлый уже закончился.
+                HistoryAction::Retry if state.is_some() => self.load_clash_history(request),
+                HistoryAction::Retry => {}
             }
         }
     }
@@ -3103,12 +3138,11 @@ impl eframe::App for App {
                 Page::Accounts => actions.extend(self.accounts_page(ui)),
                 Page::Lobby => {
                     // Клиент сообщает об идущем турнире Clash — показываем его вместо лобби.
-                    let opened = if self.clash.is_shown() {
-                        clash_view::show(ui, &self.clash, self.client_region())
-                    } else {
-                        lobby_view::show(ui, &self.lobby, self.client_region(), &self.clash.schedule)
-                    };
-                    if opened {
+                    if self.clash.is_shown() {
+                        if let Some(request) = clash_view::show(ui, &self.clash) {
+                            self.open_clash_history(request);
+                        }
+                    } else if lobby_view::show(ui, &self.lobby, self.client_region(), &self.clash.schedule) {
                         self.notify("Профиль открыт в браузере");
                     }
                 }
