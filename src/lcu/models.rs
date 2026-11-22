@@ -1,5 +1,7 @@
 //! Ответы LCU (только нужные нам поля; остальные serde пропускает).
 
+use std::collections::HashMap;
+
 use serde::Deserialize;
 
 use crate::lobby;
@@ -437,6 +439,13 @@ impl LcuGame {
 impl LcuMatchHistory {
     /// В общий формат. Новые игры первыми, не больше `FETCH_MATCHES`.
     pub fn to_summaries(&self) -> Vec<MatchSummary> {
+        let mut matches = self.all_summaries();
+        matches.truncate(FETCH_MATCHES);
+        matches
+    }
+
+    /// Все игры ответа, новые первыми.
+    pub fn all_summaries(&self) -> Vec<MatchSummary> {
         let mut matches: Vec<MatchSummary> = self
             .games
             .games
@@ -457,7 +466,6 @@ impl LcuMatchHistory {
             .collect();
         // Клиент и так отдаёт новые первыми, но порядок не обещан — сортируем сами.
         matches.sort_by_key(|m| std::cmp::Reverse(m.played_at));
-        matches.truncate(FETCH_MATCHES);
         matches
     }
 }
@@ -606,6 +614,56 @@ pub struct LcuScoutingChampions {
 pub struct LcuScoutingMastery {
     pub champion_id: i32,
     pub champion_points: i64,
+}
+
+/// Линии чемпиона из `/lol-perks/v1/recommended-champion-positions` (ответ — объект
+/// «id чемпиона строкой → это»). ВНИМАНИЕ (проверено 2026-11-22): порядок алфавитный,
+/// а не по популярности (у Darius «JUNGLE, TOP») — основную линию отсюда не узнать,
+/// она в [`LcuRecommendedPage`].
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LcuRecommendedPositions {
+    /// "TOP", "JUNGLE", "MIDDLE", "BOTTOM", "UTILITY".
+    pub recommended_positions: Vec<String>,
+}
+
+/// Итоги команды Clash в её турнире (`/lol-clash/v1/roster/{rosterId}/stats`; работает и
+/// для команды соперника — проверено 2026-11-22). Команда живёт один день турнира, так что
+/// здесь — только сегодняшние раунды.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LcuClashRosterStats {
+    pub period_stats: Vec<LcuClashPeriodStats>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LcuClashPeriodStats {
+    /// Начало дня турнира, unix-время в миллисекундах.
+    pub time: i64,
+    pub match_stats: Vec<LcuClashMatchStats>,
+}
+
+/// Один раунд. `game_id` 0 — игры не было (соперник не явился).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LcuClashMatchStats {
+    pub round: i32,
+    pub duration_ms: i64,
+    pub win: bool,
+    pub game_id: i64,
+    /// summonerId строкой → id чемпиона; здесь все десять игроков игры.
+    pub player_champion_ids: HashMap<String, i32>,
+}
+
+/// Рекомендуемая страница рун из
+/// `/lol-perks/v1/recommended-pages/champion/{id}/position/NONE/map/11`: с позицией NONE
+/// клиент отдаёт страницы для основной линии чемпиона (`isDefaultPosition: true`).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LcuRecommendedPage {
+    pub position: String,
+    pub is_default_position: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

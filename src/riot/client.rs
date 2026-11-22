@@ -290,6 +290,27 @@ impl RiotClient {
         Ok((matches, details))
     }
 
+    /// match-v5: последние игры в Clash (очередь 700) — до `count` штук, новые первыми.
+    /// Стоит 1 + `count` запросов; для окна «прошлые Clash» по щелчку на ник.
+    pub async fn clash_matches(&self, puuid: &str, region: Region, count: usize) -> AppResult<Vec<MatchSummary>> {
+        let host = region.regional().host();
+        let path = format!(
+            "/lol/match/v5/matches/by-puuid/{}/ids?queue=700&start=0&count={count}",
+            encode_segment(puuid)
+        );
+        let ids: Vec<String> = self.get_json(host, &path).await?.unwrap_or_default();
+        let mut matches = Vec::with_capacity(ids.len());
+        for id in ids {
+            let path = format!("/lol/match/v5/matches/{}", encode_segment(&id));
+            if let Some(game) = self.get_json::<MatchDto>(host, &path).await?
+                && let Some(summary) = game.summary_for(puuid)
+            {
+                matches.push(summary);
+            }
+        }
+        Ok(matches)
+    }
+
     /// match-v5: одна игра целиком (окно «Подробности игры»).
     pub async fn match_by_id(&self, match_id: &str, region: Region) -> AppResult<MatchDto> {
         let path = format!("/lol/match/v5/matches/{}", encode_segment(match_id));

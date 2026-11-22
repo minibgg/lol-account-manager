@@ -23,7 +23,7 @@ use zeroize::Zeroize;
 use crate::error::AppError;
 use crate::images::{ImageBytes, ImageKey};
 use crate::lcu::LcuStatus;
-use crate::clash::ClashState;
+use crate::clash::{ClashHistory, ClashState, HistoryRequest};
 use crate::lobby::{LiveGame, LobbyState};
 use crate::riot::{DataSource, Inventory, MatchDetails, MatchSummary, RankedQueues, RiotId};
 use crate::storage::{Account, AccountId, AccountInput, Credentials, SecretChange};
@@ -154,6 +154,8 @@ pub enum Command {
         match_id: String,
         players: Vec<RiotId>,
     },
+    /// Прошлые игры игрока в Clash — для окна по щелчку на ник на вкладке Clash.
+    LoadClashHistory(HistoryRequest),
     /// Проверить, нет ли новой версии приложения (кнопка в настройках).
     CheckUpdate,
     /// Скачать установщик этой версии, проверить его и запустить.
@@ -281,6 +283,12 @@ pub enum Event {
     RanksLoaded {
         match_id: String,
         result: Result<Vec<(RiotId, RankedQueues)>, AppError>,
+    },
+
+    /// Ответ на `LoadClashHistory`.
+    ClashHistoryLoaded {
+        riot_id: RiotId,
+        result: Result<ClashHistory, AppError>,
     },
 
     /// Проверка обновлений закончилась: `Ok(None)` — установлена последняя версия.

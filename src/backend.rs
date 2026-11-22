@@ -24,7 +24,7 @@ use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
 use crate::captcha;
-use crate::clash::{self, ClashPhase, ClashPlayer, ClashState, ClashTeam};
+use crate::clash::{self, ClashHistory, ClashPhase, ClashPlayer, ClashState, ClashTeam, HistoryRequest};
 use crate::clipboard::{self, SecretClipboard};
 use crate::error::{AppError, AppResult};
 use crate::hello;
@@ -1006,6 +1006,12 @@ impl Worker {
         {
             cache.champions = names;
         }
+        // Линии чемпионов — чтобы угадать роли соперника (у него в Clash все «любая»).
+        if cache.positions.is_empty()
+            && let Ok(raw) = self.lcu.champion_positions().await
+        {
+            cache.positions = clash::champion_positions(raw);
+        }
 
         let mut state = ClashState {
             phase: ClashPhase::from_lcu(&summary.state),
@@ -1082,7 +1088,10 @@ impl Worker {
             match self.lcu.clash_scouting(&missing).await {
                 Ok(list) => {
                     for scouting in list {
-                        let champions = clash::scout_champions(&scouting, &cache.champions);
+                        let mut champions = clash::scout_champions(&scouting, &cache.champions, &cache.positions);
+                        for champion in &mut champions {
+                            champion.main_position = self.main_position(champion.champion_id, cache).await;
+                        }
                         cache.scouted.insert(scouting.player_id);
                         if let Some(known) = cache.players.get_mut(&scouting.player_id) {
                             known.champions = champions;
@@ -1104,6 +1113,88 @@ impl Worker {
             short_name: roster.short_name,
             players,
         }))
+    }
+
+    /// Прошлые игры игрока в Clash из трёх источников сразу (см. [`ClashHistory`]):
+    /// Riot API — старые игры, история клиента League — свежие, итоги команды —
+    /// сегодняшние раунды. Игроки Clash — с сервера клиента, поэтому сервер берём у него.
+    async fn clash_history(&self, request: &HistoryRequest) -> AppResult<ClashHistory> {
+        let region = self.lcu.region().await?;
+        // Три запроса независимы — идут одновременно.
+        let via_api = async {
+            if !self.riot.has_api_key() {
+                return None;
+            }
+            let games = async {
+                // PUUID клиента League и Riot API разные — ищем игрока по Riot ID.
+                let account = self.riot.account_by_riot_id(&request.riot_id, region).await?;
+                self.riot.clash_matches(&account.puuid, region, clash::HISTORY_GAMES).await
+            };
+            Some(games.await)
+        };
+        let via_client = async {
+            if request.puuid.is_empty() {
+                return Ok(Vec::new());
+            }
+            self.lcu.clash_matches(&request.puuid).await
+        };
+        let today = async {
+            match self.lcu.clash_roster_stats(request.roster_id).await {
+                Ok(Some(stats)) => clash::roster_games(&stats, request.summoner_id),
+                Ok(None) => Vec::new(),
+                Err(e) => {
+                    debug!(error = %e, "итоги команды Clash не загрузились");
+                    Vec::new()
+                }
+            }
+        };
+        let (api, client, today) = tokio::join!(via_api, via_client, today);
+
+        let (api_games, api_problem) = match api {
+            Some(Ok(games)) => (Some(games), None),
+            Some(Err(e)) => (None, Some(e)),
+            None => (None, None),
+        };
+        let client_games = match client {
+            Ok(games) => games,
+            // Ни API, ни клиент не ответили — показывать нечего, кроме ошибки.
+            Err(e) if api_games.is_none() && today.is_empty() => return Err(api_problem.unwrap_or(e)),
+            Err(e) => {
+                debug!(error = %e, "история клиента для Clash не загрузилась");
+                Vec::new()
+            }
+        };
+        let from_api = api_games.is_some();
+        // Подробные источники первыми: при совпадении игры остаётся их запись.
+        let mut games = clash::merge_history(
+            vec![api_games.unwrap_or_default(), client_games, today],
+            clash::HISTORY_SHOWN,
+        );
+        self.fill_champion_names(games.iter_mut().map(|m| &mut m.me)).await;
+        Ok(ClashHistory {
+            games,
+            from_api,
+            api_problem,
+        })
+    }
+
+    /// Основная линия чемпиона — из кэша или одним запросом к клиенту.
+    async fn main_position(&self, champion_id: i32, cache: &mut ClashCache) -> Option<lobby::Position> {
+        if let Some(known) = cache.main_positions.get(&champion_id) {
+            return *known;
+        }
+        match self.lcu.champion_main_position(champion_id).await {
+            Ok(main) => {
+                let main = main.as_deref().and_then(clash::position);
+                cache.main_positions.insert(champion_id, main);
+                main
+            }
+            // Ошибку не запоминаем — спросим снова со следующей разведкой.
+            Err(e) => {
+                debug!(error = %e, champion_id, "основная линия чемпиона не загрузилась");
+                None
+            }
+        }
     }
 
     async fn clash_player(&self, summoner_id: u64) -> AppResult<ClashPlayer> {
@@ -1332,6 +1423,16 @@ impl Worker {
                         debug!(%match_id, %error, "ранги игроков не загрузились");
                     }
                     worker.events.send(Event::RanksLoaded { match_id, result });
+                }
+                Command::LoadClashHistory(request) => {
+                    let result = worker.clash_history(&request).await;
+                    if let Err(error) = &result {
+                        debug!(riot_id = %request.riot_id, %error, "прошлые Clash не загрузились");
+                    }
+                    worker.events.send(Event::ClashHistoryLoaded {
+                        riot_id: request.riot_id,
+                        result,
+                    });
                 }
                 Command::CheckUpdate => worker.check_update(true).await,
                 Command::InstallUpdate(info) => worker.install_update(info).await,
@@ -2257,6 +2358,10 @@ struct ClashCache {
     tournament_id: i64,
     my_puuid: Option<String>,
     champions: HashMap<i32, String>,
+    /// id чемпиона → его основные линии.
+    positions: HashMap<i32, Vec<lobby::Position>>,
+    /// id чемпиона → его основная линия (`None` — клиент не знает).
+    main_positions: HashMap<i32, Option<lobby::Position>>,
     /// summonerId → игрок с Riot ID, рангами и разведкой.
     players: HashMap<u64, ClashPlayer>,
     /// У кого разведка уже загружена (даже если пустая).
