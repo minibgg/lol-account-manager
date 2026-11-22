@@ -82,11 +82,38 @@ async fn run() -> Result<(), Box<dyn Error>> {
     }
     // Инвентарь и текущая игра — только для аккаунта, в который выполнен вход.
     match lcu.inventory(0).await {
-        Ok(i) => println!(
-            "Инвентарь: чемпионов {}, образов {}, синей эссенции {}, оранжевой {}, RP {}",
-            i.champions, i.skins, i.blue_essence, i.orange_essence, i.rp
-        ),
+        Ok(i) => {
+            println!(
+                "Инвентарь: чемпионов {}, образов {}, синей эссенции {}, оранжевой {}, RP {}",
+                i.champions, i.skins, i.blue_essence, i.orange_essence, i.rp
+            );
+            let champions: Vec<&str> = i.champion_list.iter().take(3).map(|c| c.name.as_str()).collect();
+            let skins: Vec<&str> = i.skin_list.iter().take(3).map(|s| s.name.as_str()).collect();
+            println!("           например: {} · {}", champions.join(", "), skins.join(", "));
+            let restrictions: Vec<String> = i.restrictions.iter().map(|r| r.label(0)).collect();
+            println!(
+                "           честь {:?}, ограничения: {}",
+                i.honor_level,
+                if restrictions.is_empty() { "нет".to_string() } else { restrictions.join(", ") }
+            );
+        }
         Err(e) => println!("Инвентарь: не загрузился ({e})"),
+    }
+    match lcu.clash_tournaments().await {
+        Ok(list) => {
+            let days = lol_account_manager::clash::schedule(&list, &[], lol_account_manager::storage::unix_now());
+            println!("Clash:     турниров {}, ближайших дней {}", list.len(), days.len());
+            for day in days {
+                println!(
+                    "           {} — «{}», {}, подтверждение с {}",
+                    day.start,
+                    day.name,
+                    day.day_label(),
+                    day.lock_in
+                );
+            }
+        }
+        Err(e) => println!("Clash:     расписание не загрузилось ({e})"),
     }
     let my_puuid = lcu.current_summoner().await?.puuid;
     let champions = lcu.champion_names().await.unwrap_or_default();

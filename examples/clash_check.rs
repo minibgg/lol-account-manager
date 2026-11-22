@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use lol_account_manager::backend::{Backend, BackendConfig};
-use lol_account_manager::clash::{ClashPlayer, ClashTeam};
+use lol_account_manager::clash::{self, ClashPlayer, ClashTeam};
 use lol_account_manager::messages::Event;
 use lol_account_manager::storage::{Secrets, Storage};
 
@@ -68,6 +68,24 @@ fn main() {
     }
     if state.opponent_pending {
         println!("Соперник ещё не определился");
+    }
+    if state.schedule.is_empty() {
+        println!("Расписание турниров: пусто");
+    }
+    for day in &state.schedule {
+        println!(
+            "Турнир {} «{}»: {}, начало {}, подтверждение {}{}",
+            day.tournament_id,
+            day.name,
+            day.day_label(),
+            day.start,
+            day.lock_in,
+            if day.registered { " · вы в команде" } else { "" }
+        );
+    }
+    if let Some(opponent) = &state.opponent {
+        let bans: Vec<String> = clash::ban_suggestions(opponent).iter().map(|b| b.label()).collect();
+        println!("Кого банить: {}", if bans.is_empty() { "—".to_string() } else { bans.join(" · ") });
     }
     for (title, team) in [("Соперник", &state.opponent), ("Ваша команда", &state.team)] {
         if let Some(team) = team {

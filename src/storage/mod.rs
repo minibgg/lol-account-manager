@@ -13,7 +13,7 @@ pub use db::{Account, AccountId, AccountInput, CachedProfile, Db, normalize_tags
 pub use secrets::{Credentials, Secrets};
 
 use crate::error::{AppError, AppResult};
-use crate::riot::{AccountSnapshot, ApiKey, MatchDetails, MatchSummary};
+use crate::riot::{AccountSnapshot, ApiKey, MatchDetails, MatchSummary, RiotId};
 
 pub const APP_DIR: &str = "lol-account-manager";
 pub const DB_FILE: &str = "accounts.db";
@@ -182,6 +182,14 @@ impl Storage {
 
     pub fn matches_without_details(&self, id: AccountId, limit: usize) -> AppResult<Vec<String>> {
         self.db.matches_without_details(id, limit)
+    }
+
+    pub fn meetings(&self, players: &[RiotId]) -> AppResult<Vec<(RiotId, crate::lobby::Meeting)>> {
+        self.db.meetings(players)
+    }
+
+    pub fn settings_with_prefix(&self, prefix: &str) -> AppResult<Vec<(String, String)>> {
+        self.db.settings_with_prefix(prefix)
     }
 
     // ----- Настройки --------------------------------------------------------

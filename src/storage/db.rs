@@ -12,6 +12,7 @@ use tracing::{info, warn};
 
 use crate::error::{AppError, AppResult};
 use crate::history::{self, DAY, HISTORY_DAYS, Queue, RankPoint};
+use crate::lobby::Meeting;
 use crate::riot::{
     AccountSnapshot, DataSource, Division, MatchDetails, MatchSummary, RankedQueues, RankedStats, Region,
     RiotId, Tier,
@@ -383,6 +384,9 @@ impl Db {
         if deleted == 0 {
             return Err(AppError::AccountMissing);
         }
+        // Инвентарь аккаунта хранится в настройках (см. backend::inventory).
+        self.conn
+            .execute("DELETE FROM settings WHERE key = ?1", [format!("inventory_{id}")])?;
         Ok(())
     }
 
@@ -538,6 +542,74 @@ impl Db {
         Ok(ids)
     }
 
+    /// Прошлые игры с игроками `players` из архивов всех аккаунтов — для пометки «уже
+    /// встречались» на вкладке «Лобби». Ищем по Riot ID: в подробностях игр он есть у всех
+    /// десяти игроков, а PUUID — нет. Регистр не важен. Ремейки не берём.
+    pub fn meetings(&self, players: &[RiotId]) -> AppResult<Vec<(RiotId, Meeting)>> {
+        // Грубый отбор по тегу — в SQL (lower() в SQLite понимает только латиницу, поэтому
+        // и здесь to_ascii_lowercase), точное сравнение имени и тега — уже здесь, в Rust.
+        let mut tags: Vec<String> = players.iter().map(|p| p.tag_line.to_ascii_lowercase()).collect();
+        tags.sort();
+        tags.dedup();
+        if tags.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders: Vec<String> = (1..=tags.len()).map(|i| format!("?{i}")).collect();
+        // json_each разворачивает массив JSON в строки: каждая команда, потом каждый игрок.
+        // Своя команда в архиве всегда первая (key = 0).
+        let sql = format!(
+            "SELECT m.match_id, m.played_at, a.game_name, a.tag_line, t.key,
+                    json_extract(t.value, '$.win'),
+                    json_extract(p.value, '$.riot_id.game_name'),
+                    json_extract(p.value, '$.riot_id.tag_line'),
+                    json_extract(p.value, '$.stats.champion')
+             FROM matches m
+             JOIN accounts a ON a.id = m.account_id,
+                  json_each(m.details_json, '$.teams') t,
+                  json_each(t.value, '$.players') p
+             WHERE m.details_json IS NOT NULL
+               AND json_extract(m.details_json, '$.remake') = 0
+               AND json_extract(p.value, '$.is_me') = 0
+               AND lower(json_extract(p.value, '$.riot_id.tag_line')) IN ({})",
+            placeholders.join(", ")
+        );
+        let wanted: Vec<(String, &RiotId)> = players.iter().map(|p| (p.to_string().to_lowercase(), p)).collect();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(tags.iter()), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                format!("{}#{}", r.get::<_, String>(2)?, r.get::<_, String>(3)?),
+                r.get::<_, i64>(4)?,
+                r.get::<_, Option<bool>>(5)?.unwrap_or(false),
+                r.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                r.get::<_, Option<String>>(7)?.unwrap_or_default(),
+                r.get::<_, Option<String>>(8)?.unwrap_or_default(),
+            ))
+        })?;
+        let mut found = Vec::new();
+        for row in rows {
+            let (match_id, played_at, account, team, team_win, name, tag, champion) = row?;
+            let key = format!("{name}#{tag}").to_lowercase();
+            let Some((_, player)) = wanted.iter().find(|(k, _)| *k == key) else {
+                continue;
+            };
+            let same_team = team == 0;
+            found.push((
+                (*player).clone(),
+                Meeting {
+                    match_id,
+                    played_at,
+                    account,
+                    same_team,
+                    won: team_win == same_team,
+                    champion,
+                },
+            ));
+        }
+        Ok(found)
+    }
+
     // ----- Настройки (только несекретные!) ----------------------------------
 
     pub fn setting(&self, key: &str) -> AppResult<Option<String>> {
@@ -559,6 +631,18 @@ impl Db {
     pub fn delete_setting(&mut self, key: &str) -> AppResult<()> {
         self.conn.execute("DELETE FROM settings WHERE key = ?1", [key])?;
         Ok(())
+    }
+
+    /// Все настройки, ключ которых начинается с `prefix` («inventory_» → инвентари всех
+    /// аккаунтов). LIKE не подходит: «_» в нём — любой символ.
+    pub fn settings_with_prefix(&self, prefix: &str) -> AppResult<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT key, value FROM settings WHERE substr(key, 1, length(?1)) = ?1 ORDER BY key")?;
+        let rows = stmt
+            .query_map([prefix], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
     }
 
     // ----- Вспомогательное --------------------------------------------------
@@ -916,6 +1000,79 @@ mod tests {
                 }],
             }],
         }
+    }
+
+    /// «Уже встречались»: игрок ищется по Riot ID в архивах всех аккаунтов, без учёта
+    /// регистра; своя команда — первая; ремейки и сам владелец архива не считаются.
+    #[test]
+    fn meetings_are_found_in_every_archive() {
+        let mut db = Db::open_in_memory().unwrap();
+        let main = db.insert_account(&input("Main#EUW", Region::Euw)).unwrap();
+        let alt = db.insert_account(&input("Alt#EUW", Region::Euw)).unwrap();
+        let line = |name: &str, is_me: bool, champion: &str| crate::riot::PlayerLine {
+            riot_id: RiotId::parse(name).ok(),
+            is_me,
+            stats: crate::riot::PlayerStats {
+                champion: champion.into(),
+                ..Default::default()
+            },
+        };
+        let team = |win: bool, players| crate::riot::TeamDetails {
+            win,
+            towers: 0,
+            dragons: 0,
+            barons: 0,
+            players,
+        };
+        let save = |db: &mut Db, account: AccountId, owner: &str, id: &str, remake: bool, ours_won: bool, pal: &str, foe: &str| {
+            let mut snap = snapshot(&format!("p{account}"), owner);
+            snap.matches = Some(vec![game(id, ours_won)]);
+            db.save_snapshot(account, &snap, 1).unwrap();
+            let details = MatchDetails {
+                remake,
+                teams: vec![
+                    team(ours_won, vec![line(owner, true, "Корки"), line(pal, false, "Ари")]),
+                    team(!ours_won, vec![line(foe, false, "Зед")]),
+                ],
+                ..details(id)
+            };
+            db.save_details(account, &details).unwrap();
+        };
+        save(&mut db, main.id, "Main#EUW", "EUW1_1", false, true, "Pal#EUW", "Foe#EUW");
+        save(&mut db, main.id, "Main#EUW", "EUW1_2", true, true, "Pal#EUW", "Foe#EUW"); // ремейк
+        save(&mut db, alt.id, "Alt#EUW", "EUW1_3", false, false, "Other#EUW", "pal#euw");
+
+        let pal = RiotId::parse("PAL#euw").unwrap();
+        let mut found = db.meetings(&[pal.clone(), RiotId::parse("Nobody#EUW").unwrap()]).unwrap();
+        found.sort_by_key(|(_, m)| m.played_at);
+        let seen: Vec<_> = found
+            .iter()
+            .map(|(who, m)| (who.clone(), m.match_id.as_str(), m.account.as_str(), m.same_team, m.won, m.champion.as_str()))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (pal.clone(), "EUW1_1", "Main#EUW", true, true, "Ари"),
+                // На втором аккаунте он был против нас, и мы проиграли.
+                (pal.clone(), "EUW1_3", "Alt#EUW", false, false, "Зед"),
+            ]
+        );
+        // Владелец архива сам себе не «встреча».
+        assert!(db.meetings(&[RiotId::parse("Main#EUW").unwrap()]).unwrap().is_empty());
+        assert!(db.meetings(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn settings_by_prefix_and_inventory_cleanup() {
+        let mut db = Db::open_in_memory().unwrap();
+        let a = db.insert_account(&input("Name#EUW", Region::Euw)).unwrap();
+        db.set_setting(&format!("inventory_{}", a.id), "{}").unwrap();
+        db.set_setting("inventoryXlike", "не подходит: после inventory нет «_»").unwrap();
+        db.set_setting("sort", "rank").unwrap();
+        let keys: Vec<String> = db.settings_with_prefix("inventory_").unwrap().into_iter().map(|(k, _)| k).collect();
+        assert_eq!(keys, [format!("inventory_{}", a.id)]);
+        db.delete_account(a.id).unwrap();
+        assert!(db.settings_with_prefix("inventory_").unwrap().is_empty(), "инвентарь удаляется вместе с аккаунтом");
     }
 
     /// Позиция, которую узнали во время игры, не стирается, когда клиент потом

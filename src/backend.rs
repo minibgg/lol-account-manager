@@ -35,7 +35,9 @@ use crate::lcu::models::ChatParticipant;
 use crate::lcu::riot_client::{self, RiotClientAuth};
 use crate::lcu::{LcuClient, LcuStatus, RiotSession, lockfile};
 use crate::riot_login::AuthStep;
-use crate::lobby::{self, EnemyPlayer, LiveGame, LobbyPhase, LobbyPlayer, LobbyState, PlayerProfile, RecentForm};
+use crate::lobby::{
+    self, Encounters, EnemyPlayer, LiveGame, LobbyPhase, LobbyPlayer, LobbyState, Meeting, PlayerProfile, RecentForm,
+};
 use crate::messages::{Command, CredentialKind, Event, ImportReport, LeagueDirInfo, Secret};
 use crate::riot::{
     AccountSnapshot, ApiKey, DataSource, Inventory, MatchDetails, MatchSummary, PlayerStats, RankedQueues, Region, RiotClient,
@@ -61,6 +63,8 @@ const LCU_POLL_INTERVAL: Duration = Duration::from_secs(3);
 const LOBBY_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Как часто смотреть турнир Clash. Сетка меняется раз в раунд — чаще не нужно.
 const CLASH_POLL_INTERVAL: Duration = Duration::from_secs(15);
+/// Как часто перечитывать расписание турниров Clash (оно меняется редко).
+const CLASH_SCHEDULE_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
 /// Как часто спрашиваем Riot API, не в игре ли остальные аккаунты (по запросу на аккаунт).
 const LIVE_POLL_INTERVAL: Duration = Duration::from_secs(150);
@@ -515,7 +519,7 @@ impl Worker {
 
     /// Инвентарь аккаунта. Клиент League отдаёт его только для аккаунта, в который
     /// выполнен вход: тогда берём свежий и запоминаем в базе (в настройках, по ключу
-    /// `inventory_<id>` — там только числа, ничего секретного). Для остальных аккаунтов
+    /// `inventory_<id>` — числа и названия чемпионов и образов, ничего секретного). Для остальных аккаунтов
     /// — то, что запомнили в прошлый раз.
     async fn inventory(&self, id: AccountId) -> Option<Inventory> {
         let key = format!("inventory_{id}");
@@ -731,9 +735,11 @@ impl Worker {
             // В игре показываем команду из выбора чемпионов (если он был при нас).
             LobbyPhase::InGame => cache.last_team.clone(),
             LobbyPhase::Idle | LobbyPhase::NoClient => {
-                // Лобби закончилось: в следующий раз загрузим свежие ранги.
+                // Лобби закончилось: в следующий раз загрузим свежие ранги и встречи
+                // (в архиве могла появиться только что сыгранная игра).
                 cache.profiles.clear();
                 cache.last_team.clear();
+                cache.meetings.clear();
                 Vec::new()
             }
         };
@@ -776,6 +782,7 @@ impl Worker {
             }
             self.fill_enemies(cache).await;
         }
+        self.fill_meetings(&mut players, cache).await;
         if phase == LobbyPhase::ChampSelect {
             cache.last_team = players.clone();
         }
@@ -805,6 +812,45 @@ impl Worker {
                     Err(e) => debug!(error = %e, "история противника не загрузилась"),
                 }
             }
+        }
+        cache.enemies = enemies;
+    }
+
+    /// «Уже встречались»: прошлые игры с игроками лобби и с противниками — по архиву игр
+    /// всех аккаунтов. Для новых имён — один запрос к базе, дальше — из кэша лобби.
+    async fn fill_meetings(&self, players: &mut [LobbyPlayer], cache: &mut LobbyCache) {
+        let key = |id: &RiotId| id.to_string().to_lowercase();
+        let mut missing: Vec<RiotId> = players
+            .iter()
+            .filter(|p| !p.is_self)
+            .filter_map(|p| p.riot_id.clone())
+            .chain(cache.enemies.iter().filter_map(|e| e.riot_id.clone()))
+            .filter(|id| !cache.meetings.contains_key(&key(id)))
+            .collect();
+        missing.dedup();
+        if !missing.is_empty() {
+            let query = missing.clone();
+            match self.with_storage(move |s| s.meetings(&query)).await {
+                Ok(rows) => {
+                    for id in &missing {
+                        let mine: Vec<Meeting> = rows
+                            .iter()
+                            .filter(|(who, _)| key(who) == key(id))
+                            .map(|(_, m)| m.clone())
+                            .collect();
+                        cache.meetings.insert(key(id), Encounters::from_meetings(&mine));
+                    }
+                }
+                Err(e) => debug!(error = %e, "прошлые встречи не загрузились"),
+            }
+        }
+        let found = |id: &Option<RiotId>| id.as_ref().and_then(|id| cache.meetings.get(&key(id)).cloned().flatten());
+        for player in players.iter_mut().filter(|p| !p.is_self) {
+            player.met = found(&player.riot_id);
+        }
+        let mut enemies = std::mem::take(&mut cache.enemies);
+        for enemy in &mut enemies {
+            enemy.met = found(&enemy.riot_id);
         }
         cache.enemies = enemies;
     }
@@ -879,11 +925,26 @@ impl Worker {
     async fn watch_clash(self) {
         let mut cache = ClashCache::default();
         let mut last: Option<ClashState> = None;
+        // Расписание турниров: когда загружено и что ответил клиент.
+        let mut schedule: Option<(Instant, Vec<crate::lcu::models::LcuClashTournament>)> = None;
         let mut ticker = tokio::time::interval(CLASH_POLL_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            let state = self.poll_clash(&mut cache).await;
+            let mut state = self.poll_clash(&mut cache).await;
+            if state.phase == ClashPhase::NoClient {
+                schedule = None; // клиент закрыли — при следующем запуске загрузим заново
+            } else {
+                if schedule.as_ref().is_none_or(|(at, _)| at.elapsed() >= CLASH_SCHEDULE_INTERVAL) {
+                    match self.lcu.clash_tournaments().await {
+                        Ok(list) => schedule = Some((Instant::now(), list)),
+                        Err(e) => debug!(error = %e, "расписание Clash не загрузилось"),
+                    }
+                }
+                if let Some((_, list)) = &schedule {
+                    state.schedule = clash::schedule(list, &cache.registered, unix_now());
+                }
+            }
             if last.as_ref() != Some(&state) {
                 debug!(phase = ?state.phase, round = ?state.round, "clash");
                 self.events.send(Event::Clash(state.clone()));
@@ -908,6 +969,13 @@ impl Worker {
                 };
             }
         };
+        // Клиент перечисляет здесь и турниры без команды (rosterId пустой, bracketId -1 —
+        // проверено на живом клиенте) — «вы в команде» только там, где команда есть.
+        cache.registered = summaries
+            .iter()
+            .filter(|s| s.roster_id.parse::<i64>().is_ok_and(|id| id > 0))
+            .map(|s| s.tournament_id)
+            .collect();
         // Обычно турнир один; если их несколько — тот, где уже есть сетка.
         let Some(summary) = summaries
             .iter()
@@ -926,6 +994,7 @@ impl Worker {
         if cache.tournament_id != summary.tournament_id {
             *cache = ClashCache {
                 tournament_id: summary.tournament_id,
+                registered: std::mem::take(&mut cache.registered),
                 ..ClashCache::default()
             };
         }
@@ -1090,7 +1159,29 @@ impl Worker {
             .find(|a| is_same_account(a, region, riot_id, puuid))
         {
             self.refresh(vec![account.id]).await;
+            self.send_inventory(account.id).await;
         }
+    }
+
+    /// Свежий инвентарь аккаунта из клиента (он же сохраняется в базе) — в окно:
+    /// так «Коллекция» знает, что есть на аккаунте, даже если «Профиль» не открывали.
+    async fn send_inventory(&self, id: AccountId) {
+        let inventory = self.inventory(id).await;
+        self.events.send(Event::InventoryLoaded { account: id, inventory });
+    }
+
+    /// Сохранённые инвентари всех аккаунтов (окно «Коллекция»).
+    async fn inventories(&self) -> Vec<(AccountId, Inventory)> {
+        let rows = self
+            .with_storage(|s| s.settings_with_prefix("inventory_"))
+            .await
+            .unwrap_or_default();
+        rows.into_iter()
+            .filter_map(|(key, json)| {
+                let id: AccountId = key.strip_prefix("inventory_")?.parse().ok()?;
+                Some((id, serde_json::from_str(&json).ok()?))
+            })
+            .collect()
     }
 
     /// После игры обновляет аккаунт, в который выполнен вход: окно покажет новые LP и игру.
@@ -1120,6 +1211,8 @@ impl Worker {
                 return;
             };
             if game_recorded(&initial, &after) {
+                // После игры меняются и валюта, и ограничения — обновим и инвентарь.
+                self.send_inventory(id).await;
                 return;
             }
             debug!(id, "клиент ещё не записал игру или новые LP — попробую ещё раз");
@@ -1228,9 +1321,10 @@ impl Worker {
                     let result = worker.with_storage(move |s| s.archived_matches(account, None)).await;
                     worker.events.send(Event::GamesLoaded { account, result });
                 }
-                Command::LoadInventory(account) => {
-                    let inventory = worker.inventory(account).await;
-                    worker.events.send(Event::InventoryLoaded { account, inventory });
+                Command::LoadInventory(account) => worker.send_inventory(account).await,
+                Command::LoadInventories => {
+                    let list = worker.inventories().await;
+                    worker.events.send(Event::Inventories(list));
                 }
                 Command::LoadRanks { account, match_id, players } => {
                     let result = worker.player_ranks(account, players).await;
@@ -2151,6 +2245,8 @@ struct LobbyCache {
     live: Option<LiveGame>,
     /// Команда противника в идущей игре.
     enemies: Vec<EnemyPlayer>,
+    /// Riot ID (в нижнем регистре) → прошлые игры с ним; `None` — не встречались.
+    meetings: HashMap<String, Option<Encounters>>,
     /// Игра только что закончилась — пора обновить аккаунт (забирает `watch_lobby`).
     game_ended: bool,
 }
@@ -2165,6 +2261,8 @@ struct ClashCache {
     players: HashMap<u64, ClashPlayer>,
     /// У кого разведка уже загружена (даже если пустая).
     scouted: HashSet<u64>,
+    /// Турниры, в которых у аккаунта из клиента есть команда.
+    registered: Vec<i64>,
 }
 
 /// Где искать клиент League с учётом папки из настроек, и где игра нашлась.

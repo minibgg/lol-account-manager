@@ -1,11 +1,12 @@
 //! Clash на вкладке «Лобби» (пока турнир идёт): соперник в текущем раунде и ваша команда —
 //! таблицами с позициями, рангами и чемпионами из разведки. Щелчок по строке — профиль
 //! игрока на op.gg; `c` — скопировать ники соперника, `o` — мультипоиск op.gg по нему
-//! (если соперника ещё нет — по своей команде).
+//! (если соперника ещё нет — по своей команде). Над таблицей соперника — кого банить:
+//! чемпионы, на которых у них больше всего игр и побед в этом сезоне.
 
 use eframe::egui::{self, Color32, CursorIcon, Rect, RichText, Sense, Stroke, pos2, vec2};
 
-use crate::clash::{ClashPhase, ClashPlayer, ClashState, ClashTeam};
+use crate::clash::{self, ClashPhase, ClashPlayer, ClashState, ClashTeam};
 use crate::lobby;
 use crate::riot::{Region, RiotId};
 use crate::storage::unix_now;
@@ -69,6 +70,7 @@ pub fn show(ui: &mut egui::Ui, state: &ClashState, region: Option<Region>) -> bo
             match &state.opponent {
                 Some(opponent) => {
                     section_title(ui, "соперник", opponent, theme::RED_TEXT);
+                    bans(ui, opponent);
                     opened |= table(ui, opponent, region, "clash_opponent");
                     ui.add_space(14.0);
                 }
@@ -120,6 +122,27 @@ fn header(ui: &mut egui::Ui, state: &ClashState) {
         _ => "ваша команда",
     };
     ui.label(RichText::new(subtitle).font(theme::mono(11.5)).color(theme::TEXT_HINT));
+}
+
+/// «баны: ари — mid: 12 игр, 41% · ривен — top: 9 игр, 66%».
+fn bans(ui: &mut egui::Ui, team: &ClashTeam) {
+    let suggestions = clash::ban_suggestions(team);
+    if suggestions.is_empty() {
+        return;
+    }
+    let mut parts: Vec<(String, Color32)> = vec![("баны: ".into(), theme::TEXT_HINT)];
+    for (index, ban) in suggestions.iter().enumerate() {
+        if index > 0 {
+            parts.push((" · ".into(), theme::TEXT_HINT));
+        }
+        parts.push((ban.label(), theme::AMBER_TEXT));
+    }
+    let parts: Vec<(&str, Color32)> = parts.iter().map(|(t, c)| (t.as_str(), *c)).collect();
+    let mut text = job(&parts, &theme::mono(12.0));
+    text.wrap.max_width = ui.available_width();
+    ui.label(text)
+        .on_hover_text("Чемпионы соперника с наибольшим числом игр и побед в этом сезоне (по разведке Clash)");
+    ui.add_space(4.0);
 }
 
 fn note(ui: &mut egui::Ui, text: &str) {

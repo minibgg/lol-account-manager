@@ -369,7 +369,7 @@ fn inventory_line(ui: &mut egui::Ui, inventory: Option<&Option<Inventory>>) {
         None => {}
         Some(None) => {
             ui.label(job(
-                &[("инвентарь ", k), ("появится, когда вы войдёте в этот аккаунт в клиенте League и откроете профиль", k)],
+                &[("инвентарь ", k), ("появится, когда вы войдёте в этот аккаунт в клиенте League", k)],
                 &font,
             ));
         }
@@ -402,6 +402,27 @@ fn inventory_line(ui: &mut egui::Ui, inventory: Option<&Option<Inventory>>) {
                 ],
                 &font,
             ));
+            // Честь и ограничения — отдельной строкой, ограничения красным.
+            let mut standing: Vec<(String, egui::Color32)> = Vec::new();
+            if let Some(honor) = inventory.honor_level {
+                standing.push(("честь ".into(), k));
+                let color = if honor < 2 { theme::RED_TEXT } else { theme::TEXT };
+                standing.push((honor.to_string(), color));
+            }
+            let now = crate::storage::unix_now();
+            for restriction in &inventory.restrictions {
+                if !standing.is_empty() {
+                    standing.push((" · ".into(), k));
+                }
+                standing.push((restriction.label(now), theme::RED_TEXT));
+            }
+            if inventory.honor_level.is_some() && inventory.restrictions.is_empty() {
+                standing.push((" · ограничений нет".into(), k));
+            }
+            if !standing.is_empty() {
+                let parts: Vec<(&str, egui::Color32)> = standing.iter().map(|(t, c)| (t.as_str(), *c)).collect();
+                ui.label(job(&parts, &font));
+            }
         }
     }
 }
@@ -687,6 +708,13 @@ mod tests {
             orange_essence: 29,
             rp: 0,
             fetched_at: unix_now(),
+            honor_level: Some(3),
+            restrictions: vec![crate::riot::Restriction {
+                kind: crate::riot::RestrictionKind::Chat,
+                games_left: 4,
+                until: 0,
+            }],
+            ..Inventory::default()
         }));
         // 40 чемпионов по одной игре.
         view.games = Some(Ok((0..40).map(|i| game(i, 420, i % 2 == 0, i64::from(i))).collect()));

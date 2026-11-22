@@ -19,6 +19,9 @@ pub struct LcuSummoner {
     pub tag_line: String,
     pub profile_icon_id: i32,
     pub summoner_level: i64,
+    /// Номер призывателя на сервере (нужен для запросов коллекции).
+    #[serde(default)]
+    pub summoner_id: u64,
 }
 
 /// `/riotclient/region-locale`.
@@ -52,10 +55,90 @@ pub struct LcuChampSelectMember {
 }
 
 /// Чемпион из `/lol-champions/v1/owned-champions-minimal` (там же — бесплатные на этой неделе).
+/// `/lol-champions/v1/owned-champions-minimal` — чемпионы аккаунта из клиента.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct LcuOwnedChampion {
+    pub id: i32,
+    /// На языке клиента.
+    pub name: String,
     pub ownership: LcuOwnership,
+}
+
+/// `/lol-champions/v1/inventories/{summonerId}/skins-minimal` — все образы игры
+/// с пометкой, какие есть на аккаунте.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LcuSkinMinimal {
+    pub id: i32,
+    pub champion_id: i32,
+    /// На языке клиента: «Звёздная защитница Ари».
+    pub name: String,
+    /// Базовый образ есть у всех, у кого есть чемпион, — его не считаем.
+    pub is_base: bool,
+    pub ownership: LcuOwnership,
+}
+
+/// `/lol-honor-v2/v1/profile`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LcuHonorProfile {
+    pub honor_level: i32,
+}
+
+/// `/lol-player-behavior/v1/chat-restriction` (404 — ограничения нет).
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LcuChatRestriction {
+    pub games_remaining: i64,
+    /// Миллисекунды unix; 0 — по времени не ограничено.
+    pub expiration_millis: u64,
+}
+
+/// `/lol-leaver-buster/v1/ranked-restriction`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LcuRankedRestriction {
+    pub punished_games_remaining: i32,
+}
+
+/// `/lol-leaver-buster/v1/notifications` — штрафы за выходы из игр.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LcuLeaverNotification {
+    /// "PunishedGamesRemaining" (очередь с задержкой), "OnLockoutWarning" и др.
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub punished_games_remaining: i32,
+}
+
+/// `/lol-clash/v1/all-tournaments` — расписание турниров Clash.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LcuClashTournament {
+    pub id: i64,
+    /// Ключ перевода названия, например «tournament_name_bilgewater».
+    pub name_loc_key: String,
+    pub name_loc_key_secondary: String,
+    /// Миллисекунды unix.
+    pub schedule_time: i64,
+    pub schedule_end_time: i64,
+    /// До какого момента можно собрать команду (мс unix).
+    pub roster_create_deadline: i64,
+    /// "CANCELLED", "DEFAULT", "PAUSED", "PRERESUME".
+    pub status: String,
+    pub phases: Vec<LcuClashTournamentPhase>,
+}
+
+/// День турнира: когда открывается регистрация и когда начинаются игры.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LcuClashTournamentPhase {
+    pub id: i64,
+    /// Миллисекунды unix.
+    pub registration_time: i64,
+    pub start_time: i64,
+    pub cancelled: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]

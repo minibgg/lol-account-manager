@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 
 use crate::error::AppError;
-use crate::lcu::models::{LcuClashBracket, LcuScoutingChampions};
+use crate::lcu::models::{LcuClashBracket, LcuClashTournament, LcuScoutingChampions};
 use crate::lobby::{PlayerProfile, Position};
 use crate::riot::RiotId;
 
@@ -122,6 +122,8 @@ pub struct ClashState {
     /// Соперник ещё не определился: ждём результата другого матча.
     pub opponent_pending: bool,
     pub problem: Option<AppError>,
+    /// Ближайшие дни турниров (показываются на вкладке «Лобби», пока турнира нет).
+    pub schedule: Vec<ClashDay>,
 }
 
 impl ClashState {
@@ -196,6 +198,195 @@ pub fn position_order(position: Option<Position>) -> u8 {
         Some(Position::Utility) => 4,
         None => 5,
     }
+}
+
+// ----- Расписание турниров ------------------------------------------------------
+
+/// День турнира Clash из расписания (`/lol-clash/v1/all-tournaments`).
+///
+/// Проверено на живом клиенте (RU, 2026-11-22): каждый день Clash — отдельный «турнир»
+/// с одной фазой; номер дня — во втором ключе названия («day_2»). У фазы
+/// `registrationTime` — начало подтверждения участия (lock-in, за 2 часа до игр),
+/// `startTime` — начало игр.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ClashDay {
+    pub tournament_id: i64,
+    /// Название из ключа перевода («worlds 2024»); пустое — понять не удалось.
+    pub name: String,
+    /// Какой это день турнира (0 — неизвестно) и сколько их всего (0 — неизвестно).
+    pub day: usize,
+    pub days: usize,
+    /// Когда начинается подтверждение участия и когда — игры (unix-время, секунды).
+    pub lock_in: i64,
+    pub start: i64,
+    /// Вы (аккаунт из клиента) зарегистрированы в этом турнире.
+    pub registered: bool,
+}
+
+impl ClashDay {
+    /// Идёт подтверждение участия (до начала игр).
+    pub fn lock_in_open(&self, now: i64) -> bool {
+        self.lock_in > 0 && self.lock_in <= now && now < self.start
+    }
+
+    /// «день 2» / «день 1 из 2»; пусто — номер неизвестен.
+    pub fn day_label(&self) -> String {
+        match (self.day, self.days) {
+            (0, _) => String::new(),
+            (day, 0 | 1) => format!("день {day}"),
+            (day, days) => format!("день {day} из {days}"),
+        }
+    }
+}
+
+/// Сколько дней турнира показывать.
+pub const SCHEDULE_DAYS: usize = 4;
+/// Сколько после начала день турнира ещё считается идущим (игры идут несколько часов).
+const DAY_LENGTH: i64 = 6 * 3600;
+
+/// Ближайшие дни турниров: без отменённых и прошедших, по порядку.
+/// `registered` — турниры, где у вас есть команда (из `tournament-summary`).
+pub fn schedule(tournaments: &[LcuClashTournament], registered: &[i64], now: i64) -> Vec<ClashDay> {
+    let mut days = Vec::new();
+    for t in tournaments.iter().filter(|t| t.status != "CANCELLED") {
+        let mut phases: Vec<_> = t.phases.iter().filter(|p| !p.cancelled && p.start_time > 0).collect();
+        phases.sort_by_key(|p| p.start_time);
+        let name = tournament_name(&t.name_loc_key);
+        // «day_2» → второй день; если ключа нет, а фаз несколько — по порядку фаз.
+        let day_from_key = t
+            .name_loc_key_secondary
+            .to_lowercase()
+            .strip_prefix("day_")
+            .and_then(|n| n.parse::<usize>().ok());
+        let total = if day_from_key.is_some() { 0 } else { phases.len() };
+        let starts: Vec<(i64, i64)> = if phases.is_empty() {
+            // Дней нет в ответе — берём время всего турнира.
+            (t.schedule_time > 0)
+                .then_some((t.schedule_time / 1000, 0))
+                .into_iter()
+                .collect()
+        } else {
+            phases.iter().map(|p| (p.start_time / 1000, p.registration_time / 1000)).collect()
+        };
+        for (index, (start, lock_in)) in starts.into_iter().enumerate() {
+            if start + DAY_LENGTH < now {
+                continue;
+            }
+            let day = match day_from_key {
+                Some(day) => day + index,
+                None if total > 1 => index + 1,
+                None => 0,
+            };
+            days.push(ClashDay {
+                tournament_id: t.id,
+                name: name.clone(),
+                day,
+                days: total,
+                lock_in,
+                start,
+                registered: registered.contains(&t.id),
+            });
+        }
+    }
+    days.sort_by_key(|d| d.start);
+    days.truncate(SCHEDULE_DAYS);
+    days
+}
+
+/// «tournament_name_bilgewater» → «bilgewater», «worlds2024» → «worlds 2024»;
+/// непонятный ключ — пустая строка.
+fn tournament_name(key: &str) -> String {
+    let key = key.to_lowercase();
+    let mut rest = key.as_str();
+    for prefix in ["clash_", "tournament_", "name_", "theme_"] {
+        rest = rest.strip_prefix(prefix).unwrap_or(rest);
+    }
+    // Пробел между буквами и цифрами.
+    let mut spaced = String::new();
+    let mut previous: Option<char> = None;
+    for c in rest.chars() {
+        if previous.is_some_and(|p| p.is_ascii_alphabetic()) && c.is_ascii_digit() {
+            spaced.push(' ');
+        }
+        spaced.push(c);
+        previous = Some(c);
+    }
+    let name = spaced.replace('_', " ").trim().to_string();
+    if name.is_empty() || name.chars().all(|c| c.is_ascii_digit() || c == ' ') {
+        String::new()
+    } else {
+        name
+    }
+}
+
+// ----- Кого банить ----------------------------------------------------------------
+
+/// Подсказка бана против соперника: чемпион, кто на нём играет и насколько успешно.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BanSuggestion {
+    pub champion: String,
+    /// «Имя» игрока соперника (без тега); пустое — имя не загрузилось.
+    pub player: String,
+    pub games: u32,
+    pub wins: u32,
+}
+
+impl BanSuggestion {
+    /// «ривен — ник: 9 игр, 67%».
+    pub fn label(&self) -> String {
+        let who = if self.player.is_empty() { String::new() } else { format!(" — {}", self.player) };
+        if self.games == 0 {
+            format!("{}{who}: мастерство", self.champion.to_lowercase())
+        } else {
+            format!(
+                "{}{who}: {}, {}%",
+                self.champion.to_lowercase(),
+                crate::lobby::games_count(self.games),
+                self.wins * 100 / self.games
+            )
+        }
+    }
+}
+
+/// Сколько банов предлагать (в Clash у команды 5 банов).
+pub const BAN_SUGGESTIONS: usize = 5;
+
+/// Кого банить против команды: чемпионы сезона из разведки, у кого больше игр и выше
+/// процент побед — тот и опаснее. Один чемпион — один раз (у самого опасного игрока).
+/// Если ни у кого нет игр в сезоне — по мастерству (оно стоит в разведке первым).
+pub fn ban_suggestions(team: &ClashTeam) -> Vec<BanSuggestion> {
+    let mut all: Vec<(u32, BanSuggestion)> = Vec::new();
+    for player in &team.players {
+        let name = player.riot_id.as_ref().map(|id| id.game_name.clone()).unwrap_or_default();
+        for (rank, champion) in player.champions.iter().enumerate() {
+            // Очки: игры × (1 + доля побед). Мастерство без игр — совсем немного,
+            // чтобы попасть в список, только если больше ничего нет.
+            let score = if champion.games > 0 {
+                champion.games * 100 + champion.wins * 100
+            } else {
+                3 - rank.min(2) as u32
+            };
+            all.push((
+                score,
+                BanSuggestion {
+                    champion: champion.name.clone(),
+                    player: name.clone(),
+                    games: champion.games,
+                    wins: champion.wins,
+                },
+            ));
+        }
+    }
+    all.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+    let has_games = all.iter().any(|(_, s)| s.games > 0);
+    let mut seen = std::collections::HashSet::new();
+    all.into_iter()
+        .map(|(_, s)| s)
+        // Есть игры в сезоне — одиночные «по мастерству» уже не нужны.
+        .filter(|s| !has_games || s.games >= 2)
+        .filter(|s| seen.insert(s.champion.clone()))
+        .take(BAN_SUGGESTIONS)
+        .collect()
 }
 
 /// До трёх чемпионов из разведки: сначала сыгранные в этом сезоне (по числу игр),
@@ -305,6 +496,118 @@ mod tests {
         assert_eq!(position("FILL"), None);
         assert_eq!(position("UNSELECTED"), None);
         assert!(position_order(Some(Position::Top)) < position_order(None));
+    }
+
+    #[test]
+    fn schedule_skips_cancelled_and_past_days() {
+        use crate::lcu::models::LcuClashTournamentPhase;
+        let now = 1_800_000_000;
+        // Как в живом клиенте: отдельный турнир на день, номер — в «day_2».
+        let live = [LcuClashTournament {
+            id: 28542,
+            name_loc_key: "worlds2024".into(),
+            name_loc_key_secondary: "day_2".into(),
+            status: "DEFAULT".into(),
+            phases: vec![LcuClashTournamentPhase {
+                id: 27422,
+                registration_time: (now + 3600) * 1000,
+                start_time: (now + 3 * 3600) * 1000,
+                cancelled: false,
+            }],
+            ..Default::default()
+        }];
+        let today = schedule(&live, &[28542], now);
+        assert_eq!(today.len(), 1);
+        assert_eq!((today[0].name.as_str(), today[0].day_label()), ("worlds 2024", "день 2".to_string()));
+        assert!(today[0].registered);
+        assert!(!today[0].lock_in_open(now), "подтверждение через час");
+        assert!(today[0].lock_in_open(now + 2 * 3600));
+
+        let phase = |id, start: i64, cancelled| LcuClashTournamentPhase {
+            id,
+            registration_time: (start - 4 * 86_400) * 1000,
+            start_time: start * 1000,
+            cancelled,
+        };
+        let tournaments = [
+            LcuClashTournament {
+                id: 7,
+                name_loc_key: "tournament_name_bilgewater".into(),
+                status: "DEFAULT".into(),
+                phases: vec![
+                    phase(2, now + 86_400, false),
+                    phase(1, now - 2 * 86_400, false), // уже прошёл
+                    phase(3, now + 2 * 86_400, true),  // отменён
+                ],
+                ..Default::default()
+            },
+            LcuClashTournament {
+                id: 8,
+                status: "CANCELLED".into(),
+                phases: vec![phase(9, now + 3600, false)],
+                ..Default::default()
+            },
+            LcuClashTournament {
+                id: 9,
+                name_loc_key: "12345".into(),
+                status: "DEFAULT".into(),
+                schedule_time: (now + 7 * 86_400) * 1000,
+                ..Default::default()
+            },
+        ];
+        let days = schedule(&tournaments, &[7], now);
+        let seen: Vec<_> = days.iter().map(|d| (d.tournament_id, d.name.as_str(), d.day_label(), d.registered)).collect();
+        assert_eq!(
+            seen,
+            [(7, "bilgewater", "день 2 из 2".to_string(), true), (9, "", String::new(), false)]
+        );
+        assert!(days[0].lock_in_open(now), "подтверждение за 4 дня до начала");
+        assert!(!days[1].lock_in_open(now), "без времени подтверждения — не знаем");
+        // Идущий сейчас день (начался час назад) ещё показываем.
+        let today = [LcuClashTournament {
+            id: 1,
+            phases: vec![phase(1, now - 3600, false)],
+            ..Default::default()
+        }];
+        assert_eq!(schedule(&today, &[], now).len(), 1);
+    }
+
+    #[test]
+    fn bans_pick_the_most_dangerous_champions() {
+        let player = |name: &str, champions: Vec<ScoutChampion>| ClashPlayer {
+            riot_id: RiotId::parse(&format!("{name}#RU1")).ok(),
+            champions,
+            ..ClashPlayer::default()
+        };
+        let champ = |name: &str, games, wins| ScoutChampion {
+            name: name.into(),
+            games,
+            wins,
+            kda: String::new(),
+        };
+        let team = ClashTeam {
+            players: vec![
+                player("top", vec![champ("Ривен", 9, 6), champ("Джакс", 1, 1)]),
+                player("mid", vec![champ("Ари", 12, 5), champ("Ривен", 3, 3)]),
+                player("sup", vec![champ("Тареш", 0, 0)]), // только мастерство
+            ],
+            ..ClashTeam::default()
+        };
+        let bans = ban_suggestions(&team);
+        let seen: Vec<_> = bans.iter().map(|b| (b.champion.as_str(), b.player.as_str(), b.games)).collect();
+        // Ари: 12 игр + 5 побед = 1700; Ривен у top: 9 + 6 = 1500; Ривен у mid повторно не берём;
+        // Джакс с одной игрой и Тареш без игр — не нужны, когда есть сыгранные чемпионы.
+        assert_eq!(seen, [("Ари", "mid", 12), ("Ривен", "top", 9)]);
+        assert_eq!(bans[1].label(), "ривен — top: 9 игр, 66%");
+
+        // Ни у кого нет игр в сезоне — подсказываем по мастерству.
+        let quiet = ClashTeam {
+            players: vec![player("a", vec![champ("Тареш", 0, 0), champ("Лулу", 0, 0)])],
+            ..ClashTeam::default()
+        };
+        let bans = ban_suggestions(&quiet);
+        assert_eq!(bans.len(), 2);
+        assert_eq!(bans[0].label(), "тареш — a: мастерство");
     }
 
     #[test]

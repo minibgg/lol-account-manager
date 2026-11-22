@@ -40,6 +40,24 @@ pub struct Skin {
 }
 
 impl Skin {
+    /// Все имена образа и его чемпиона (рус. и англ.) в нижнем регистре — для поиска
+    /// в других окнах (например, в «Коллекции»).
+    pub fn names(&self) -> &[String] {
+        &self.search
+    }
+
+    /// Образ с заданными именами — для тестов других модулей.
+    #[cfg(test)]
+    pub fn for_test(id: i64, title: &str, champion: &str, names: &[&str]) -> Self {
+        Self {
+            id,
+            title: title.to_string(),
+            champion: champion.to_string(),
+            splash_url: None,
+            search: names.iter().map(|n| n.to_lowercase()).collect(),
+        }
+    }
+
     /// Подходит ли образ под запрос: точное совпадение по числовому id либо подстрока
     /// в любом из имён. Пустой запрос подходит всем (показываем весь каталог).
     pub fn matches(&self, query: &str) -> bool {
