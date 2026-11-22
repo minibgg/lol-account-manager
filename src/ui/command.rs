@@ -66,6 +66,8 @@ enum Arg {
     /// Любой тег: существующий или новый (для «метка …»).
     NewTag,
     Sort,
+    /// Свободный текст, можно и без него (для «коллекция ари»).
+    Text,
 }
 
 #[derive(Clone, Copy)]
@@ -89,6 +91,7 @@ enum Kind {
     Go(Screen),
     Help,
     Overview,
+    Collection,
     Update,
     Quit,
 }
@@ -121,6 +124,7 @@ const COMMANDS: &[Spec] = &[
     Spec { kind: Kind::Go(Screen::Lobby), names: &["лобби", "lobby"], hint: "экран лобби" },
     Spec { kind: Kind::Go(Screen::Settings), names: &["настройки", "settings"], hint: "экран настроек" },
     Spec { kind: Kind::Overview, names: &["сводка", "overview", "итоги"], hint: "все аккаунты за период" },
+    Spec { kind: Kind::Collection, names: &["коллекция", "collection", "чемпион", "образ", "скин"], hint: "на каком аккаунте есть чемпион или образ" },
     Spec { kind: Kind::Help, names: &["помощь", "help", "?"], hint: "горячие клавиши" },
     Spec { kind: Kind::Quit, names: &["выход", "quit", "exit"], hint: "закрыть программу совсем" },
     Spec { kind: Kind::Update, names: &["обновление", "upgrade", "версия"], hint: "проверить новую версию приложения" },
@@ -144,6 +148,7 @@ impl Kind {
             Self::Label => Arg::NewTag,
             Self::Sort => Arg::Sort,
             Self::Add | Self::Go(_) | Self::Help | Self::Overview | Self::Update | Self::Quit => Arg::None,
+            Self::Collection => Arg::Text,
         }
     }
 
@@ -167,6 +172,7 @@ impl Kind {
             Self::Tag | Self::Label | Self::Sort | Self::Go(_) | Self::Help => Action::Help,
             Self::Update => Action::Update,
             Self::Overview => Action::Overview,
+            Self::Collection => Action::Collection(String::new()),
             Self::Quit => Action::Quit,
         }
     }
@@ -178,6 +184,7 @@ impl Kind {
             Self::Go(screen) => Some(Action::Screen(screen)),
             Self::Help => Some(Action::Help),
             Self::Overview => Some(Action::Overview),
+            Self::Collection => Some(Action::Collection(String::new())),
             Self::Update => Some(Action::Update),
             Self::Quit => Some(Action::Quit),
             _ => None,
@@ -276,7 +283,7 @@ pub fn suggest(input: &str, targets: &[Target], tags: &[String], selected: Optio
     };
 
     if let Some(spec) = exact(head)
-        && (rest.is_some() || spec.kind.arg() == Arg::None)
+        && (rest.is_some() || matches!(spec.kind.arg(), Arg::None | Arg::Text))
     {
         arguments(spec, rest.unwrap_or(""), targets, tags, selected, &mut out);
     } else if rest.is_none() {
@@ -286,7 +293,7 @@ pub fn suggest(input: &str, targets: &[Target], tags: &[String], selected: Optio
             if spec.names.iter().any(|n| n.starts_with(head) || n.starts_with(&swapped)) {
                 out.push(match (spec.kind.arg(), current) {
                     (Arg::Account | Arg::AccountOrAll, Some(t)) => for_account(spec, t),
-                    (Arg::None, _) => plain(spec),
+                    (Arg::None | Arg::Text, _) => plain(spec),
                     _ => needs_argument(spec),
                 });
             }
@@ -356,6 +363,16 @@ fn arguments(
             if out.is_empty() {
                 out.push(needs_argument(spec));
             }
+        }
+        Arg::Text => {
+            let text = rest.trim();
+            let label = if text.is_empty() { name.to_string() } else { format!("{name} {text}") };
+            out.push(Suggestion {
+                completion: label.clone(),
+                label,
+                hint: spec.hint,
+                run: Some(Invocation::new(Action::Collection(text.to_string()))),
+            });
         }
         Arg::Sort => {
             let swapped = swap_layout(rest);
@@ -482,6 +499,11 @@ mod tests {
         assert_eq!(first("sort level"), Some(Invocation::new(Action::Sort(SortOrder::Level))));
         assert_eq!(first("лобби"), Some(Invocation::new(Action::Screen(Screen::Lobby))));
         assert_eq!(first("help"), Some(Invocation::new(Action::Help)));
+        // Коллекция — с текстом поиска и без него, в том числе синонимами.
+        assert_eq!(first("коллекция ари"), Some(Invocation::new(Action::Collection("ари".into()))));
+        assert_eq!(first("коллекция"), Some(Invocation::new(Action::Collection(String::new()))));
+        assert_eq!(first("скин звёздная защитница"), Some(Invocation::new(Action::Collection("звёздная защитница".into()))));
+        assert_eq!(first("колл"), Some(Invocation::new(Action::Collection(String::new()))));
     }
 
     #[test]

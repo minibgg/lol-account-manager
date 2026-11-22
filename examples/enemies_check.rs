@@ -3,13 +3,14 @@
 //!
 //!   cargo run --example enemies_check
 //!
-//! Только чтение (GET к клиенту League); ваша настоящая база и пароли не используются.
+//! Только чтение (GET к клиенту League); ваша настоящая база и пароли не используются —
+//! поэтому пометка «уже встречались» здесь пустая (архив игр временной базы пуст).
 
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 use lol_account_manager::backend::{Backend, BackendConfig};
-use lol_account_manager::lobby::LobbyState;
+use lol_account_manager::lobby::{self, LobbyState};
 use lol_account_manager::messages::Event;
 use lol_account_manager::storage::{Secrets, Storage};
 
@@ -73,5 +74,11 @@ fn main() {
             e.position.map_or("—", |p| p.label()),
             e.champion.as_deref().unwrap_or("—"),
         );
+        if let Some(met) = &e.met {
+            println!("             {}", met.describe(lol_account_manager::storage::unix_now()).replace('\n', " "));
+        }
+        if let Some(hint) = lobby::smurf_hint(e.profile.as_ref(), e.form.as_ref()) {
+            println!("             {hint}");
+        }
     }
 }

@@ -123,6 +123,8 @@ pub struct LobbyPlayer {
     pub champion: Option<String>,
     /// `None` — ещё не загружен или не удалось.
     pub profile: Option<PlayerProfile>,
+    /// Прошлые игры с этим игроком (по архиву всех ваших аккаунтов); `None` — не встречались.
+    pub met: Option<Encounters>,
 }
 
 impl LobbyPlayer {
@@ -227,6 +229,152 @@ pub struct EnemyPlayer {
     pub profile: Option<PlayerProfile>,
     /// Последние игры; `None` — ещё не загружены.
     pub form: Option<RecentForm>,
+    /// Прошлые игры с этим игроком (по архиву всех ваших аккаунтов); `None` — не встречались.
+    pub met: Option<Encounters>,
+}
+
+// ----- «Уже встречались» и «похоже на смурфа» ------------------------------------
+
+/// Одна прошлая игра с этим игроком — строка из архива игр (см. `Db::meetings`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Meeting {
+    pub match_id: String,
+    pub played_at: i64,
+    /// Ваш аккаунт, на котором была игра («Имя#TAG»).
+    pub account: String,
+    /// Он был в вашей команде.
+    pub same_team: bool,
+    /// Вы выиграли.
+    pub won: bool,
+    /// Чемпион, на котором играл он.
+    pub champion: String,
+}
+
+/// Сколько раз вы уже играли с этим игроком или против него. Ремейки не считаются.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Encounters {
+    /// Игры, где он был в вашей команде, и ваши победы в них.
+    pub with: u32,
+    pub with_wins: u32,
+    /// Игры против него и ваши победы в них.
+    pub against: u32,
+    pub against_wins: u32,
+    /// Последняя встреча: когда (unix-время), на каком вашем аккаунте, на ком играл он.
+    pub last_at: i64,
+    pub last_account: String,
+    pub last_champion: String,
+}
+
+impl Encounters {
+    /// Собирает встречи из строк архива. Одна и та же игра может быть в архиве двух
+    /// ваших аккаунтов (играли вместе) — считаем её один раз. `None` — встреч нет.
+    pub fn from_meetings(meetings: &[Meeting]) -> Option<Self> {
+        let mut seen = HashSet::new();
+        let mut result = Self::default();
+        for m in meetings {
+            if !seen.insert(m.match_id.as_str()) {
+                continue;
+            }
+            if m.same_team {
+                result.with += 1;
+                result.with_wins += u32::from(m.won);
+            } else {
+                result.against += 1;
+                result.against_wins += u32::from(m.won);
+            }
+            if m.played_at >= result.last_at {
+                result.last_at = m.played_at;
+                result.last_account = m.account.clone();
+                result.last_champion = m.champion.clone();
+            }
+        }
+        (result.games() > 0).then_some(result)
+    }
+
+    pub fn games(&self) -> u32 {
+        self.with + self.against
+    }
+
+    /// Метка в таблице: «↺3».
+    pub fn mark(&self) -> String {
+        format!("↺{}", self.games())
+    }
+
+    /// Подсказка: «Уже встречались: 3 игры. Вместе — 2 (побед 1), против — 1 (побед 0).
+    /// Последняя — 5 дн. назад, на аккаунте X; он играл на Ари.»
+    pub fn describe(&self, now: i64) -> String {
+        let mut parts = Vec::new();
+        if self.with > 0 {
+            parts.push(format!("в вашей команде — {} (ваших побед {})", self.with, self.with_wins));
+        }
+        if self.against > 0 {
+            parts.push(format!("против вас — {} (ваших побед {})", self.against, self.against_wins));
+        }
+        let days = (now - self.last_at).max(0) / 86_400;
+        let when = match days {
+            0 => "сегодня".to_string(),
+            1 => "вчера".to_string(),
+            n => format!("{n} дн. назад"),
+        };
+        let mut text = format!("Уже встречались: {}. {}.", games_count(self.games()), parts.join(", "));
+        text.push_str(&format!("\nПоследняя игра — {when}, ваш аккаунт {}", self.last_account));
+        if !self.last_champion.is_empty() {
+            text.push_str(&format!("; он играл на чемпионе «{}»", self.last_champion));
+        }
+        text.push('.');
+        text
+    }
+}
+
+/// «1 игра», «3 игры», «5 игр».
+pub fn games_count(n: u32) -> String {
+    let word = match (n % 10, n % 100) {
+        (1, 11) => "игр",
+        (1, _) => "игра",
+        (2..=4, 12..=14) => "игр",
+        (2..=4, _) => "игры",
+        _ => "игр",
+    };
+    format!("{n} {word}")
+}
+
+/// Ниже этого уровня аккаунт считаем новым (для пометки «смурф?»).
+pub const SMURF_LEVEL: i64 = 60;
+
+/// Похоже ли на смурфа: аккаунт новый (уровень ниже [`SMURF_LEVEL`]), а играет как
+/// опытный — высокий ранг или очень много побед. Возвращает пояснение для подсказки;
+/// `None` — не похоже или данных мало. Это только догадка по цифрам, а не приговор.
+pub fn smurf_hint(profile: Option<&PlayerProfile>, form: Option<&RecentForm>) -> Option<String> {
+    let profile = profile?;
+    let level = profile.summoner_level;
+    if level <= 0 || level >= SMURF_LEVEL {
+        return None;
+    }
+    let mut reasons = Vec::new();
+    if let Some(f) = form
+        && f.games >= 8
+        && let Some(wr) = f.winrate()
+        && wr >= 65
+    {
+        reasons.push(format!("{wr}% побед в последних {}", games_count(f.games)));
+    }
+    let queues = [("solo/duo", profile.ranked.solo.as_ref()), ("flex", profile.ranked.flex.as_ref())];
+    if let Some((queue, stats)) = queues
+        .iter()
+        .filter_map(|(q, s)| s.map(|s| (*q, s)))
+        .filter(|(_, s)| s.tier >= crate::riot::Tier::Emerald)
+        .max_by_key(|(_, s)| s.tier)
+    {
+        reasons.push(format!("{} в {queue}", stats.rank_label().to_lowercase()));
+    }
+    if let Some(stats) = profile.ranked.solo.as_ref()
+        && stats.games().is_some_and(|g| g >= 20)
+        && let Some(wr) = stats.winrate()
+        && wr >= 65.0
+    {
+        reasons.push(format!("{wr:.0}% побед в solo/duo"));
+    }
+    (!reasons.is_empty()).then(|| format!("Похоже на смурфа: уровень {level}, {}.", reasons.join(", ")))
 }
 
 /// Форма игрока по последним играм (без ремейков).
@@ -708,5 +856,89 @@ mod tests {
         assert!(LobbyPhase::game_running("WaitingForStats"));
         assert!(!LobbyPhase::game_running("EndOfGame"), "после игры — уже можно обновлять");
         assert!(!LobbyPhase::game_running("Lobby"));
+    }
+
+    fn meeting(id: &str, at: i64, same_team: bool, won: bool) -> Meeting {
+        Meeting {
+            match_id: id.into(),
+            played_at: at,
+            account: format!("main#{at}"),
+            same_team,
+            won,
+            champion: format!("чемп {at}"),
+        }
+    }
+
+    #[test]
+    fn encounters_count_each_game_once() {
+        let meetings = [
+            meeting("RU_1", 100, true, true),
+            meeting("RU_1", 100, true, true), // та же игра в архиве второго аккаунта
+            meeting("RU_2", 300, false, false),
+            meeting("RU_3", 200, true, false),
+        ];
+        let met = Encounters::from_meetings(&meetings).unwrap();
+        assert_eq!((met.with, met.with_wins), (2, 1));
+        assert_eq!((met.against, met.against_wins), (1, 0));
+        assert_eq!(met.games(), 3);
+        assert_eq!(met.mark(), "↺3");
+        assert_eq!((met.last_at, met.last_account.as_str(), met.last_champion.as_str()), (300, "main#300", "чемп 300"));
+        let text = met.describe(300 + 86_400 * 5);
+        assert!(text.starts_with("Уже встречались: 3 игры."), "{text}");
+        assert!(text.contains("5 дн. назад"), "{text}");
+        assert!(Encounters::from_meetings(&[]).is_none());
+    }
+
+    #[test]
+    fn games_count_declension() {
+        assert_eq!(games_count(1), "1 игра");
+        assert_eq!(games_count(3), "3 игры");
+        assert_eq!(games_count(11), "11 игр");
+        assert_eq!(games_count(22), "22 игры");
+        assert_eq!(games_count(25), "25 игр");
+    }
+
+    #[test]
+    fn smurf_needs_low_level_and_strong_play() {
+        use crate::riot::{Division, RankedStats, Tier};
+        let stats = |tier, wins, losses| RankedStats {
+            tier,
+            division: Division::Two,
+            lp: 10,
+            wins,
+            losses,
+        };
+        let profile = |level, solo| PlayerProfile {
+            profile_icon_id: 1,
+            summoner_level: level,
+            ranked: RankedQueues { solo, flex: None },
+        };
+        let hot = RecentForm {
+            games: 15,
+            wins: 12,
+            ..RecentForm::default()
+        };
+        // Новый аккаунт с 80% побед.
+        let hint = smurf_hint(Some(&profile(35, None)), Some(&hot)).unwrap();
+        assert!(hint.contains("уровень 35") && hint.contains("80% побед"), "{hint}");
+        // Тот же винрейт на старом аккаунте — не смурф.
+        assert_eq!(smurf_hint(Some(&profile(300, None)), Some(&hot)), None);
+        // Новый, но с обычной формой и низким рангом — тоже нет.
+        let usual = RecentForm {
+            games: 20,
+            wins: 10,
+            ..RecentForm::default()
+        };
+        let silver = Some(stats(Tier::Silver, 10, None));
+        assert_eq!(smurf_hint(Some(&profile(40, silver)), Some(&usual)), None);
+        // Высокий ранг на новом аккаунте — да (даже без истории).
+        let emerald = Some(stats(Tier::Emerald, 30, None));
+        let hint = smurf_hint(Some(&profile(45, emerald)), None).unwrap();
+        assert!(hint.contains("изумруд"), "{hint}");
+        // Свой аккаунт с известными поражениями: 70% побед в 30 играх.
+        let winning = Some(stats(Tier::Gold, 21, Some(9)));
+        assert!(smurf_hint(Some(&profile(50, winning)), None).unwrap().contains("70% побед в solo/duo"));
+        // Без профиля — ничего не утверждаем.
+        assert_eq!(smurf_hint(None, Some(&hot)), None);
     }
 }

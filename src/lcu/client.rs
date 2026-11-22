@@ -13,15 +13,19 @@ use tracing::{debug, warn};
 
 use super::lockfile::Lockfile;
 use super::models::{
-    ChatParticipant, ChatParticipants, LcuChampSelectSession, LcuChampionSummary, LcuClashBracket,
-    LcuClashRoster, LcuClashSummary, LcuLobby, LcuScoutingChampions, LcuSummonerById,
+    ChatParticipant, ChatParticipants, LcuChampSelectSession, LcuChampionSummary, LcuChatRestriction, LcuClashBracket,
+    LcuClashRoster, LcuClashSummary, LcuClashTournament, LcuHonorProfile, LcuLeaverNotification, LcuLobby,
+    LcuRankedRestriction, LcuScoutingChampions, LcuSkinMinimal, LcuSummonerById,
     LcuGame, LcuGameflowSession, LcuInventoryItem, LcuMatchHistory, LcuOwnedChampion, LcuRankedStats, LcuRegionLocale, LcuSummoner,
 };
 use super::riot_client::RiotClientAuth;
 use crate::error::{AppError, AppResult};
 use crate::riot::client::encode_segment;
 use crate::riot::models::FETCH_MATCHES;
-use crate::riot::{AccountSnapshot, DataSource, Inventory, MatchSummary, RankedQueues, Region, RiotId};
+use crate::riot::{
+    AccountSnapshot, DataSource, Inventory, MatchSummary, OwnedChampion, OwnedSkin, RankedQueues, Region, Restriction,
+    RestrictionKind, RiotId,
+};
 use crate::riot_login::{self, AuthStep};
 
 /// Что сейчас происходит с клиентом League.
@@ -316,25 +320,125 @@ impl LcuClient {
         Ok(wallet.get(currency).copied().unwrap_or(0))
     }
 
-    /// Инвентарь аккаунта, в который выполнен вход: чемпионы, образы, валюта.
-    /// Только чтение — пять GET-запросов.
+    /// Инвентарь аккаунта, в который выполнен вход: чемпионы и образы (с названиями),
+    /// валюта, честь и ограничения. Только чтение — около десяти GET-запросов.
     pub async fn inventory(&self, fetched_at: i64) -> AppResult<Inventory> {
         let champions: Vec<LcuOwnedChampion> = self
             .get_json("/lol-champions/v1/owned-champions-minimal")
             .await?
             .ok_or(AppError::LcuNotReady)?;
-        let skins: Vec<LcuInventoryItem> = self
-            .get_json("/lol-inventory/v2/inventory/CHAMPION_SKIN")
-            .await?
-            .unwrap_or_default();
+        // id от 10 000 — копии чемпионов для особых режимов («Jade_Aatrox» с id 60266 и т.п.,
+        // проверено на живом клиенте): их не считаем, иначе каждый чемпион был бы дважды.
+        let mut champion_list: Vec<OwnedChampion> = champions
+            .iter()
+            .filter(|c| c.ownership.owned && c.id > 0 && c.id < 10_000)
+            .map(|c| OwnedChampion {
+                id: c.id,
+                name: c.name.clone(),
+            })
+            .collect();
+        champion_list.sort_by(|a, b| a.name.cmp(&b.name));
+
+        // Образы с названиями — по номеру призывателя; если не вышло, хотя бы их число.
+        let summoner_id = self.current_summoner().await?.summoner_id;
+        let skins: Option<Vec<LcuSkinMinimal>> = if summoner_id > 0 {
+            self.get_json(&format!("/lol-champions/v1/inventories/{summoner_id}/skins-minimal"))
+                .await
+                .unwrap_or_else(|e| {
+                    debug!(error = %e, "образы с названиями не загрузились");
+                    None
+                })
+        } else {
+            None
+        };
+        let skin_list: Vec<OwnedSkin> = skins
+            .unwrap_or_default()
+            .into_iter()
+            // Образы копий чемпионов для особых режимов (championId от 10 000) — тоже копии.
+            .filter(|s| s.ownership.owned && !s.is_base && s.id > 0 && s.champion_id < 10_000)
+            .map(|s| OwnedSkin {
+                id: s.id,
+                champion_id: s.champion_id,
+                name: s.name,
+            })
+            .collect();
+        let skin_count = if skin_list.is_empty() {
+            let items: Vec<LcuInventoryItem> = self
+                .get_json("/lol-inventory/v2/inventory/CHAMPION_SKIN")
+                .await?
+                .unwrap_or_default();
+            items.iter().filter(|s| s.owned).count() as u32
+        } else {
+            skin_list.len() as u32
+        };
+
         Ok(Inventory {
-            champions: champions.iter().filter(|c| c.ownership.owned).count() as u32,
-            skins: skins.iter().filter(|s| s.owned).count() as u32,
+            champions: champion_list.len() as u32,
+            skins: skin_count,
             blue_essence: self.wallet("lol_blue_essence").await?,
             orange_essence: self.wallet("lol_orange_essence").await?,
             rp: self.wallet("RP").await?,
             fetched_at,
+            champion_list,
+            skin_list,
+            honor_level: self.honor_level().await,
+            restrictions: self.restrictions().await,
         })
+    }
+
+    /// Уровень чести; `None` — клиент не ответил.
+    async fn honor_level(&self) -> Option<i32> {
+        let profile: Option<LcuHonorProfile> = self.get_json("/lol-honor-v2/v1/profile").await.ok().flatten();
+        profile.map(|p| p.honor_level)
+    }
+
+    /// Действующие ограничения аккаунта. Когда ограничения нет, клиент отвечает 404
+    /// или нулями — тогда его нет и в списке. Ошибки не мешают остальному инвентарю.
+    async fn restrictions(&self) -> Vec<Restriction> {
+        let mut list = Vec::new();
+        let chat: Option<LcuChatRestriction> =
+            self.get_json("/lol-player-behavior/v1/chat-restriction").await.ok().flatten();
+        if let Some(chat) = chat.filter(|c| c.games_remaining > 0 || c.expiration_millis > 0) {
+            list.push(Restriction {
+                kind: RestrictionKind::Chat,
+                games_left: chat.games_remaining.max(0),
+                until: (chat.expiration_millis / 1000) as i64,
+            });
+        }
+        let ranked: Option<LcuRankedRestriction> =
+            self.get_json("/lol-leaver-buster/v1/ranked-restriction").await.ok().flatten();
+        if let Some(ranked) = ranked.filter(|r| r.punished_games_remaining > 0) {
+            list.push(Restriction {
+                kind: RestrictionKind::Ranked,
+                games_left: i64::from(ranked.punished_games_remaining),
+                until: 0,
+            });
+        }
+        let leaver: Vec<LcuLeaverNotification> = self
+            .get_json("/lol-leaver-buster/v1/notifications")
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        if let Some(games) = leaver
+            .iter()
+            .filter(|n| n.kind == "PunishedGamesRemaining")
+            .map(|n| n.punished_games_remaining)
+            .max()
+            .filter(|g| *g > 0)
+        {
+            list.push(Restriction {
+                kind: RestrictionKind::LowPriority,
+                games_left: i64::from(games),
+                until: 0,
+            });
+        }
+        list
+    }
+
+    /// Расписание турниров Clash на сервере клиента (пусто — турниров нет).
+    pub async fn clash_tournaments(&self) -> AppResult<Vec<LcuClashTournament>> {
+        Ok(self.get_json("/lol-clash/v1/all-tournaments").await?.unwrap_or_default())
     }
 
     /// Текущая игра (`None` — игры нет).

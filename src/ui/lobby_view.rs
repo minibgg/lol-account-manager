@@ -1,11 +1,18 @@
 //! Вкладка «Лобби» в стиле терминала: ваша группа, команда в выборе чемпионов и в игре —
 //! таблицей с рангами. Щелчок по строке — профиль игрока на op.gg; клавиши `c` —
 //! скопировать ники, `o` — мультипоиск op.gg (они же — подсказки в нижней строке окна).
+//!
+//! Пометки после ника: «↺3» — вы уже играли с ним (или против него) 3 раза, по архиву игр
+//! всех ваших аккаунтов; «смурф?» — новый аккаунт, который играет как опытный. Подробности —
+//! в подсказке при наведении на строку. Пока лобби нет — расписание турниров Clash.
 
 use eframe::egui::{self, Align, Color32, CursorIcon, Layout, Rect, RichText, Sense, Stroke, pos2, vec2};
 
-use crate::lobby::{self, EnemyPlayer, LobbyPhase, LobbyPlayer, LobbyState, RecentForm};
+use crate::clash::ClashDay;
+use crate::lobby::{self, Encounters, EnemyPlayer, LobbyPhase, LobbyPlayer, LobbyState, RecentForm};
 use crate::riot::{RankedStats, Region, RiotId};
+use crate::storage::unix_now;
+use crate::ui::format;
 use crate::ui::terminal::{self, FONT, ROW_HEIGHT, job};
 use crate::ui::theme::{self, white};
 
@@ -48,9 +55,10 @@ pub fn open_multisearch(ctx: &egui::Context, state: &LobbyState, region: Option<
     }
 }
 
-/// Рисует вкладку. `region` — сервер клиента League (для ссылок на op.gg).
+/// Рисует вкладку. `region` — сервер клиента League (для ссылок на op.gg), `schedule` —
+/// ближайшие дни Clash (показываются, пока лобби нет).
 /// Возвращает true, если щелчком по игроку открыли его профиль.
-pub fn show(ui: &mut egui::Ui, state: &LobbyState, region: Option<Region>) -> bool {
+pub fn show(ui: &mut egui::Ui, state: &LobbyState, region: Option<Region>, schedule: &[ClashDay]) -> bool {
     let found = state.players.iter().filter(|p| p.riot_id.is_some()).count();
     header(ui, state, found);
     if let Some(problem) = &state.problem {
@@ -60,6 +68,10 @@ pub fn show(ui: &mut egui::Ui, state: &LobbyState, region: Option<Region>) -> bo
 
     if state.players.is_empty() && state.enemies.is_empty() {
         empty_state(ui, state.phase);
+        if !schedule.is_empty() {
+            ui.add_space(14.0);
+            clash_schedule(ui, schedule);
+        }
         return false;
     }
     let mut opened = false;
@@ -102,21 +114,28 @@ fn table_head(ui: &mut egui::Ui, headers: &[&str], columns: &[f32]) {
     ui.add_space(4.0);
 }
 
-/// Строка таблицы, по которой можно щёлкнуть (профиль на op.gg). Возвращает
-/// (место строки, наведена ли, щёлкнули ли).
-fn link_row(ui: &mut egui::Ui, region: Option<Region>, riot_id: Option<&RiotId>) -> (Rect, bool, bool) {
+/// Строка таблицы, по которой можно щёлкнуть (профиль на op.gg). `notes` — пояснения
+/// к пометкам (встречи, смурф) для подсказки. Возвращает (место строки, наведена ли,
+/// щёлкнули ли).
+fn link_row(ui: &mut egui::Ui, region: Option<Region>, riot_id: Option<&RiotId>, notes: &[String]) -> (Rect, bool, bool) {
     let link = match (region, riot_id) {
         (Some(region), Some(id)) => Some(lobby::opgg_profile_url(region, id)),
         _ => None,
     };
     let sense = if link.is_some() { Sense::click() } else { Sense::hover() };
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), sense);
+    let mut hint = notes.join("\n\n");
     let Some(url) = link else {
+        if !hint.is_empty() {
+            response.on_hover_text(hint);
+        }
         return (rect, false, false);
     };
-    let response = response
-        .on_hover_cursor(CursorIcon::PointingHand)
-        .on_hover_text("Открыть профиль на op.gg");
+    if !hint.is_empty() {
+        hint.push_str("\n\n");
+    }
+    hint.push_str("Щелчок — профиль на op.gg");
+    let response = response.on_hover_cursor(CursorIcon::PointingHand).on_hover_text(hint);
     let clicked = response.clicked();
     if clicked {
         ui.ctx().open_url(egui::OpenUrl::new_tab(url));
@@ -131,12 +150,38 @@ fn enemy_table(ui: &mut egui::Ui, enemies: &[EnemyPlayer], region: Option<Region
     ui.push_id("lobby_enemies", |ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
         for enemy in enemies {
-            let (rect, hovered, clicked) = link_row(ui, region, enemy.riot_id.as_ref());
-            enemy_row(ui, rect, enemy, hovered);
+            let smurf = lobby::smurf_hint(enemy.profile.as_ref(), enemy.form.as_ref());
+            let notes = notes(enemy.met.as_ref(), smurf.as_deref());
+            let (rect, hovered, clicked) = link_row(ui, region, enemy.riot_id.as_ref(), &notes);
+            enemy_row(ui, rect, enemy, smurf.is_some(), hovered);
             opened |= clicked;
         }
     });
     opened
+}
+
+/// Пояснения к пометкам строки — для подсказки при наведении.
+fn notes(met: Option<&Encounters>, smurf: Option<&str>) -> Vec<String> {
+    let mut notes = Vec::new();
+    if let Some(met) = met {
+        notes.push(met.describe(unix_now()));
+    }
+    if let Some(smurf) = smurf {
+        notes.push(format!("{smurf} Это только догадка по цифрам."));
+    }
+    notes
+}
+
+/// Пометки после ника: « ↺3», « смурф?».
+fn marks(met: Option<&Encounters>, smurf: bool) -> Vec<(String, Color32)> {
+    let mut marks = Vec::new();
+    if let Some(met) = met {
+        marks.push((format!(" {}", met.mark()), theme::AMBER_TEXT));
+    }
+    if smurf {
+        marks.push((" смурф?".to_string(), theme::RED_TEXT));
+    }
+    marks
 }
 
 /// «3 игры · 67%»; ни одной игры на нём среди последних — «0 из 20» (возможно, первая).
@@ -148,7 +193,7 @@ pub(crate) fn champion_form(form: Option<&RecentForm>) -> (String, Color32) {
         Some(f) => {
             let wr = f.champion_wins * 100 / f.champion_games;
             let color = if f.champion_games * 4 >= f.games { theme::ACCENT_TEXT } else { theme::TEXT };
-            (format!("{} · {wr}%", games_word(f.champion_games)), color)
+            (format!("{} · {wr}%", lobby::games_count(f.champion_games)), color)
         }
     }
 }
@@ -178,20 +223,8 @@ pub(crate) fn recent_form(form: Option<&RecentForm>) -> Vec<(String, Color32)> {
     parts
 }
 
-/// «1 игра», «3 игры», «5 игр».
-fn games_word(n: u32) -> String {
-    let word = match (n % 10, n % 100) {
-        (1, 11) => "игр",
-        (1, _) => "игра",
-        (2..=4, 12..=14) => "игр",
-        (2..=4, _) => "игры",
-        _ => "игр",
-    };
-    format!("{n} {word}")
-}
-
 /// Строка противника: «бот  ник#тег  джинкс  алмаз II 64lp · 120W  3 игры · 67%  55% из 20 …».
-fn enemy_row(ui: &egui::Ui, rect: Rect, enemy: &EnemyPlayer, hovered: bool) {
+fn enemy_row(ui: &egui::Ui, rect: Rect, enemy: &EnemyPlayer, smurf: bool, hovered: bool) {
     let painter = ui.painter_at(rect);
     if hovered {
         painter.rect_filled(rect, 0, white(7));
@@ -204,13 +237,14 @@ fn enemy_row(ui: &egui::Ui, rect: Rect, enemy: &EnemyPlayer, hovered: bool) {
     let (on_champion, on_champion_color) = champion_form(enemy.form.as_ref());
     let form = recent_form(enemy.form.as_ref());
     let form: Vec<(&str, Color32)> = form.iter().map(|(t, c)| (t.as_str(), *c)).collect();
-    let name = match &enemy.riot_id {
+    let mut name = match &enemy.riot_id {
         Some(id) => vec![
             (id.game_name.clone(), theme::TEXT),
             (format!("#{}", id.tag_line), theme::TEXT_MUTED),
         ],
         None => vec![("загружаю…".into(), theme::TEXT_HINT)],
     };
+    name.extend(marks(enemy.met.as_ref(), smurf));
     let name: Vec<(&str, Color32)> = name.iter().map(|(t, c)| (t.as_str(), *c)).collect();
 
     let cells = [
@@ -315,6 +349,45 @@ fn empty_state(ui: &mut egui::Ui, phase: LobbyPhase) {
         });
 }
 
+/// Ближайшие дни Clash: «вс 22 нояб, 19:00  через 3 ч  worlds 2024 · день 2  вы в команде».
+fn clash_schedule(ui: &mut egui::Ui, days: &[ClashDay]) {
+    ui.label(RichText::new("clash").font(theme::mono(12.5)).color(theme::ACCENT_TEXT));
+    ui.add_space(4.0);
+    let now = unix_now();
+    let font = theme::mono(FONT);
+    for day in days {
+        let mut parts: Vec<(String, Color32)> = vec![
+            (format::local_datetime(day.start), theme::TEXT),
+            (format!("   {}", format::until(day.start, now)), theme::TEXT_MUTED),
+        ];
+        let mut about = Vec::new();
+        if !day.name.is_empty() {
+            about.push(day.name.clone());
+        }
+        let day_label = day.day_label();
+        if !day_label.is_empty() {
+            about.push(day_label);
+        }
+        if !about.is_empty() {
+            parts.push((format!("   {}", about.join(" · ")), theme::TEXT_MUTED));
+        }
+        let (status, color) = if day.registered {
+            ("вы в команде".to_string(), theme::GREEN_TEXT)
+        } else if day.lock_in_open(now) {
+            ("идёт подтверждение участия".to_string(), theme::ACCENT_TEXT)
+        } else if day.lock_in > now {
+            (format!("подтверждение {}", format::until(day.lock_in, now)), theme::TEXT_HINT)
+        } else {
+            (String::new(), theme::TEXT_HINT)
+        };
+        if !status.is_empty() {
+            parts.push((format!("   {status}"), color));
+        }
+        let parts: Vec<(&str, Color32)> = parts.iter().map(|(t, c)| (t.as_str(), *c)).collect();
+        ui.label(job(&parts, &font));
+    }
+}
+
 /// «алмаз II 64lp · 52%» / «алмаз II 64lp · 119 побед» (поражения чужих аккаунтов клиент скрывает).
 pub(crate) fn rank_cell(stats: Option<Option<&RankedStats>>) -> (String, Color32) {
     match stats {
@@ -337,8 +410,13 @@ fn table(ui: &mut egui::Ui, state: &LobbyState, region: Option<Region>) -> bool 
     ui.push_id("lobby_table", |ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
         for player in &state.players {
-            let (rect, hovered, clicked) = link_row(ui, region, player.riot_id.as_ref());
-            row(ui, rect, player, hovered);
+            // У союзников истории нет — смурфа видно только по уровню и рангу.
+            let smurf = (!player.is_self)
+                .then(|| lobby::smurf_hint(player.profile.as_ref(), None))
+                .flatten();
+            let notes = notes(player.met.as_ref(), smurf.as_deref());
+            let (rect, hovered, clicked) = link_row(ui, region, player.riot_id.as_ref(), &notes);
+            row(ui, rect, player, smurf.is_some(), hovered);
             opened |= clicked;
         }
     });
@@ -346,7 +424,7 @@ fn table(ui: &mut egui::Ui, state: &LobbyState, region: Option<Region>) -> bool 
 }
 
 /// Строка игрока: «мид  benjm netanyahu#01irl (вы)  экко  алмаз II 86lp · 52%  …  469».
-fn row(ui: &egui::Ui, rect: Rect, player: &LobbyPlayer, hovered: bool) {
+fn row(ui: &egui::Ui, rect: Rect, player: &LobbyPlayer, smurf: bool, hovered: bool) {
     let painter = ui.painter_at(rect);
     if hovered {
         painter.rect_filled(rect, 0, white(7));
@@ -373,6 +451,7 @@ fn row(ui: &egui::Ui, rect: Rect, player: &LobbyPlayer, hovered: bool) {
             if player.is_self {
                 parts.push((" (вы)".into(), theme::ACCENT_TEXT));
             }
+            parts.extend(marks(player.met.as_ref(), smurf));
             parts
         }
         None => vec![("скрытый игрок".into(), theme::TEXT_HINT)],
@@ -408,9 +487,63 @@ mod tests {
     use super::*;
 
     #[test]
-    fn games_word_declension() {
-        let words: Vec<String> = [1, 2, 5, 11, 12, 21, 22, 25].into_iter().map(games_word).collect();
-        assert_eq!(words, ["1 игра", "2 игры", "5 игр", "11 игр", "12 игр", "21 игра", "22 игры", "25 игр"]);
+    fn marks_and_notes() {
+        let met = Encounters {
+            with: 1,
+            with_wins: 1,
+            against: 2,
+            last_at: unix_now(),
+            last_account: "Main#RU1".into(),
+            ..Encounters::default()
+        };
+        let texts: Vec<String> = marks(Some(&met), true).into_iter().map(|(t, _)| t).collect();
+        assert_eq!(texts, [" ↺3", " смурф?"]);
+        assert!(marks(None, false).is_empty());
+        let notes = notes(Some(&met), Some("Похоже на смурфа: уровень 30."));
+        assert_eq!(notes.len(), 2);
+        assert!(notes[0].contains("Main#RU1") && notes[0].contains("сегодня"), "{}", notes[0]);
+    }
+
+    /// Таблицы с пометками и расписание Clash рисуются без паники.
+    #[test]
+    fn page_draws_with_marks_and_schedule() {
+        let ctx = egui::Context::default();
+        let draw = |state: &LobbyState, schedule: &[ClashDay]| {
+            ctx.run_ui(egui::RawInput::default(), |ui| {
+                show(ui, state, Some(Region::Ru), schedule);
+            })
+            .drop_without_applying_deltas();
+        };
+        let now = unix_now();
+        let day = ClashDay {
+            name: "bilgewater".into(),
+            day: 1,
+            days: 2,
+            lock_in: now - 3600,
+            start: now + 86_400,
+            ..ClashDay::default()
+        };
+        draw(&LobbyState::default(), &[day.clone(), ClashDay { registered: true, ..day }]);
+        let met = Encounters {
+            against: 1,
+            last_at: now,
+            ..Encounters::default()
+        };
+        let state = LobbyState {
+            phase: LobbyPhase::InGame,
+            players: vec![LobbyPlayer {
+                riot_id: RiotId::parse("Pal#RU1").ok(),
+                met: Some(met.clone()),
+                ..LobbyPlayer::default()
+            }],
+            enemies: vec![EnemyPlayer {
+                riot_id: RiotId::parse("Foe#RU1").ok(),
+                met: Some(met),
+                ..EnemyPlayer::default()
+            }],
+            ..LobbyState::default()
+        };
+        draw(&state, &[]);
     }
 
     #[test]

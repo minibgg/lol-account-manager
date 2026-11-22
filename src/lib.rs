@@ -16,6 +16,7 @@ pub mod decay;
 pub mod error;
 pub mod hello;
 pub mod history;
+pub mod hotkey;
 pub mod images;
 pub mod captcha;
 pub mod launcher;

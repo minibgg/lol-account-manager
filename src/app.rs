@@ -20,13 +20,14 @@ use crate::backend::{Backend, is_same_account};
 use crate::clash::ClashState;
 use crate::error::AppError;
 use crate::hello;
+use crate::hotkey::{self, GlobalHotkey};
 use crate::history::{self, Queue, Session};
 use crate::images::ImageKey;
 use crate::lcu::LcuStatus;
 use crate::lobby::{self, LiveGame, LobbyPhase, LobbyState};
 use crate::messages::{Command, CredentialKind, Event, LeagueDirInfo, Secret};
 use crate::riot::models::RECENT_MATCHES;
-use crate::riot::{Division, MatchDetails, MatchSummary, RankedQueues, Region, RiotId};
+use crate::riot::{Division, Inventory, MatchDetails, MatchSummary, RankedQueues, Region, RiotId};
 use crate::storage::{Account, AccountId, AccountInput, SecretChange, unix_now};
 use crate::single_instance;
 use crate::transfer;
@@ -36,6 +37,7 @@ use crate::vault;
 use crate::ui::account_card::CardAction;
 use crate::ui::account_form::{AccountForm, FormAction};
 use crate::ui::account_list::{self, ListView, SortOrder};
+use crate::ui::collection_view::CollectionView;
 use crate::ui::image_store::ImageStore;
 use crate::ui::theme::{self, Weight};
 use crate::ui::widgets::{self, Button, Icon, Tone};
@@ -63,6 +65,8 @@ const SORT_KEY: &str = "sort";
 const TRAY_KEY: &str = "close_to_tray";
 /// Ключ в том же файле: показывать ли уведомления Windows («0» — нет).
 const NOTIFY_KEY: &str = "notifications";
+/// Ключ в window.ron: глобальная клавиша Ctrl+Shift+L («0» — выключена).
+const HOTKEY_KEY: &str = "global_hotkey";
 /// Сколько ждём после игры, прежде чем показать уведомление Windows: клиент League
 /// отдаёт новые LP и саму игру не одновременно — собираем всё в одно уведомление.
 const TOAST_DELAY: Duration = Duration::from_secs(8);
@@ -82,6 +86,8 @@ pub struct Startup {
 struct DesktopState {
     /// Значок в трее. `Some` — «при закрытии сворачивать в трей» включено.
     tray: Option<Tray>,
+    /// Глобальная клавиша Ctrl+Shift+L. `Some` — включена и зарегистрирована.
+    hotkey: Option<GlobalHotkey>,
     /// Запуск вместе с Windows (как записано в реестре).
     autostart: bool,
     /// Спрятать окно в первом же кадре (запуск вместе с Windows сразу в трей).
@@ -278,6 +284,10 @@ pub struct App {
     overview: Option<OverviewView>,
     /// Окно «Профиль» (статистика по архиву игр, клавиша i).
     profile_view: Option<ProfileView>,
+    /// Окно «Коллекция» (на каком аккаунте есть чемпион или образ, клавиша b).
+    collection: Option<CollectionView>,
+    /// Сохранённые инвентари всех аккаунтов (для «Коллекции»); `None` — ещё не загружены.
+    inventories: Option<HashMap<AccountId, Inventory>>,
     /// Только для отладки (LOLAM_DEBUG_PAGE=lobby-demo): лобби из тестовых аккаунтов,
     /// клиент League его не перезаписывает.
     debug_lobby: bool,
@@ -367,6 +377,8 @@ impl App {
             games_view: None,
             profile_view: None,
             overview: None,
+            collection: None,
+            inventories: None,
             debug_lobby: false,
         }
     }
@@ -400,6 +412,15 @@ impl App {
         } else {
             None
         };
+        // Клавиша включена по умолчанию; не удалось (занята другой программой) — без неё.
+        let wants_hotkey = cc.storage.and_then(|s| s.get_string(HOTKEY_KEY)).as_deref() != Some("0");
+        let hotkey = if wants_hotkey && hotkey::is_supported() {
+            GlobalHotkey::new(cc.egui_ctx.clone())
+                .inspect_err(|error| tracing::warn!(%error, "глобальная клавиша не зарегистрирована"))
+                .ok()
+        } else {
+            None
+        };
         let debug_quit_at = std::env::var("LOLAM_DEBUG_QUIT_AFTER")
             .ok()
             .filter(|_| cfg!(debug_assertions))
@@ -409,6 +430,7 @@ impl App {
             // Windows запустила нас при входе в систему, и трей включён — сразу в трей.
             hide_on_start: startup.by_system && tray.is_some(),
             tray,
+            hotkey,
             autostart: autostart::is_enabled(),
             quitting: false,
             show_requests,
@@ -439,6 +461,15 @@ impl App {
                 }
             }
         }
+        // Ctrl+Shift+L: окно не перед глазами — показать; перед глазами — спрятать.
+        let mut hide = false;
+        if self.desktop.hotkey.as_ref().is_some_and(GlobalHotkey::pressed) {
+            if self.desktop.hidden || !self.desktop.focused {
+                show = true;
+            } else {
+                hide = true;
+            }
+        }
         if let Some(at) = self.desktop.debug_quit_at {
             let left = at.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -452,6 +483,18 @@ impl App {
             self.quit(ctx);
         } else if show {
             self.show_window(ctx);
+        } else if hide {
+            self.hide_window(ctx);
+        }
+    }
+
+    /// Спрятать окно клавишей: с треем — в трей, без него — свернуть на панель задач.
+    fn hide_window(&mut self, ctx: &egui::Context) {
+        if self.desktop.tray.is_some() {
+            self.desktop.hidden = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        } else {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         }
     }
 
@@ -839,12 +882,17 @@ impl App {
                 }
             }
             Event::InventoryLoaded { account, inventory } => {
+                // Список инвентарей уже загружен — обновим в нём этот аккаунт.
+                if let (Some(map), Some(inventory)) = (&mut self.inventories, &inventory) {
+                    map.insert(account, inventory.clone());
+                }
                 if let Some(view) = &mut self.profile_view
                     && view.account == account
                 {
                     view.inventory = Some(inventory);
                 }
             }
+            Event::Inventories(list) => self.inventories = Some(list.into_iter().collect()),
             Event::UpdateChecked { result, manual } => self.update_checked(result, manual),
             Event::UpdateProgress { received, total } => self.update.progress = Some((received, total)),
             Event::UpdateInstalling => {
@@ -1083,6 +1131,11 @@ impl App {
                 self.lobby = debug_lobby(&self.accounts);
             }
             "overview" => self.overview = Some(OverviewView::default()),
+            // «collection» или «collection:ари» — сразу с поиском.
+            p if p.starts_with("collection") => {
+                let query = p.strip_prefix("collection:").unwrap_or_default().to_string();
+                self.open_collection(query);
+            }
             "profile" => {
                 if let Some(account) = self.accounts.iter().find(|a| a.archived_games > 0) {
                     self.profile_view = Some(ProfileView::new(account.id));
@@ -1627,6 +1680,7 @@ impl App {
             || self.games_view.is_some()
             || self.profile_view.is_some()
             || self.overview.is_some()
+            || self.collection.is_some()
             || self.command.is_some()
             || ctx.text_edit_focused();
         if busy {
@@ -1636,6 +1690,19 @@ impl App {
             .into_iter()
             .map(Invocation::new)
             .collect()
+    }
+
+    /// Окно «Коллекция» (сразу с поиском, если `query` не пустой).
+    fn open_collection(&mut self, query: String) {
+        self.collection = Some(CollectionView::new(query));
+        // Каждый раз заново: инвентари меняются, когда вы заходите в аккаунты.
+        self.backend.send(Command::LoadInventories);
+        // Русские названия образов — из каталога «Обоев» (грузится один раз).
+        if !self.wallpapers.requested {
+            self.wallpapers.requested = true;
+            self.wallpapers.loading = true;
+            self.backend.send(Command::LoadSkins);
+        }
     }
 
     /// Выполняет действие — с клавиатуры, из командной строки или щелчком.
@@ -1724,6 +1791,7 @@ impl App {
                 self.go_to(Page::Accounts);
                 self.overview = Some(OverviewView::default());
             }
+            A::Collection(query) => self.open_collection(query),
             A::Quit => self.quit(ctx),
             A::Update => {
                 self.go_to(Page::Settings);
@@ -2011,6 +2079,11 @@ impl App {
                 }
             }
         }
+        if let Some(view) = &mut self.collection
+            && view.show(ctx, &self.accounts, self.inventories.as_ref(), &self.wallpapers.skins)
+        {
+            self.collection = None;
+        }
         if let Some(view) = &mut self.profile_view {
             let close = match self.accounts.iter().find(|a| a.id == view.account) {
                 Some(account) => view.show(ctx, account),
@@ -2260,7 +2333,8 @@ impl App {
         let label = |text: &str| RichText::new(text).size(12.5).color(theme::TEXT);
         let mut autostart_on = self.desktop.autostart;
         let mut tray_on = self.desktop.tray.is_some();
-        let (mut autostart_changed, mut tray_changed) = (false, false);
+        let mut hotkey_on = self.desktop.hotkey.is_some();
+        let (mut autostart_changed, mut tray_changed, mut hotkey_changed) = (false, false, false);
         ui.add_enabled_ui(self.desktop.notifier.is_some(), |ui| {
             ui.checkbox(&mut self.desktop.notifications, label("уведомления Windows: результат игры, сгорание ранга, новая версия"));
         });
@@ -2268,6 +2342,21 @@ impl App {
             autostart_changed = ui.checkbox(&mut autostart_on, label("запускать вместе с Windows")).changed();
             tray_changed = ui.checkbox(&mut tray_on, label("при закрытии сворачивать в трей")).changed();
         });
+        ui.add_enabled_ui(hotkey::is_supported(), |ui| {
+            let text = format!("{} из любой программы — показать окно (ещё раз — спрятать)", hotkey::LABEL);
+            hotkey_changed = ui.checkbox(&mut hotkey_on, label(&text)).changed();
+        });
+        if hotkey_changed {
+            self.desktop.result = None;
+            if hotkey_on {
+                match GlobalHotkey::new(ui.ctx().clone()) {
+                    Ok(hotkey) => self.desktop.hotkey = Some(hotkey),
+                    Err(error) => self.desktop.result = Some(Err(error)),
+                }
+            } else {
+                self.desktop.hotkey = None; // сочетание освобождается вместе со значением
+            }
+        }
         if autostart_changed {
             // Запись в реестр — мгновенная, фоновый поток для неё не нужен.
             self.desktop.result = Some(autostart::set_enabled(autostart_on).map(|()| {
@@ -2293,7 +2382,9 @@ impl App {
              рядом с часами или повторный запуск с ярлыка. Выйти совсем — правая кнопка по \
              значку → «Выход» или команда «выход». Если включены автозапуск и трей, при входе в \
              Windows программа запускается сразу в трей, без окна. Уведомления появляются, \
-             только когда окно спрятано или не активно; щелчок по уведомлению открывает окно."
+             только когда окно спрятано или не активно; щелчок по уведомлению открывает окно. \
+             Ctrl+Shift+L показывает окно из любой программы (и из трея), а если окно уже \
+             перед глазами — прячет его."
         } else {
             "Автозапуск и трей есть только в Windows."
         };
@@ -2774,6 +2865,7 @@ fn debug_lobby(accounts: &[Account]) -> LobbyState {
                 summoner_level: c.summoner_level,
                 ranked: c.ranked.clone(),
             }),
+            met: None,
         })
         .collect();
     players.push(LobbyPlayer {
@@ -2791,6 +2883,15 @@ fn debug_lobby(accounts: &[Account]) -> LobbyState {
             champion: p.champion.clone(),
             position: p.position,
             profile: p.profile.clone(),
+            met: (index == 1).then(|| crate::lobby::Encounters {
+                with: 1,
+                with_wins: 1,
+                against: 2,
+                against_wins: 1,
+                last_at: unix_now() - 3 * 86_400,
+                last_account: "Main#RU1".into(),
+                last_champion: "Ари".into(),
+            }),
             form: (index < 4).then(|| crate::lobby::RecentForm {
                 games: 20,
                 wins: [13, 8, 11, 6][index],
@@ -3005,7 +3106,7 @@ impl eframe::App for App {
                     let opened = if self.clash.is_shown() {
                         clash_view::show(ui, &self.clash, self.client_region())
                     } else {
-                        lobby_view::show(ui, &self.lobby, self.client_region())
+                        lobby_view::show(ui, &self.lobby, self.client_region(), &self.clash.schedule)
                     };
                     if opened {
                         self.notify("Профиль открыт в браузере");
@@ -3072,6 +3173,8 @@ impl eframe::App for App {
         storage.set_string(TRAY_KEY, tray.to_string());
         let notifications = if self.desktop.notifications { "1" } else { "0" };
         storage.set_string(NOTIFY_KEY, notifications.to_string());
+        let hotkey = if self.desktop.hotkey.is_some() { "1" } else { "0" };
+        storage.set_string(HOTKEY_KEY, hotkey.to_string());
     }
 
     /// Внутреннее состояние egui (прокрутка, раскрытые блоки и т. п.) не сохраняем:

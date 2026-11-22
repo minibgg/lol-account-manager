@@ -4,6 +4,7 @@ pub mod account_card;
 pub mod account_form;
 pub mod account_list;
 pub mod clash_view;
+pub mod collection_view;
 pub mod command;
 pub mod format;
 pub mod games_view;

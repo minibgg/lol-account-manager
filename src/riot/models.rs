@@ -677,7 +677,7 @@ pub enum DataSource {
 
 /// Что есть на аккаунте: чемпионы, образы, валюта. Известно только для аккаунта,
 /// в который выполнен вход в клиенте League; последнее увиденное сохраняется в базе.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Inventory {
     pub champions: u32,
     /// Образы чемпионов (скины).
@@ -687,6 +687,70 @@ pub struct Inventory {
     pub rp: i64,
     /// Когда получено (unix-время).
     pub fetched_at: i64,
+    /// Какие именно чемпионы и образы есть — для поиска «на каком аккаунте есть Ари».
+    /// `serde(default)` — в записях старых версий этих полей нет.
+    #[serde(default)]
+    pub champion_list: Vec<OwnedChampion>,
+    #[serde(default)]
+    pub skin_list: Vec<OwnedSkin>,
+    /// Уровень чести (0–5); `None` — клиент не ответил.
+    #[serde(default)]
+    pub honor_level: Option<i32>,
+    /// Действующие ограничения: чат, ранговые, очередь с задержкой.
+    #[serde(default)]
+    pub restrictions: Vec<Restriction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnedChampion {
+    pub id: i32,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnedSkin {
+    pub id: i32,
+    pub champion_id: i32,
+    pub name: String,
+}
+
+/// Ограничение аккаунта (наказание системы поведения).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Restriction {
+    pub kind: RestrictionKind,
+    /// Сколько игр ещё осталось; 0 — ограничение по времени или неизвестно.
+    pub games_left: i64,
+    /// До какого момента (unix-время); 0 — неизвестно.
+    pub until: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RestrictionKind {
+    /// Ограничен чат.
+    Chat,
+    /// Нельзя играть в ранговые.
+    Ranked,
+    /// Очередь с задержкой (low priority queue) за выходы из игр.
+    LowPriority,
+}
+
+impl Restriction {
+    /// «чат ограничен · ещё 5 игр».
+    pub fn label(&self, now: i64) -> String {
+        let what = match self.kind {
+            RestrictionKind::Chat => "чат ограничен",
+            RestrictionKind::Ranked => "ранговые закрыты",
+            RestrictionKind::LowPriority => "очередь с задержкой",
+        };
+        if self.games_left > 0 {
+            format!("{what} · ещё {}", crate::lobby::games_count(self.games_left.clamp(0, u32::MAX as i64) as u32))
+        } else if self.until > now {
+            let days = (self.until - now + 86_399) / 86_400;
+            format!("{what} · ещё {days} дн.")
+        } else {
+            what.to_string()
+        }
+    }
 }
 
 /// spectator-v5: игра, которая идёт прямо сейчас.
