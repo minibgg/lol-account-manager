@@ -3,7 +3,7 @@
 //! Логины и пароли сюда не попадают никогда — только флаги «есть логин / есть пароль»
 //! и `secret_ref` — случайный UUID, по которому запись ищется в системном хранилище.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -539,6 +539,24 @@ impl Db {
     /// Сохранить подробности игры, которая уже есть в архиве.
     pub fn save_details(&mut self, id: AccountId, details: &MatchDetails) -> AppResult<()> {
         archive_details(&self.conn, id, details)
+    }
+
+    /// Номера игр архива, у которых уже есть подробности, — их загрузка истории пропускает.
+    pub fn matches_with_details(&self, id: AccountId) -> AppResult<HashSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT match_id FROM matches WHERE account_id = ?1 AND details_json IS NOT NULL")?;
+        let ids = stmt.query_map(params![id], |r| r.get(0))?.collect::<Result<_, _>>()?;
+        Ok(ids)
+    }
+
+    /// Сохранить игру целиком — итог и подробности (загрузка старой истории).
+    pub fn archive_game(&mut self, id: AccountId, game: &MatchSummary, details: &MatchDetails) -> AppResult<()> {
+        let tx = self.conn.transaction()?;
+        archive_summary(&tx, id, game)?;
+        archive_details(&tx, id, details)?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Игры архива без подробностей, новые первыми — их догружает фоновый поток.
@@ -1182,6 +1200,24 @@ mod tests {
         );
         assert_eq!(sorted("EUW1_2"), [player(Some("Foe#EUW"), false), player(Some("Pal#EUW"), true)]);
         assert!(db.archived_players(12345).unwrap().is_empty());
+    }
+
+    /// Старая игра из загрузки истории ложится в архив сразу с подробностями;
+    /// игры без подробностей в «уже загруженные» не попадают.
+    #[test]
+    fn archive_game_saves_summary_and_details() {
+        let mut db = Db::open_in_memory().unwrap();
+        let a = db.insert_account(&input("Name#EUW", Region::Euw)).unwrap();
+        let mut snap = snapshot("p1", "Name#EUW");
+        snap.matches = Some(vec![game("EUW1_9", true)]);
+        db.save_snapshot(a.id, &snap, 1).unwrap();
+
+        db.archive_game(a.id, &game("EUW1_1", false), &details("EUW1_1")).unwrap();
+
+        let ids: Vec<String> = db.archived_matches(a.id, None).unwrap().into_iter().map(|g| g.id).collect();
+        assert_eq!(ids, ["EUW1_9", "EUW1_1"]);
+        assert_eq!(db.archived_details(a.id, "EUW1_1").unwrap(), Some(details("EUW1_1")));
+        assert_eq!(db.matches_with_details(a.id).unwrap(), HashSet::from(["EUW1_1".to_string()]));
     }
 
     #[test]

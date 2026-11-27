@@ -1,6 +1,8 @@
 //! Окно «Все игры» (клавиша m): архив игр аккаунта — все, что приложение видело,
 //! без ограничения количества. Вид терминала: курсор-строка, ↑ ↓ PgUp PgDn Home End,
 //! Enter или щелчок — подробности игры, Tab — фильтр по очереди, `/` — поиск, Esc — закрыть.
+//! `h` — загрузить в архив всю историю игр через Riot API (обычное обновление берёт
+//! только последние 20), ещё раз `h` — остановить.
 //! Сверху — итог: сколько игр, побед и поражений, винрейт и самые частые чемпионы.
 //! У ранговых игр — ранг аккаунта после игры и сколько LP она принесла (по истории рангов).
 //!
@@ -14,6 +16,7 @@ use eframe::egui::{self, Align, Layout, Margin, Rect, RichText, Sense, Stroke, p
 
 use crate::error::AppError;
 use crate::history::{self, GameRank, Queue, RankPoint};
+use crate::messages::HistoryProgress;
 use crate::riot::{MatchSummary, RiotId};
 use crate::storage::{AccountId, ArchivedPlayer};
 use crate::ui::command::swap_layout;
@@ -112,6 +115,43 @@ pub enum GamesAction {
     Close,
     /// Открыть подробности этой игры.
     Open(MatchSummary),
+    /// Загрузить всю историю игр аккаунта (`h`).
+    LoadHistory,
+    /// Остановить загрузку истории (`h`, пока она идёт).
+    StopHistory,
+}
+
+/// Загрузка всей истории аккаунта — для строки в окне «Все игры».
+#[derive(Debug, Clone, Default)]
+pub struct HistoryLoad {
+    pub progress: HistoryProgress,
+    pub running: bool,
+    /// Чем кончилась прошлая загрузка, если ошибкой.
+    pub error: Option<AppError>,
+}
+
+impl HistoryLoad {
+    /// Что сделать клавишей `h`: идёт — остановить, иначе — загрузить (или продолжить).
+    fn toggle(load: Option<&Self>) -> GamesAction {
+        if load.is_some_and(|l| l.running) { GamesAction::StopHistory } else { GamesAction::LoadHistory }
+    }
+
+    /// Строка о загрузке: текст и его цвет.
+    fn status(load: Option<&Self>) -> (String, egui::Color32) {
+        let Some(load) = load else {
+            return ("загрузить всю историю игр из Riot API — для статистики, напарников и поиска".into(), theme::TEXT_HINT);
+        };
+        let HistoryProgress { scanned, saved, stopped } = load.progress;
+        if load.running {
+            let text = format!("загружаю историю… +{saved} игр, просмотрено {scanned} — можно закрыть окно");
+            return (text, theme::ACCENT_TEXT);
+        }
+        match &load.error {
+            Some(error) => (format!("! {error} — загружено +{saved}, h — продолжить"), theme::RED_TEXT),
+            None if stopped => (format!("остановлено: +{saved} игр, h — продолжить с того же места"), theme::TEXT_MUTED),
+            None => (format!("история загружена: +{saved} новых игр, всего просмотрено {scanned}"), theme::GREEN_TEXT),
+        }
+    }
 }
 
 impl GamesView {
@@ -153,7 +193,13 @@ impl GamesView {
 
     /// Рисует окно. `keys` — false, если поверх открыто другое окно (подробности игры):
     /// тогда клавиши достаются ему. `history` — история рангов аккаунта.
-    pub fn show(&mut self, ctx: &egui::Context, keys: bool, history: &[RankPoint]) -> GamesAction {
+    pub fn show(
+        &mut self,
+        ctx: &egui::Context,
+        keys: bool,
+        history: &[RankPoint],
+        load: Option<&HistoryLoad>,
+    ) -> GamesAction {
         let mut action = GamesAction::None;
         if let Some(Ok(games)) = &self.games
             && self.ranks_for != (games.len(), history.len())
@@ -162,15 +208,15 @@ impl GamesView {
             self.ranks_for = (games.len(), history.len());
         }
         if keys {
-            action = self.handle_keys(ctx);
+            action = self.handle_keys(ctx, load);
         }
         let height = (ctx.content_rect().height() - 230.0).max(140.0);
         let modal = egui::Modal::new(egui::Id::unique("games_view"))
             .frame(theme::dialog_frame().inner_margin(Margin::symmetric(20, 16)))
             .show(ctx, |ui| {
                 ui.set_width(WIDTH);
-                if self.header(ui) {
-                    action = GamesAction::Close;
+                if let Some(clicked) = self.header(ui, load) {
+                    action = clicked;
                 }
                 ui.add_space(8.0);
                 match &self.games {
@@ -193,12 +239,12 @@ impl GamesView {
         action
     }
 
-    fn handle_keys(&mut self, ctx: &egui::Context) -> GamesAction {
+    fn handle_keys(&mut self, ctx: &egui::Context, load: Option<&HistoryLoad>) -> GamesAction {
         use egui::Key;
         let none = egui::Modifiers::NONE;
-        // Идёт ввод в поиске: буквы (j k) и Home End — поля ввода, а не списка.
+        // Идёт ввод в поиске: буквы (j k h) и Home End — поля ввода, а не списка.
         let typing = ctx.memory(|m| m.has_focus(search_id()));
-        let (up, down, page_up, page_down, home, end, enter, tab, find, escape) = ctx.input_mut(|i| {
+        let (up, down, page_up, page_down, home, end, enter, tab, find, escape, history) = ctx.input_mut(|i| {
             (
                 i.consume_key(none, Key::ArrowUp) || (!typing && i.consume_key(none, Key::K)),
                 i.consume_key(none, Key::ArrowDown) || (!typing && i.consume_key(none, Key::J)),
@@ -212,8 +258,12 @@ impl GamesView {
                 i.consume_key(egui::Modifiers::COMMAND, Key::F) || (!typing && consume_text(i, "/")),
                 // Esc при непустом поиске — очистить поиск, а не закрыть окно.
                 (typing || !self.query.is_empty()) && i.consume_key(none, Key::Escape),
+                !typing && i.consume_key(none, Key::H),
             )
         });
+        if history {
+            return HistoryLoad::toggle(load);
+        }
         if find {
             self.focus_search = true;
         }
@@ -261,16 +311,19 @@ impl GamesView {
         GamesAction::None
     }
 
-    /// Заголовок, итог по играм и фильтр. Возвращает true — «закрыть».
-    fn header(&mut self, ui: &mut egui::Ui) -> bool {
-        let mut close = false;
+    /// Заголовок, итог по играм, фильтр, поиск и загрузка истории.
+    /// Возвращает, что нажато мышью: «закрыть» или «загрузить / остановить историю».
+    fn header(&mut self, ui: &mut egui::Ui, load: Option<&HistoryLoad>) -> Option<GamesAction> {
+        let mut clicked = None;
         let font = theme::mono(FONT);
         let k = theme::TEXT_HINT;
         ui.horizontal(|ui| {
             ui.label(RichText::new("все игры").font(theme::mono(15.0)).color(theme::TEXT).semibold());
             ui.label(RichText::new(self.owner.to_string()).font(font.clone()).color(theme::TEXT_MUTED));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                close = terminal::key_button(ui, "esc", "закрыть", false).clicked();
+                if terminal::key_button(ui, "esc", "закрыть", false).clicked() {
+                    clicked = Some(GamesAction::Close);
+                }
             });
         });
 
@@ -313,7 +366,23 @@ impl GamesView {
             }
         });
         self.search_field(ui);
-        close
+
+        // Загрузка всей истории — h или щелчок.
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 12.0;
+            let running = load.is_some_and(|l| l.running);
+            let label = if running { "стоп" } else { "вся история" };
+            if terminal::key_button(ui, "h", label, false).clicked() {
+                clicked = Some(HistoryLoad::toggle(load));
+            }
+            let (text, color) = HistoryLoad::status(load);
+            ui.label(RichText::new(text).font(theme::mono(11.5)).color(color));
+            if running {
+                // Перерисовать, когда придут новые игры (их присылает фоновый поток).
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+            }
+        });
+        clicked
     }
 
     /// Поле поиска: «/ ник или чемпион…». Новый текст — курсор в начало списка.
@@ -529,7 +598,7 @@ mod tests {
             ..Default::default()
         };
         let mut action = GamesAction::None;
-        ctx.run_ui(input, |ui| action = view.show(ui.ctx(), true, &[]))
+        ctx.run_ui(input, |ui| action = view.show(ui.ctx(), true, &[], None))
             .drop_without_applying_deltas();
         action
     }
@@ -634,5 +703,32 @@ mod tests {
         assert!(matches!(frame(&ctx, &mut view, vec![press(egui::Key::Escape)]), GamesAction::None));
         assert!(view.query.is_empty(), "Esc очистил поиск, окно открыто");
         assert!(matches!(frame(&ctx, &mut view, vec![press(egui::Key::Escape)]), GamesAction::Close));
+    }
+
+    /// h — загрузить всю историю, пока идёт — остановить; при вводе в поиске h — буква.
+    #[test]
+    fn h_starts_and_stops_history() {
+        let ctx = egui::Context::default();
+        let mut view = GamesView::new(1, RiotId::parse("Name#RU1").unwrap());
+        view.games = Some(Ok(vec![game(245, "Экко", 420, true)]));
+        let show = |view: &mut GamesView, load: Option<&HistoryLoad>, events| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1100.0, 600.0))),
+                events,
+                ..Default::default()
+            };
+            let mut action = GamesAction::None;
+            ctx.run_ui(input, |ui| action = view.show(ui.ctx(), true, &[], load)).drop_without_applying_deltas();
+            action
+        };
+        assert!(matches!(show(&mut view, None, vec![press(egui::Key::H)]), GamesAction::LoadHistory));
+        let running = HistoryLoad { running: true, ..Default::default() };
+        assert!(matches!(show(&mut view, Some(&running), vec![press(egui::Key::H)]), GamesAction::StopHistory));
+        let stopped = HistoryLoad::default();
+        assert!(matches!(show(&mut view, Some(&stopped), vec![press(egui::Key::H)]), GamesAction::LoadHistory));
+
+        show(&mut view, None, vec![egui::Event::Text("/".into())]);
+        show(&mut view, None, vec![]);
+        assert!(matches!(show(&mut view, None, vec![press(egui::Key::H)]), GamesAction::None), "в поиске h — не команда");
     }
 }

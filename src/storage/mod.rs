@@ -184,6 +184,14 @@ impl Storage {
         self.db.matches_without_details(id, limit)
     }
 
+    pub fn matches_with_details(&self, id: AccountId) -> AppResult<std::collections::HashSet<String>> {
+        self.db.matches_with_details(id)
+    }
+
+    pub fn archive_game(&mut self, id: AccountId, game: &MatchSummary, details: &MatchDetails) -> AppResult<()> {
+        self.db.archive_game(id, game, details)
+    }
+
     pub fn archived_players(&self, id: AccountId) -> AppResult<std::collections::HashMap<String, Vec<ArchivedPlayer>>> {
         self.db.archived_players(id)
     }
