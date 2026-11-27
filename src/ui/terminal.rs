@@ -593,7 +593,7 @@ pub enum CommandEvent {
 }
 
 impl CommandLine {
-    /// Рисует строку «:войти dr4g▌» и подсказки над ней (слой поверх окна).
+    /// Рисует строку «:войти fr0st▌» и подсказки над ней (слой поверх окна).
     /// `suggestions` посчитаны окном по текущему тексту.
     pub fn show(&mut self, ui: &mut Ui, suggestions: &[Suggestion]) -> CommandEvent {
         let id = egui::Id::unique("command_line");
@@ -652,7 +652,7 @@ impl CommandLine {
                 .font(theme::mono(13.0))
                 .text_color(theme::TEXT)
                 .frame(egui::Frame::NONE)
-                .hint_text(RichText::new("команда или ник — например «войти dr4g»").color(theme::TEXT_HINT))
+                .hint_text(RichText::new("команда или ник — например «войти fr0st»").color(theme::TEXT_HINT))
                 .desired_width(ui.available_width());
             let response = ui.add(edit);
             if !response.has_focus() {
@@ -697,7 +697,7 @@ impl CommandLine {
     }
 }
 
-/// Одна подсказка: «войти dr4gm4shroom#1933   логин в буфер…». Возвращает true при щелчке.
+/// Одна подсказка: «войти fr0stl4nce#1111   логин в буфер…». Возвращает true при щелчке.
 fn suggestion_row(ui: &mut Ui, s: &Suggestion, selected: bool) -> bool {
     let font = theme::mono(12.5);
     let (rect, response) = ui.allocate_exact_size(vec2(520.0, 24.0), Sense::click());

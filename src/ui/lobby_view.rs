@@ -423,7 +423,7 @@ fn table(ui: &mut egui::Ui, state: &LobbyState, region: Option<Region>) -> bool 
     opened
 }
 
-/// Строка игрока: «мид  benjm netanyahu#01irl (вы)  экко  алмаз II 86lp · 52%  …  469».
+/// Строка игрока: «мид  quiet otter#00ex (вы)  экко  алмаз II 86lp · 52%  …  469».
 fn row(ui: &egui::Ui, rect: Rect, player: &LobbyPlayer, smurf: bool, hovered: bool) {
     let painter = ui.painter_at(rect);
     if hovered {

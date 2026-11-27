@@ -1913,7 +1913,7 @@ impl App {
     }
 
     /// Действие с конкретным аккаунтом. Курсор переезжает на него (важно для команд
-    /// вроде «войти benjm»: сразу видно, с каким аккаунтом работаем).
+    /// вроде «войти quiet»: сразу видно, с каким аккаунтом работаем).
     fn run_on(&mut self, action: Action, id: AccountId, ctx: &egui::Context) {
         use Action as A;
         let Some(account) = self.accounts.iter().find(|a| a.id == id) else {

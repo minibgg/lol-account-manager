@@ -1,4 +1,4 @@
-//! Командная строка (`:` или Ctrl+K): «войти dr4g», «пароль benjm», «обновить все»,
+//! Командная строка (`:` или Ctrl+K): «войти fr0st», «пароль quiet», «обновить все»,
 //! «тег smurf», «сортировка имя». По мере ввода показываются подсказки; Tab дописывает
 //! выбранную, Enter выполняет.
 //!
@@ -45,7 +45,7 @@ impl Invocation {
 /// Одна подсказка под командной строкой.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Suggestion {
-    /// Как показать: «войти dr4gm4shroom#1933».
+    /// Как показать: «войти fr0stl4nce#1111».
     pub label: String,
     /// Пояснение серым справа.
     pub hint: &'static str,
@@ -279,7 +279,7 @@ pub fn suggest(input: &str, targets: &[Target], tags: &[String], selected: Optio
         return out;
     }
 
-    // Первое слово и остальное: «войти dr4g» → («войти», «dr4g»).
+    // Первое слово и остальное: «войти fr0st» → («войти», «fr0st»).
     let (head, rest) = match lower.split_once(char::is_whitespace) {
         Some((head, rest)) => (head, Some(rest.trim_start())),
         None => (lower.as_str(), None),
@@ -442,7 +442,7 @@ mod tests {
     use super::*;
 
     fn targets() -> Vec<Target> {
-        ["benjm netanyahu#01irl", "ДемоСмурф#KR1", "dr4gm4shroom#1933", "Cäps#EUW"]
+        ["quiet otter#00ex", "ДемоСмурф#KR1", "fr0stl4nce#1111", "Cäps#EUW"]
             .iter()
             .enumerate()
             .map(|(i, name)| Target {
@@ -461,21 +461,21 @@ mod tests {
     fn layout_swap_both_ways() {
         assert_eq!(swap_layout("djqnb"), "войти");
         assert_eq!(swap_layout("пароль"), "gfhjkm");
-        assert_eq!(swap_layout("dr4g"), "вк4п");
+        assert_eq!(swap_layout("fr0st"), "ак0ые");
     }
 
     #[test]
     fn command_with_account() {
         assert_eq!(first("войти dr4"), Some(Invocation::on(Action::Login, 3)));
-        assert_eq!(first("пароль benjm"), Some(Invocation::on(Action::CopyPassword, 1)));
+        assert_eq!(first("пароль quiet"), Some(Invocation::on(Action::CopyPassword, 1)));
         // Не та раскладка: и команда, и ник.
         assert_eq!(first("djqnb dr4"), Some(Invocation::on(Action::Login, 3)));
         assert_eq!(first("login демо"), Some(Invocation::on(Action::Login, 2)));
         // Часть ника из середины.
-        assert_eq!(first("история shroom"), Some(Invocation::on(Action::History, 3)));
-        assert_eq!(first("игры benjm"), Some(Invocation::on(Action::Games, 1)));
-        assert_eq!(first("загрузить benjm"), Some(Invocation::on(Action::LoadHistory, 1)));
-        assert_eq!(first("профиль benjm"), Some(Invocation::on(Action::Profile, 1)));
+        assert_eq!(first("история lance"), Some(Invocation::on(Action::History, 3)));
+        assert_eq!(first("игры quiet"), Some(Invocation::on(Action::Games, 1)));
+        assert_eq!(first("загрузить quiet"), Some(Invocation::on(Action::LoadHistory, 1)));
+        assert_eq!(first("профиль quiet"), Some(Invocation::on(Action::Profile, 1)));
         assert_eq!(first("метка новый"), Some(Invocation::new(Action::ToggleTag("новый".into()))));
         // Без ника — выбранный курсором (id 3) первым.
         assert_eq!(first("войти "), Some(Invocation::on(Action::Login, 3)));
@@ -484,7 +484,7 @@ mod tests {
     #[test]
     fn partial_command_uses_selected_account() {
         let list = suggest("пар", &targets(), &[], Some(3));
-        assert_eq!(list[0].label, "пароль dr4gm4shroom#1933");
+        assert_eq!(list[0].label, "пароль fr0stl4nce#1111");
         assert_eq!(list[0].run, Some(Invocation::on(Action::CopyPassword, 3)));
         // Сортировке нужно слово — Enter её только дописывает.
         let sort = suggest("сорт", &targets(), &[], Some(3));
@@ -512,7 +512,7 @@ mod tests {
 
     #[test]
     fn plain_text_jumps_to_account() {
-        assert_eq!(first("benjm"), Some(Invocation::on(Action::Select, 1)));
+        assert_eq!(first("quiet"), Some(Invocation::on(Action::Select, 1)));
         assert_eq!(first("cäps"), Some(Invocation::on(Action::Select, 4)));
         assert!(suggest("нет такого", &targets(), &[], None).is_empty());
     }
@@ -520,7 +520,7 @@ mod tests {
     #[test]
     fn empty_input_offers_common_commands() {
         let list = suggest("", &targets(), &[], Some(3));
-        assert_eq!(list[0].label, "войти dr4gm4shroom#1933");
+        assert_eq!(list[0].label, "войти fr0stl4nce#1111");
         assert!(list.iter().any(|s| s.run == Some(Invocation::new(Action::RefreshAll))));
         assert!(list.len() <= MAX_SUGGESTIONS);
         // Без выбранного аккаунта — только общие команды.
