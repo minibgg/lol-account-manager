@@ -1202,7 +1202,7 @@ impl App {
             }
             "command" => {
                 self.command = Some(CommandLine {
-                    input: "войти dr4".into(),
+                    input: "войти fr0".into(),
                     selected: 0,
                 });
             }

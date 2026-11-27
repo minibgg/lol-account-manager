@@ -466,13 +466,13 @@ mod tests {
 
     #[test]
     fn command_with_account() {
-        assert_eq!(first("войти dr4"), Some(Invocation::on(Action::Login, 3)));
+        assert_eq!(first("войти fr0"), Some(Invocation::on(Action::Login, 3)));
         assert_eq!(first("пароль quiet"), Some(Invocation::on(Action::CopyPassword, 1)));
         // Не та раскладка: и команда, и ник.
-        assert_eq!(first("djqnb dr4"), Some(Invocation::on(Action::Login, 3)));
+        assert_eq!(first("djqnb fr0"), Some(Invocation::on(Action::Login, 3)));
         assert_eq!(first("login демо"), Some(Invocation::on(Action::Login, 2)));
         // Часть ника из середины.
-        assert_eq!(first("история lance"), Some(Invocation::on(Action::History, 3)));
+        assert_eq!(first("история l4nce"), Some(Invocation::on(Action::History, 3)));
         assert_eq!(first("игры quiet"), Some(Invocation::on(Action::Games, 1)));
         assert_eq!(first("загрузить quiet"), Some(Invocation::on(Action::LoadHistory, 1)));
         assert_eq!(first("профиль quiet"), Some(Invocation::on(Action::Profile, 1)));
@@ -496,7 +496,7 @@ mod tests {
     fn refresh_tags_sorts_and_screens() {
         assert_eq!(first("обновить все"), Some(Invocation::new(Action::RefreshAll)));
         assert_eq!(first("обновить "), Some(Invocation::new(Action::RefreshAll)));
-        assert_eq!(first("обновить ben"), Some(Invocation::on(Action::Refresh, 1)));
+        assert_eq!(first("обновить qui"), Some(Invocation::on(Action::Refresh, 1)));
         assert_eq!(first("тег sm"), Some(Invocation::new(Action::Tag(Some("smurf".into())))));
         assert_eq!(first("тег все"), Some(Invocation::new(Action::Tag(None))));
         assert_eq!(first("сортировка им"), Some(Invocation::new(Action::Sort(SortOrder::Name))));
