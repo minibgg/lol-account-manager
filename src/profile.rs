@@ -5,7 +5,8 @@
 
 use std::collections::HashMap;
 
-use crate::riot::MatchSummary;
+use crate::riot::{MatchSummary, RiotId};
+use crate::storage::ArchivedPlayer;
 
 /// Сумма показателей по нескольким играм. Ремейки считаются отдельно и в остальные
 /// числа не входят: это не победа, не поражение и не настоящая игра.
@@ -180,6 +181,76 @@ pub fn champions<'a>(games: impl IntoIterator<Item = &'a MatchSummary>, sort: Ch
     list
 }
 
+/// С кем аккаунт сыграл вместе хотя бы столько игр — тот попадает в «напарники».
+/// Случайный союзник почти никогда не встречается дважды, а друг — постоянно.
+pub const PARTNER_MIN_GAMES: u32 = 2;
+
+/// Итог игр вместе с одним напарником: показатели — самого аккаунта в этих играх.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartnerStats {
+    pub riot_id: RiotId,
+    pub totals: Totals,
+    /// Когда играли вместе в последний раз (unix-время).
+    pub last_played: i64,
+}
+
+/// Из игроков архива (см. `Db::archived_players`) — союзники с известным именем:
+/// номер игры → их Riot ID. Это вход для [`partners`].
+pub fn teammates(players: &HashMap<String, Vec<ArchivedPlayer>>) -> HashMap<String, Vec<RiotId>> {
+    players
+        .iter()
+        .map(|(match_id, list)| {
+            let allies = list.iter().filter(|p| p.ally).filter_map(|p| p.riot_id.clone()).collect();
+            (match_id.clone(), allies)
+        })
+        .collect()
+}
+
+/// Напарники: союзники, с которыми аккаунт сыграл вместе не меньше [`PARTNER_MIN_GAMES`]
+/// игр (без ремейков). `teammates` — номер игры → союзники в ней (см.
+/// `Db::archived_teammates`); игры без подробностей просто не учитываются. Riot ID
+/// сравниваются без учёта регистра. Сортировка — как у чемпионов.
+pub fn partners<'a>(
+    games: impl IntoIterator<Item = &'a MatchSummary>,
+    teammates: &HashMap<String, Vec<RiotId>>,
+    sort: ChampionSort,
+) -> Vec<PartnerStats> {
+    let mut by_player: HashMap<String, PartnerStats> = HashMap::new();
+    for game in games {
+        let Some(players) = teammates.get(&game.id) else {
+            continue;
+        };
+        for riot_id in players {
+            let entry = by_player.entry(riot_id.to_string().to_lowercase()).or_insert_with(|| PartnerStats {
+                riot_id: riot_id.clone(),
+                totals: Totals::default(),
+                last_played: 0,
+            });
+            entry.totals.add(game);
+            // Игры идут новыми первыми — имя берём из самой свежей (его могли сменить).
+            if game.played_at > entry.last_played {
+                entry.last_played = game.played_at;
+                entry.riot_id.clone_from(riot_id);
+            }
+        }
+    }
+    let mut list: Vec<PartnerStats> = by_player
+        .into_values()
+        .filter(|p| p.totals.games >= PARTNER_MIN_GAMES)
+        .collect();
+    list.sort_by(|a, b| {
+        let main = match sort {
+            ChampionSort::Games => b.totals.games.cmp(&a.totals.games),
+            ChampionSort::Winrate => b.totals.winrate().unwrap_or(0.0).total_cmp(&a.totals.winrate().unwrap_or(0.0)),
+            ChampionSort::Kda => b.totals.kda_ratio().total_cmp(&a.totals.kda_ratio()),
+            ChampionSort::Recent => b.last_played.cmp(&a.last_played),
+        };
+        main.then_with(|| b.totals.games.cmp(&a.totals.games))
+            .then_with(|| a.riot_id.to_string().to_lowercase().cmp(&b.riot_id.to_string().to_lowercase()))
+    });
+    list
+}
+
 /// Итоги по позициям («top» … «utility»), чаще сыгранные — первыми. Игры, где позиция
 /// неизвестна (ARAM, старые записи архива), не учитываются.
 pub fn positions<'a>(games: impl IntoIterator<Item = &'a MatchSummary>) -> Vec<(String, Totals)> {
@@ -276,6 +347,60 @@ mod tests {
         let ekko = &champions(&games, ChampionSort::Games)[0];
         assert_eq!((ekko.totals.games, ekko.totals.wins, ekko.last_played), (3, 1, 10));
         assert_eq!(ekko.name, "Чемпион 245");
+    }
+
+    #[test]
+    fn partners_need_two_games_together() {
+        let id = |s: &str| RiotId::parse(s).unwrap();
+        let mut remake = game(1, true, (0, 0, 0), 5);
+        remake.remake = true;
+        let games = [
+            game(1, true, (10, 2, 5), 40),
+            game(1, true, (4, 4, 4), 30),
+            game(1, false, (1, 5, 1), 20),
+            game(1, true, (1, 1, 1), 10),
+            remake,
+            game(1, false, (1, 1, 1), 1), // без подробностей
+        ];
+        let teammates: HashMap<String, Vec<RiotId>> = [
+            ("RU_40", vec![id("Pal#RU1"), id("Random#RU1")]),
+            ("RU_30", vec![id("pal#ru1"), id("Duo#RU1")]),
+            ("RU_20", vec![id("Duo#RU1")]),
+            ("RU_10", vec![id("Duo#RU1")]),
+            ("RU_5", vec![id("Random#RU1")]), // ремейк — не в счёт
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+
+        let list = partners(&games, &teammates, ChampionSort::Games);
+        let short: Vec<(String, u32, u32, i64)> = list
+            .iter()
+            .map(|p| (p.riot_id.to_string(), p.totals.games, p.totals.wins, p.last_played))
+            .collect();
+        // Random — одна настоящая игра: не напарник. Регистр Pal не важен, имя — из свежей игры.
+        assert_eq!(short, [("Duo#RU1".into(), 3, 2, 30), ("Pal#RU1".into(), 2, 2, 40)]);
+        let by_winrate: Vec<String> = partners(&games, &teammates, ChampionSort::Winrate)
+            .iter()
+            .map(|p| p.riot_id.game_name.clone())
+            .collect();
+        assert_eq!(by_winrate, ["Pal", "Duo"]);
+        assert_eq!(list[1].totals.average_kda(), "7.0/3.0/4.5");
+        assert!(partners(&games, &HashMap::new(), ChampionSort::Games).is_empty());
+    }
+
+    #[test]
+    fn teammates_are_named_allies() {
+        let player = |name: Option<&str>, ally: bool| ArchivedPlayer {
+            riot_id: name.map(|n| RiotId::parse(n).unwrap()),
+            champion: "Ари".into(),
+            ally,
+        };
+        let players: HashMap<String, Vec<ArchivedPlayer>> =
+            [("RU_1".to_string(), vec![player(Some("Pal#RU1"), true), player(None, true), player(Some("Foe#RU1"), false)])]
+                .into_iter()
+                .collect();
+        assert_eq!(teammates(&players)["RU_1"], [RiotId::parse("Pal#RU1").unwrap()]);
     }
 
     #[test]

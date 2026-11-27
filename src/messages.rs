@@ -26,7 +26,7 @@ use crate::lcu::LcuStatus;
 use crate::clash::{ClashHistory, ClashState, HistoryRequest};
 use crate::lobby::{LiveGame, LobbyState};
 use crate::riot::{DataSource, Inventory, MatchDetails, MatchSummary, RankedQueues, RiotId};
-use crate::storage::{Account, AccountId, AccountInput, Credentials, SecretChange};
+use crate::storage::{Account, AccountId, AccountInput, ArchivedPlayer, Credentials, SecretChange};
 use crate::update::UpdateInfo;
 use crate::wallpapers::Skin;
 
@@ -141,6 +141,9 @@ pub enum Command {
     LoadMatch { account: AccountId, match_id: String },
     /// Все игры аккаунта из архива — для окна «Все игры».
     LoadGames(AccountId),
+    /// Другие игроки в играх аккаунта (по архиву) — для «напарников» в окне «Профиль»
+    /// и поиска по нику и чемпиону во «Всех играх».
+    LoadPlayers(AccountId),
     /// Инвентарь аккаунта — для окна «Профиль»: свежий из клиента League, если в нём
     /// выполнен вход в этот аккаунт, иначе последний сохранённый.
     LoadInventory(AccountId),
@@ -268,6 +271,11 @@ pub enum Event {
     GamesLoaded {
         account: AccountId,
         result: Result<Vec<MatchSummary>, AppError>,
+    },
+    /// Ответ на `LoadPlayers`: номер игры → другие игроки в ней.
+    PlayersLoaded {
+        account: AccountId,
+        result: Result<std::collections::HashMap<String, Vec<ArchivedPlayer>>, AppError>,
     },
 
     /// Ответ на `LoadInventory`: `None` — инвентарь этого аккаунта ещё ни разу не видели.

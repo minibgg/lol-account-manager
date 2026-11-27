@@ -18,7 +18,7 @@ use crate::ui::theme::{self, white};
 
 /// Ширины колонок: позиция, игрок, solo/duo, flex; остальное — чемпионы.
 const COLUMNS: [f32; 4] = [86.0, 250.0, 180.0, 170.0];
-const HEADERS: [&str; 5] = ["поз", "игрок", "solo/duo", "flex", "чемпионы сезона"];
+const HEADERS: [&str; 5] = ["поз", "игрок", "solo/duo 5×5", "flex 5×5", "чемпионы сезона"];
 
 /// Riot ID команды, к которой относятся `c` / `o`.
 pub fn riot_ids(state: &ClashState) -> Vec<RiotId> {

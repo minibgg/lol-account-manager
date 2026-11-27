@@ -50,6 +50,10 @@ const PARALLEL_DOWNLOADS: usize = 4;
 /// Оригинал 1280×720 уменьшаем до 400×225 и храним в кэше JPG-файлом (~25 КБ).
 const SKIN_THUMB_WIDTH: u32 = 400;
 
+/// Большой арт в превью «Обоев» — колонка 340 px (680 px с масштабом 200%). Оригинал
+/// 1280×720 уменьшаем до 800×450: в памяти он занимает 1,4 МБ вместо 3,7 МБ.
+const SKIN_PREVIEW_WIDTH: u32 = 800;
+
 /// Первые 8 байт любого PNG-файла.
 const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
 /// Первые 3 байта любого JPG-файла.
@@ -70,7 +74,7 @@ pub enum ImageKey {
     Item(i32),
     /// Арт образа, уменьшенный — плитка в сетке «Обоев». Число — id образа.
     SkinThumb(i64),
-    /// Арт образа целиком — превью выбранного образа на «Обоях».
+    /// Арт образа покрупнее (800 px) — превью выбранного образа на «Обоях».
     SkinSplash(i64),
 }
 
@@ -83,7 +87,8 @@ impl ImageKey {
             Self::Champion(id) => format!("champion-{id}.png"),
             Self::Item(id) => format!("item-{id}.png"),
             Self::SkinThumb(id) => format!("skin-thumb-{id}.jpg"),
-            Self::SkinSplash(id) => format!("skin-splash-{id}.jpg"),
+            // «preview», а не прежнее «splash»: в старых файлах кэша — арт целиком (1280 px).
+            Self::SkinSplash(id) => format!("skin-preview-{id}.jpg"),
         }
     }
 
@@ -95,6 +100,12 @@ impl ImageKey {
 
     /// Арты образов — JPG, всё остальное — PNG.
     fn is_jpeg(self) -> bool {
+        self.is_skin_art()
+    }
+
+    /// Арт образа (вкладка «Обои»). Их тысячи, поэтому окно выгружает из памяти те,
+    /// что давно не рисовались (см. `ui::image_store`).
+    pub fn is_skin_art(self) -> bool {
         matches!(self, Self::SkinThumb(_) | Self::SkinSplash(_))
     }
 
@@ -271,7 +282,8 @@ impl ImageCache {
             ImageKey::Emblem(_) => Some(Shrink::Png(EMBLEM_SIZE)),
             ImageKey::Champion(_) => Some(Shrink::Png(CHAMPION_ICON_SIZE)),
             ImageKey::SkinThumb(_) => Some(Shrink::Jpeg(SKIN_THUMB_WIDTH)),
-            ImageKey::ProfileIcon(_) | ImageKey::Item(_) | ImageKey::SkinSplash(_) => None,
+            ImageKey::SkinSplash(_) => Some(Shrink::Jpeg(SKIN_PREVIEW_WIDTH)),
+            ImageKey::ProfileIcon(_) | ImageKey::Item(_) => None,
         };
         let bytes: Vec<u8> = match shrink {
             Some(shrink) => tokio::task::spawn_blocking(move || match shrink {
@@ -453,7 +465,7 @@ mod tests {
         let decoded = image::load_from_memory(&thumb).unwrap();
         assert_eq!((decoded.width(), decoded.height()), (400, 225));
         assert_eq!(key.uri(), "bytes://skin-thumb-103001.jpg");
-        assert_eq!(ImageKey::SkinSplash(7).file_name(), "skin-splash-7.jpg");
+        assert_eq!(ImageKey::SkinSplash(7).file_name(), "skin-preview-7.jpg");
     }
 
     #[test]

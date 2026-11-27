@@ -1412,6 +1412,10 @@ impl Worker {
                     let result = worker.with_storage(move |s| s.archived_matches(account, None)).await;
                     worker.events.send(Event::GamesLoaded { account, result });
                 }
+                Command::LoadPlayers(account) => {
+                    let result = worker.with_storage(move |s| s.archived_players(account)).await;
+                    worker.events.send(Event::PlayersLoaded { account, result });
+                }
                 Command::LoadInventory(account) => worker.send_inventory(account).await,
                 Command::LoadInventories => {
                     let list = worker.inventories().await;

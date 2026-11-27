@@ -58,8 +58,8 @@ impl Queue {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Solo => "Solo/Duo",
-            Self::Flex => "Flex",
+            Self::Solo => "Solo/Duo 5×5",
+            Self::Flex => "Flex 5×5",
         }
     }
 

@@ -743,6 +743,8 @@ impl App {
                     || self.profile_view.as_ref().is_some_and(|v| v.account == account.id)
                 {
                     self.backend.send(Command::LoadGames(account.id));
+                    // И игроки этих игр (напарники, поиск): у новых игр могли появиться подробности.
+                    self.backend.send(Command::LoadPlayers(account.id));
                 }
                 self.replace_account(account);
             }
@@ -889,6 +891,18 @@ impl App {
                     && view.account == account
                 {
                     view.games = Some(result);
+                }
+            }
+            Event::PlayersLoaded { account, result } => {
+                if let Some(view) = &mut self.profile_view
+                    && view.account == account
+                {
+                    view.players_loaded(&result);
+                }
+                if let Some(view) = &mut self.games_view
+                    && view.account == account
+                {
+                    view.players = Some(result);
                 }
             }
             Event::InventoryLoaded { account, inventory } => {
@@ -1150,6 +1164,7 @@ impl App {
                 if let Some(account) = self.accounts.iter().find(|a| a.archived_games > 0) {
                     self.profile_view = Some(ProfileView::new(account.id));
                     self.backend.send(Command::LoadGames(account.id));
+                    self.backend.send(Command::LoadPlayers(account.id));
                     self.backend.send(Command::LoadInventory(account.id));
                 }
             }
@@ -1157,6 +1172,7 @@ impl App {
                 if let Some(account) = self.accounts.iter().find(|a| a.archived_games > 0) {
                     self.games_view = Some(GamesView::new(account.id, account.riot_id.clone()));
                     self.backend.send(Command::LoadGames(account.id));
+                    self.backend.send(Command::LoadPlayers(account.id));
                 }
             }
             "command" => {
@@ -1922,10 +1938,12 @@ impl App {
             A::Games => {
                 self.games_view = Some(GamesView::new(id, riot_id.clone()));
                 self.backend.send(Command::LoadGames(id));
+                self.backend.send(Command::LoadPlayers(id));
             }
             A::Profile => {
                 self.profile_view = Some(ProfileView::new(id));
                 self.backend.send(Command::LoadGames(id));
+                self.backend.send(Command::LoadPlayers(id));
                 self.backend.send(Command::LoadInventory(id));
             }
             A::Game(n) => match game {
@@ -3122,6 +3140,8 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.close_to_tray(&ctx);
         self.expire_notice(&ctx);
+        // Арты образов, которые давно не рисовались, — из памяти (их тысячи на «Обоях»).
+        self.images.evict_unused(&ctx, Instant::now());
         // Клавиши — до виджетов: найденные нажатия забираем, чтобы их не увидели кнопки.
         let mut actions = self.hotkeys(&ctx);
         // Порядок важен: сначала верхняя и нижняя панели, CentralPanel — последней.

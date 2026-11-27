@@ -1,8 +1,12 @@
 //! Окно «Все игры» (клавиша m): архив игр аккаунта — все, что приложение видело,
 //! без ограничения количества. Вид терминала: курсор-строка, ↑ ↓ PgUp PgDn Home End,
-//! Enter или щелчок — подробности игры, Tab — фильтр по очереди, Esc — закрыть.
+//! Enter или щелчок — подробности игры, Tab — фильтр по очереди, `/` — поиск, Esc — закрыть.
 //! Сверху — итог: сколько игр, побед и поражений, винрейт и самые частые чемпионы.
 //! У ранговых игр — ранг аккаунта после игры и сколько LP она принесла (по истории рангов).
+//!
+//! Поиск — по нику любого игрока в игре и по чемпиону (своему, союзника или соперника):
+//! «Друг#RU1» — все игры с ним, «зед» — все игры с Зедом. Итог сверху считается по найденным,
+//! поэтому сразу видно, например, винрейт вместе с другом.
 
 use std::collections::HashMap;
 
@@ -11,7 +15,8 @@ use eframe::egui::{self, Align, Layout, Margin, Rect, RichText, Sense, Stroke, p
 use crate::error::AppError;
 use crate::history::{self, GameRank, Queue, RankPoint};
 use crate::riot::{MatchSummary, RiotId};
-use crate::storage::AccountId;
+use crate::storage::{AccountId, ArchivedPlayer};
+use crate::ui::command::swap_layout;
 use crate::ui::format;
 use crate::ui::match_view;
 use crate::ui::terminal::{self, FONT, ROW_HEIGHT, job};
@@ -22,6 +27,30 @@ use crate::ui::theme::{self, Weight, white};
 const COLUMNS: [f32; 9] = [16.0, 104.0, 26.0, 118.0, 88.0, 50.0, 48.0, 60.0, 190.0];
 const HEADERS: [&str; 10] = ["", "когда", "", "чемпион", "k/d/a", "kda", "cs", "время", "ранг после игры", "режим"];
 const WIDTH: f32 = 820.0;
+
+/// Поле поиска — по этому id проверяем, идёт ли в нём ввод.
+fn search_id() -> egui::Id {
+    egui::Id::unique("games_search")
+}
+
+/// Подходит ли игра под поиск: запрос (без учёта регистра, в любой раскладке) — часть
+/// своего чемпиона, ника или чемпиона любого другого игрока. `players` — другие игроки
+/// этой игры; `None` — подробностей нет, ищем только по своему чемпиону.
+pub fn search_matches(game: &MatchSummary, players: Option<&[ArchivedPlayer]>, query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+    let swapped = swap_layout(&query);
+    let hit = |text: &str| {
+        let text = text.to_lowercase();
+        text.contains(&query) || text.contains(&swapped)
+    };
+    hit(&match_view::champion_name(&game.me))
+        || players.into_iter().flatten().any(|p| {
+            hit(&p.champion) || p.riot_id.as_ref().is_some_and(|id| hit(&id.to_string()))
+        })
+}
 
 /// Фильтр по очереди (Tab). Общий с окном «Профиль».
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,8 +67,8 @@ impl Filter {
     pub fn label(self) -> &'static str {
         match self {
             Self::All => "все",
-            Self::Solo => "solo/duo",
-            Self::Flex => "flex",
+            Self::Solo => "solo/duo 5×5",
+            Self::Flex => "flex 5×5",
             Self::Other => "другие",
         }
     }
@@ -60,6 +89,12 @@ pub struct GamesView {
     owner: RiotId,
     /// `None` — ещё грузится.
     pub games: Option<Result<Vec<MatchSummary>, AppError>>,
+    /// Другие игроки в играх — для поиска: номер игры → игроки. `None` — ещё грузятся.
+    pub players: Option<Result<HashMap<String, Vec<ArchivedPlayer>>, AppError>>,
+    /// Поиск по нику и чемпиону.
+    query: String,
+    /// Поставить фокус в поле поиска в этом кадре (`/`).
+    focus_search: bool,
     cursor: usize,
     scroll_to_cursor: bool,
     /// Прокрутка списка (запоминаем, чтобы двигать её вслед за курсором).
@@ -85,6 +120,9 @@ impl GamesView {
             account,
             owner,
             games: None,
+            players: None,
+            query: String::new(),
+            focus_search: false,
             cursor: 0,
             scroll_to_cursor: false,
             offset: 0.0,
@@ -94,10 +132,21 @@ impl GamesView {
         }
     }
 
-    /// Игры под текущим фильтром.
+    /// Игры под текущими фильтром и поиском.
     fn visible(&self) -> Vec<&MatchSummary> {
+        let players = match &self.players {
+            Some(Ok(players)) => Some(players),
+            _ => None,
+        };
         match &self.games {
-            Some(Ok(games)) => games.iter().filter(|g| self.filter.accepts(g)).collect(),
+            Some(Ok(games)) => games
+                .iter()
+                .filter(|g| self.filter.accepts(g))
+                .filter(|g| {
+                    let in_game = players.and_then(|p| p.get(&g.id)).map(Vec::as_slice);
+                    search_matches(g, in_game, &self.query)
+                })
+                .collect(),
             _ => Vec::new(),
         }
     }
@@ -147,19 +196,34 @@ impl GamesView {
     fn handle_keys(&mut self, ctx: &egui::Context) -> GamesAction {
         use egui::Key;
         let none = egui::Modifiers::NONE;
-        let count = self.visible().len();
-        let (up, down, page_up, page_down, home, end, enter, tab) = ctx.input_mut(|i| {
+        // Идёт ввод в поиске: буквы (j k) и Home End — поля ввода, а не списка.
+        let typing = ctx.memory(|m| m.has_focus(search_id()));
+        let (up, down, page_up, page_down, home, end, enter, tab, find, escape) = ctx.input_mut(|i| {
             (
-                i.consume_key(none, Key::ArrowUp) || i.consume_key(none, Key::K),
-                i.consume_key(none, Key::ArrowDown) || i.consume_key(none, Key::J),
+                i.consume_key(none, Key::ArrowUp) || (!typing && i.consume_key(none, Key::K)),
+                i.consume_key(none, Key::ArrowDown) || (!typing && i.consume_key(none, Key::J)),
                 i.consume_key(none, Key::PageUp),
                 i.consume_key(none, Key::PageDown),
-                i.consume_key(none, Key::Home),
-                i.consume_key(none, Key::End),
+                !typing && i.consume_key(none, Key::Home),
+                !typing && i.consume_key(none, Key::End),
                 i.consume_key(none, Key::Enter),
                 i.consume_key(none, Key::Tab),
+                // «/» ловим как текст: в русской раскладке он на другой клавише.
+                i.consume_key(egui::Modifiers::COMMAND, Key::F) || (!typing && consume_text(i, "/")),
+                // Esc при непустом поиске — очистить поиск, а не закрыть окно.
+                (typing || !self.query.is_empty()) && i.consume_key(none, Key::Escape),
             )
         });
+        if find {
+            self.focus_search = true;
+        }
+        if escape {
+            self.query.clear();
+            ctx.memory_mut(|m| m.surrender_focus(search_id()));
+            self.cursor = 0;
+            self.scroll_to_cursor = true;
+        }
+        let count = self.visible().len();
         if tab {
             let index = Filter::ALL.iter().position(|f| *f == self.filter).unwrap_or(0);
             self.filter = Filter::ALL[(index + 1) % Filter::ALL.len()];
@@ -248,7 +312,41 @@ impl GamesView {
                 }
             }
         });
+        self.search_field(ui);
         close
+    }
+
+    /// Поле поиска: «/ ник или чемпион…». Новый текст — курсор в начало списка.
+    fn search_field(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("/").font(theme::mono(FONT)).color(theme::ACCENT_TEXT));
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut self.query)
+                    .id(search_id())
+                    .font(theme::mono(FONT))
+                    .text_color(theme::TEXT)
+                    .frame(egui::Frame::NONE)
+                    .hint_text(RichText::new("ник игрока или чемпион: друг#ru1, зед…").color(theme::TEXT_HINT))
+                    .desired_width(300.0),
+            );
+            if std::mem::take(&mut self.focus_search) {
+                response.request_focus();
+            }
+            if response.changed() {
+                self.cursor = 0;
+                self.scroll_to_cursor = true;
+            }
+            terminal::focus_outline(ui, response.rect.expand2(vec2(6.0, 3.0)));
+            // Игроков ещё нет или подробности есть не у всех игр — подскажем.
+            if !self.query.trim().is_empty() {
+                let note = match &self.players {
+                    None => "ищу пока только по своим чемпионам — загружаю игроков…".to_string(),
+                    Some(Err(error)) => format!("! игроки не загрузились: {error}"),
+                    Some(Ok(_)) => "esc — сбросить".to_string(),
+                };
+                ui.label(RichText::new(note).font(theme::mono(11.5)).color(theme::TEXT_HINT));
+            }
+        });
     }
 
     /// Список игр. Возвращает игру, по которой щёлкнули.
@@ -266,7 +364,12 @@ impl GamesView {
         let visible: Vec<MatchSummary> = self.visible().into_iter().cloned().collect();
         if visible.is_empty() {
             ui.add_space(8.0);
-            ui.label(RichText::new("игр нет").font(font).color(theme::TEXT_HINT));
+            let text = if self.query.trim().is_empty() {
+                "игр нет"
+            } else {
+                "ничего не нашлось — ищутся ники и чемпионы игр, у которых загружены подробности"
+            };
+            ui.label(RichText::new(text).font(font).color(theme::TEXT_HINT));
             return None;
         }
         // Строки вплотную: show_rows считает высоту строки вместе с этим промежутком.
@@ -304,6 +407,13 @@ impl GamesView {
         self.offset = output.state.clamped_offset().y;
         clicked
     }
+}
+
+/// Забрать из ввода кадра набранный текст `text` (чтобы его не получило поле ввода).
+fn consume_text(input: &mut egui::InputState, text: &str) -> bool {
+    let before = input.events.len();
+    input.events.retain(|e| !matches!(e, egui::Event::Text(t) if t == text));
+    input.events.len() != before
 }
 
 /// Ячейка «ранг после игры»: «платина I 40lp −18». «+46/2» — изменение сразу за две игры
@@ -475,5 +585,54 @@ mod tests {
 
         view.filter = Filter::All;
         assert_eq!(top_champions(&view.visible(), 2), "экко 3 · ривен 1");
+    }
+
+    /// Поиск: по своему чемпиону, нику (часть, без учёта регистра) и чемпиону другого
+    /// игрока; в другой раскладке; игры без подробностей — только по своему чемпиону.
+    #[test]
+    fn search_finds_players_and_champions() {
+        let player = |name: Option<&str>, champion: &str, ally: bool| ArchivedPlayer {
+            riot_id: name.map(|n| RiotId::parse(n).unwrap()),
+            champion: champion.into(),
+            ally,
+        };
+        let ekko = game(245, "Экко", 420, true);
+        let players = [player(Some("Друг#RU1"), "Ари", true), player(Some("Foe#EUW"), "Зед", false), player(None, "Лукс", false)];
+        let found = |query| search_matches(&ekko, Some(&players), query);
+        assert!(found(""));
+        assert!(found("экк"), "свой чемпион");
+        assert!(found("ДРУГ"), "ник без учёта регистра");
+        assert!(found("друг#ru1"));
+        assert!(found("зед") && found("лукс"), "чемпион соперника — даже со скрытым ником");
+        assert!(found("pt"), "«зе» в английской раскладке");
+        assert!(!found("сайлас"));
+        assert!(!search_matches(&ekko, None, "зед"), "без подробностей — только свой чемпион");
+
+        // В окне: игры с другом; итог считается по найденным.
+        let mut view = GamesView::new(1, RiotId::parse("Name#RU1").unwrap());
+        let other = game(517, "Сайлас", 420, false);
+        view.games = Some(Ok(vec![ekko.clone(), other.clone()]));
+        view.players = Some(Ok([(ekko.id.clone(), players.to_vec()), (other.id.clone(), vec![])].into_iter().collect()));
+        view.query = "друг".into();
+        assert_eq!(view.visible().len(), 1);
+        view.query = "сай".into();
+        assert_eq!(view.visible()[0].id, other.id);
+    }
+
+    /// «/» ставит фокус в поиск, Esc сначала очищает поиск и только потом закрывает окно.
+    #[test]
+    fn slash_focuses_search_and_escape_clears_it() {
+        let ctx = egui::Context::default();
+        let mut view = GamesView::new(1, RiotId::parse("Name#RU1").unwrap());
+        view.games = Some(Ok(vec![game(245, "Экко", 420, true)]));
+        frame(&ctx, &mut view, vec![egui::Event::Text("/".into())]);
+        frame(&ctx, &mut view, vec![]);
+        assert!(ctx.memory(|m| m.has_focus(search_id())), "/ — фокус в поиске");
+        assert!(view.query.is_empty(), "сам «/» в поле не попал");
+        frame(&ctx, &mut view, vec![egui::Event::Text("j".into())]);
+        assert_eq!(view.query, "j", "в поиске j — это буква, а не «вниз»");
+        assert!(matches!(frame(&ctx, &mut view, vec![press(egui::Key::Escape)]), GamesAction::None));
+        assert!(view.query.is_empty(), "Esc очистил поиск, окно открыто");
+        assert!(matches!(frame(&ctx, &mut view, vec![press(egui::Key::Escape)]), GamesAction::Close));
     }
 }
