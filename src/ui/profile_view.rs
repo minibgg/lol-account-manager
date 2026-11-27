@@ -1,19 +1,21 @@
 //! Окно «Профиль» (клавиша i): статистика аккаунта по архиву игр. Сверху — ранги
 //! и оценка сгорания, общий итог (винрейт, KDA, CS и урон в минуту), последние игры
-//! буквами W/L; ниже — таблица чемпионов.
+//! буквами W/L; ниже — таблица чемпионов или напарников (с кем играли вместе).
 //!
-//! Клавиши: Tab — очередь, ← → — период, s — сортировка чемпионов, ↑ ↓ PgUp PgDn
-//! Home End — курсор, Esc — закрыть.
+//! Клавиши: Tab — очередь, ← → — период, s — сортировка, n — чемпионы / напарники,
+//! Enter — напарник на OP.GG, ↑ ↓ PgUp PgDn Home End — курсор, Esc — закрыть.
+
+use std::collections::HashMap;
 
 use eframe::egui::{self, Align, Layout, Margin, Rect, RichText, Sense, Stroke, pos2, vec2};
 
 use crate::decay;
 use crate::error::AppError;
 use crate::history::{DAY, Queue};
-use crate::lobby::Position;
-use crate::profile::{self, ChampionSort, ChampionStats, Totals};
-use crate::riot::{Inventory, MatchSummary};
-use crate::storage::{Account, AccountId, unix_now};
+use crate::lobby::{self, Position};
+use crate::profile::{self, ChampionSort, ChampionStats, PARTNER_MIN_GAMES, PartnerStats, Totals};
+use crate::riot::{Inventory, MatchSummary, RiotId};
+use crate::storage::{Account, AccountId, ArchivedPlayer, unix_now};
 use crate::ui::format;
 use crate::ui::games_view::Filter;
 use crate::ui::match_view;
@@ -24,7 +26,28 @@ use crate::ui::theme::{self, Weight, white};
 /// дальше — «последняя игра».
 const COLUMNS: [f32; 9] = [16.0, 150.0, 50.0, 70.0, 132.0, 58.0, 112.0, 60.0, 70.0];
 const HEADERS: [&str; 10] = ["", "чемпион", "игр", "w-l", "винрейт", "kda", "k/d/a", "cs/м", "урон/м", "последняя"];
+/// Таблица напарников: курсор, игрок, игр, W-L, винрейт, KDA, K/D/A; дальше — «последняя».
+const PARTNER_COLUMNS: [f32; 7] = [16.0, 230.0, 50.0, 70.0, 132.0, 58.0, 112.0];
+const PARTNER_HEADERS: [&str; 8] = ["", "игрок", "игр", "w-l", "винрейт вместе", "kda", "k/d/a", "последняя"];
 const WIDTH: f32 = 820.0;
+
+/// Какая таблица под итогом (клавиша n).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Table {
+    Champions,
+    Partners,
+}
+
+impl Table {
+    const ALL: [Self; 2] = [Self::Champions, Self::Partners];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Champions => "чемпионы",
+            Self::Partners => "напарники",
+        }
+    }
+}
 /// Сколько клеток в полоске винрейта.
 const BAR_CELLS: usize = 10;
 /// Сколько последних игр показать буквами W/L.
@@ -73,12 +96,17 @@ pub struct ProfileView {
     pub games: Option<Result<Vec<MatchSummary>, AppError>>,
     /// Инвентарь: `None` — ещё грузится, `Some(None)` — этот аккаунт в клиенте ещё не видели.
     pub inventory: Option<Option<Inventory>>,
+    /// Союзники по играм: номер игры → Riot ID. `None` — ещё грузятся.
+    pub teammates: Option<Result<HashMap<String, Vec<RiotId>>, AppError>>,
     filter: Filter,
     period: Period,
     sort: ChampionSort,
+    table: Table,
     cursor: usize,
     scroll_to_cursor: bool,
     offset: f32,
+    /// Нажали Enter — открыть строку под курсором (напарника на OP.GG).
+    open_cursor: bool,
 }
 
 impl ProfileView {
@@ -87,12 +115,28 @@ impl ProfileView {
             account,
             games: None,
             inventory: None,
+            teammates: None,
             filter: Filter::All,
             period: Period::All,
             sort: ChampionSort::Games,
+            table: Table::Champions,
             cursor: 0,
             scroll_to_cursor: false,
             offset: 0.0,
+            open_cursor: false,
+        }
+    }
+
+    /// Пришли игроки из архива (`Event::PlayersLoaded`) — запоминаем из них только союзников.
+    pub fn players_loaded(&mut self, result: &Result<HashMap<String, Vec<ArchivedPlayer>>, AppError>) {
+        self.teammates = Some(result.as_ref().map(profile::teammates).map_err(Clone::clone));
+    }
+
+    /// Напарники по играм под фильтром и периодом; пусто, пока союзники не загружены.
+    fn partners(&self, games: &[MatchSummary]) -> Vec<PartnerStats> {
+        match &self.teammates {
+            Some(Ok(teammates)) => profile::partners(games, teammates, self.sort),
+            _ => Vec::new(),
         }
     }
 
@@ -113,7 +157,19 @@ impl ProfileView {
         let now = unix_now();
         let games: Vec<MatchSummary> = self.visible(now).into_iter().cloned().collect();
         let champions = profile::champions(&games, self.sort);
-        self.handle_keys(ctx, champions.len());
+        let partners = self.partners(&games);
+        let count = match self.table {
+            Table::Champions => champions.len(),
+            Table::Partners => partners.len(),
+        };
+        self.handle_keys(ctx, count);
+        // Enter на напарнике — его профиль на OP.GG.
+        if std::mem::take(&mut self.open_cursor)
+            && self.table == Table::Partners
+            && let Some(partner) = partners.get(self.cursor)
+        {
+            ctx.open_url(egui::OpenUrl::new_tab(lobby::opgg_profile_url(account.region, &partner.riot_id)));
+        }
 
         let mut close = false;
         let height = (ctx.content_rect().height() - 410.0).max(ROW_HEIGHT * 3.0);
@@ -144,7 +200,14 @@ impl ProfileView {
                     Some(Ok(_)) => {
                         summary(ui, &games);
                         separator(ui);
-                        self.table(ui, &champions, height);
+                        match self.table {
+                            Table::Champions => {
+                                self.table(ui, &HEADERS, &COLUMNS, champions.len(), height, |ui, rect, index, cursor, hovered| {
+                                    row(ui, rect, &champions[index], cursor, hovered);
+                                });
+                            }
+                            Table::Partners => self.partners_table(ui, &partners, height),
+                        }
                     }
                 }
             });
@@ -154,7 +217,7 @@ impl ProfileView {
     fn handle_keys(&mut self, ctx: &egui::Context, count: usize) {
         use egui::Key;
         let none = egui::Modifiers::NONE;
-        let (up, down, page_up, page_down, home, end, tab, left, right, sort) = ctx.input_mut(|i| {
+        let (up, down, page_up, page_down, home, end, tab, left, right, sort, switch, enter) = ctx.input_mut(|i| {
             (
                 i.consume_key(none, Key::ArrowUp) || i.consume_key(none, Key::K),
                 i.consume_key(none, Key::ArrowDown) || i.consume_key(none, Key::J),
@@ -166,8 +229,11 @@ impl ProfileView {
                 i.consume_key(none, Key::ArrowLeft),
                 i.consume_key(none, Key::ArrowRight),
                 i.consume_key(none, Key::S),
+                i.consume_key(none, Key::N),
+                i.consume_key(none, Key::Enter),
             )
         });
+        self.open_cursor |= enter;
         if tab {
             self.filter = cycle(&Filter::ALL, self.filter, true);
         }
@@ -177,7 +243,10 @@ impl ProfileView {
         if sort {
             self.sort = cycle(&ChampionSort::ALL, self.sort, true);
         }
-        if tab || left || right || sort {
+        if switch {
+            self.table = cycle(&Table::ALL, self.table, true);
+        }
+        if tab || left || right || sort || switch {
             // Список стал другим — курсор в начало.
             self.cursor = 0;
             self.scroll_to_cursor = true;
@@ -250,29 +319,75 @@ impl ProfileView {
                 }
             }
         });
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 12.0;
+            terminal::key_button(ui, "n", "таблица", false);
+            for table in Table::ALL {
+                if word(ui, table.label(), table == self.table) {
+                    self.table = table;
+                    changed = true;
+                }
+            }
+            if self.table == Table::Partners {
+                ui.add_space(16.0);
+                terminal::key_button(ui, "enter", "op.gg", false);
+            }
+        });
         if changed {
             self.cursor = 0;
             self.scroll_to_cursor = true;
         }
     }
 
-    /// Таблица чемпионов.
-    fn table(&mut self, ui: &mut egui::Ui, champions: &[ChampionStats], height: f32) {
+    /// Таблица напарников — или подсказка, почему она пустая.
+    fn partners_table(&mut self, ui: &mut egui::Ui, partners: &[PartnerStats], height: f32) {
+        let hint = |ui: &mut egui::Ui, text: &str, color| {
+            ui.label(RichText::new(text).font(theme::mono(FONT)).color(color));
+        };
+        match &self.teammates {
+            None => hint(ui, "загружаю напарников…", theme::TEXT_MUTED),
+            Some(Err(error)) => hint(ui, &format!("! {error}"), theme::RED_TEXT),
+            Some(Ok(_)) if partners.is_empty() => hint(
+                ui,
+                &format!(
+                    "напарников нет: нужно хотя бы {PARTNER_MIN_GAMES} игры в одной команде с одним игроком \
+                     (считаются игры, у которых загружены подробности)"
+                ),
+                theme::TEXT_HINT,
+            ),
+            Some(Ok(_)) => {
+                self.table(ui, &PARTNER_HEADERS, &PARTNER_COLUMNS, partners.len(), height, |ui, rect, index, cursor, hovered| {
+                    partner_row(ui, rect, &partners[index], cursor, hovered);
+                });
+            }
+        }
+    }
+
+    /// Таблица с прокруткой и курсором; `paint` рисует строку с этим номером.
+    fn table(
+        &mut self,
+        ui: &mut egui::Ui,
+        headers: &[&str],
+        columns: &[f32],
+        count: usize,
+        height: f32,
+        paint: impl Fn(&egui::Ui, Rect, usize, bool, bool),
+    ) {
         let font = theme::mono(FONT);
         let (head, _) = ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::hover());
         let painter = ui.painter();
         let mut x = head.left();
-        for (index, title) in HEADERS.iter().enumerate() {
+        for (index, title) in headers.iter().enumerate() {
             painter.text(pos2(x, head.center().y), egui::Align2::LEFT_CENTER, *title, font.clone(), theme::TEXT_HINT);
-            x += COLUMNS.get(index).copied().unwrap_or(0.0);
+            x += columns.get(index).copied().unwrap_or(0.0);
         }
         painter.hline(head.x_range(), head.bottom() - 0.5, Stroke::new(1.0, theme::BORDER));
 
         // Строки вплотную: show_rows считает высоту строки вместе с этим промежутком.
         ui.spacing_mut().item_spacing.y = 0.0;
-        let view_height = height.min(champions.len() as f32 * ROW_HEIGHT);
+        let view_height = height.min(count as f32 * ROW_HEIGHT);
         let mut area = egui::ScrollArea::vertical()
-            .id_salt("profile_champions")
+            .id_salt(("profile_table", self.table == Table::Partners))
             .max_height(height)
             .min_scrolled_height(view_height)
             .auto_shrink([false, true]);
@@ -286,13 +401,17 @@ impl ProfileView {
             }
             area = area.vertical_scroll_offset(self.offset);
         }
-        let output = area.show_rows(ui, ROW_HEIGHT, champions.len(), |ui, range| {
+        let output = area.show_rows(ui, ROW_HEIGHT, count, |ui, range| {
             for index in range {
                 let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::click());
                 if response.clicked() {
                     self.cursor = index;
                 }
-                row(ui, rect, &champions[index], index == self.cursor, response.hovered());
+                // Двойной щелчок — как Enter.
+                if response.double_clicked() {
+                    self.open_cursor = true;
+                }
+                paint(ui, rect, index, index == self.cursor, response.hovered());
             }
         });
         self.offset = output.state.clamped_offset().y;
@@ -328,7 +447,7 @@ fn header(ui: &mut egui::Ui, account: &Account, now: i64) -> bool {
         ui.label(job(&[("рангов ещё нет — закройте окно и нажмите r, чтобы обновить аккаунт", k)], &font));
         return close;
     };
-    for (title, queue) in [("solo ", Queue::Solo), ("flex ", Queue::Flex)] {
+    for (title, queue) in [("solo 5×5 ", Queue::Solo), ("flex 5×5 ", Queue::Flex)] {
         let Some(stats) = queue.stats(&cache.ranked) else {
             ui.label(job(&[(title, k), ("без ранга", theme::TEXT_MUTED)], &font));
             continue;
@@ -582,6 +701,49 @@ fn row(ui: &egui::Ui, rect: Rect, champion: &ChampionStats, is_cursor: bool, hov
     }
 }
 
+/// Строка напарника: «› Друг#RU1  14  9-5  64% ██████░░░░  3.9  7.2/4.1/8.8  вчера».
+/// Показатели — самого аккаунта в играх с этим напарником.
+fn partner_row(ui: &egui::Ui, rect: Rect, partner: &PartnerStats, is_cursor: bool, hovered: bool) {
+    let painter = ui.painter_at(rect);
+    if is_cursor {
+        painter.rect_filled(rect, 0, theme::ACCENT);
+    } else if hovered {
+        painter.rect_filled(rect, 0, white(7));
+    }
+    let ink = |color| if is_cursor { theme::ON_ACCENT } else { color };
+    let font = theme::mono(FONT);
+    let totals = &partner.totals;
+    let winrate = totals.winrate().unwrap_or(0.0);
+    let filled = ((winrate / 100.0 * BAR_CELLS as f32).round() as usize).min(BAR_CELLS);
+    let ratio = totals.kda_ratio();
+    let simple = |text: String, color| job(&[(&text, ink(color))], &font);
+    let cells = [
+        simple((if is_cursor { "›" } else { "" }).into(), theme::TEXT),
+        simple(partner.riot_id.to_string(), theme::TEXT),
+        simple(totals.games.to_string(), theme::TEXT),
+        simple(format!("{}-{}", totals.wins, totals.losses()), theme::TEXT_MUTED),
+        job(
+            &[
+                (&format!("{winrate:>3.0}% "), ink(winrate_color(winrate))),
+                (&"█".repeat(filled), ink(winrate_color(winrate))),
+                (&"░".repeat(BAR_CELLS - filled), ink(theme::BORDER)),
+            ],
+            &font,
+        ),
+        simple(format!("{ratio:.1}"), match_view::kda_color(ratio)),
+        simple(totals.average_kda(), theme::TEXT_MUTED),
+        simple(format::relative_time(partner.last_played), theme::TEXT_HINT),
+    ];
+    let mut x = rect.left();
+    for (index, mut cell) in cells.into_iter().enumerate() {
+        let width = PARTNER_COLUMNS.get(index).copied().unwrap_or(rect.right() - x) - 8.0;
+        cell.wrap = egui::text::TextWrapping::truncate_at_width(width.max(8.0));
+        let galley = painter.layout_job(cell);
+        painter.galley(pos2(x, rect.center().y - galley.size().y / 2.0), galley, theme::TEXT);
+        x += PARTNER_COLUMNS.get(index).copied().unwrap_or(0.0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -740,5 +902,45 @@ mod tests {
         frame(&ctx, &mut view, vec![]);
 
         assert!(frame(&ctx, &mut view, vec![press(egui::Key::Escape)]), "Esc закрывает окно");
+    }
+
+    /// n переключает на напарников; окно рисуется, пока они грузятся, при ошибке, без
+    /// напарников и с ними; курсор ходит по напарникам.
+    #[test]
+    fn partners_table_switches_and_moves_the_cursor() {
+        let ctx = egui::Context::default();
+        let mut view = ProfileView::new(1);
+        view.games = Some(Ok((0..6).map(|i| game(1, 420, i % 2 == 0, i)).collect()));
+        frame(&ctx, &mut view, vec![press(egui::Key::N)]);
+        assert_eq!(view.table, Table::Partners);
+        view.teammates = Some(Err(AppError::AccountMissing));
+        frame(&ctx, &mut view, vec![]);
+        view.teammates = Some(Ok(HashMap::new()));
+        frame(&ctx, &mut view, vec![]);
+
+        let games = view.visible(unix_now()).into_iter().cloned().collect::<Vec<_>>();
+        let id = |s: &str| RiotId::parse(s).unwrap();
+        // Друг — во всех шести играх, второй — в трёх, случайный — в одной.
+        let teammates: HashMap<String, Vec<RiotId>> = games
+            .iter()
+            .enumerate()
+            .map(|(i, g)| {
+                let mut list = vec![id("Friend#RU1")];
+                if i < 3 {
+                    list.push(id("Second#RU1"));
+                }
+                if i == 5 {
+                    list.push(id("Random#RU1"));
+                }
+                (g.id.clone(), list)
+            })
+            .collect();
+        view.teammates = Some(Ok(teammates));
+        assert_eq!(view.partners(&games).len(), 2);
+        frame(&ctx, &mut view, vec![press(egui::Key::ArrowDown)]);
+        frame(&ctx, &mut view, vec![press(egui::Key::ArrowDown)]);
+        assert_eq!(view.cursor, 1, "курсор упирается в последнего напарника");
+        frame(&ctx, &mut view, vec![press(egui::Key::N)]);
+        assert_eq!((view.table, view.cursor), (Table::Champions, 0));
     }
 }

@@ -3,7 +3,7 @@
 //! Логины и пароли сюда не попадают никогда — только флаги «есть логин / есть пароль»
 //! и `secret_ref` — случайный UUID, по которому запись ищется в системном хранилище.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -19,6 +19,17 @@ use crate::riot::{
 };
 
 pub type AccountId = i64;
+
+/// Другой игрок в игре из архива (см. [`Db::archived_players`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchivedPlayer {
+    /// `None` — имя скрыто или неизвестно.
+    pub riot_id: Option<RiotId>,
+    /// Название чемпиона (как его записал клиент или Riot API).
+    pub champion: String,
+    /// В команде аккаунта.
+    pub ally: bool,
+}
 
 /// Миграции схемы. Номер версии = индекс + 1; текущая версия хранится в
 /// `PRAGMA user_version`. Новые изменения схемы — только НОВЫМИ элементами в конце,
@@ -530,6 +541,24 @@ impl Db {
         archive_details(&self.conn, id, details)
     }
 
+    /// Номера игр архива, у которых уже есть подробности, — их загрузка истории пропускает.
+    pub fn matches_with_details(&self, id: AccountId) -> AppResult<HashSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT match_id FROM matches WHERE account_id = ?1 AND details_json IS NOT NULL")?;
+        let ids = stmt.query_map(params![id], |r| r.get(0))?.collect::<Result<_, _>>()?;
+        Ok(ids)
+    }
+
+    /// Сохранить игру целиком — итог и подробности (загрузка старой истории).
+    pub fn archive_game(&mut self, id: AccountId, game: &MatchSummary, details: &MatchDetails) -> AppResult<()> {
+        let tx = self.conn.transaction()?;
+        archive_summary(&tx, id, game)?;
+        archive_details(&tx, id, details)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Игры архива без подробностей, новые первыми — их догружает фоновый поток.
     pub fn matches_without_details(&self, id: AccountId, limit: usize) -> AppResult<Vec<String>> {
         let mut stmt = self.conn.prepare(
@@ -540,6 +569,46 @@ impl Db {
             .query_map(params![id, limit as i64], |r| r.get(0))?
             .collect::<Result<_, _>>()?;
         Ok(ids)
+    }
+
+    /// Другие игроки в играх аккаунта (кроме него самого) — для «напарников» в окне
+    /// «Профиль» и поиска по нику и чемпиону во «Всех играх»: номер игры → игроки.
+    /// Только игры с подробностями. Свою команду узнаём по отметке `is_me`, а не по
+    /// порядку команд: так надёжнее для старых записей архива.
+    pub fn archived_players(&self, id: AccountId) -> AppResult<HashMap<String, Vec<ArchivedPlayer>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.match_id,
+                    json_extract(p.value, '$.riot_id.game_name'),
+                    json_extract(p.value, '$.riot_id.tag_line'),
+                    json_extract(p.value, '$.stats.champion'),
+                    EXISTS (SELECT 1 FROM json_each(t.value, '$.players') q
+                            WHERE json_extract(q.value, '$.is_me') = 1)
+             FROM matches m,
+                  json_each(m.details_json, '$.teams') t,
+                  json_each(t.value, '$.players') p
+             WHERE m.account_id = ?1
+               AND m.details_json IS NOT NULL
+               AND json_extract(p.value, '$.is_me') = 0",
+        )?;
+        let rows = stmt.query_map(params![id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                r.get::<_, bool>(4)?,
+            ))
+        })?;
+        let mut players: HashMap<String, Vec<ArchivedPlayer>> = HashMap::new();
+        for row in rows {
+            let (match_id, game_name, tag_line, champion, ally) = row?;
+            players.entry(match_id).or_default().push(ArchivedPlayer {
+                riot_id: game_name.map(|game_name| RiotId { game_name, tag_line }),
+                champion,
+                ally,
+            });
+        }
+        Ok(players)
     }
 
     /// Прошлые игры с игроками `players` из архивов всех аккаунтов — для пометки «уже
@@ -1060,6 +1129,95 @@ mod tests {
         // Владелец архива сам себе не «встреча».
         assert!(db.meetings(&[RiotId::parse("Main#EUW").unwrap()]).unwrap().is_empty());
         assert!(db.meetings(&[]).unwrap().is_empty());
+    }
+
+    /// Игроки игры: все, кроме самого аккаунта; своя команда — по отметке is_me (даже
+    /// если она записана не первой); скрытые имена — `None`; игры других аккаунтов не попадают.
+    #[test]
+    fn archived_players_mark_allies() {
+        let mut db = Db::open_in_memory().unwrap();
+        let main = db.insert_account(&input("Main#EUW", Region::Euw)).unwrap();
+        let alt = db.insert_account(&input("Alt#EUW", Region::Euw)).unwrap();
+        let line = |name: Option<&str>, is_me: bool| crate::riot::PlayerLine {
+            riot_id: name.and_then(|n| RiotId::parse(n).ok()),
+            is_me,
+            stats: crate::riot::PlayerStats {
+                champion: format!("чемпион {}", name.unwrap_or("?")),
+                ..Default::default()
+            },
+        };
+        let team = |players| crate::riot::TeamDetails {
+            win: true,
+            towers: 0,
+            dragons: 0,
+            barons: 0,
+            players,
+        };
+        let save = |db: &mut Db, account: AccountId, owner: &str, id: &str, teams| {
+            let mut snap = snapshot(&format!("p{account}"), owner);
+            snap.matches = Some(vec![game(id, true)]);
+            db.save_snapshot(account, &snap, 1).unwrap();
+            db.save_details(account, &MatchDetails { teams, ..details(id) }).unwrap();
+        };
+        save(
+            &mut db,
+            main.id,
+            "Main#EUW",
+            "EUW1_1",
+            vec![
+                team(vec![line(Some("Main#EUW"), true), line(Some("Pal#EUW"), false), line(None, false)]),
+                team(vec![line(Some("Foe#EUW"), false)]),
+            ],
+        );
+        // Своя команда записана второй.
+        save(
+            &mut db,
+            main.id,
+            "Main#EUW",
+            "EUW1_2",
+            vec![
+                team(vec![line(Some("Foe#EUW"), false)]),
+                team(vec![line(Some("Pal#EUW"), false), line(Some("Main#EUW"), true)]),
+            ],
+        );
+        save(&mut db, alt.id, "Alt#EUW", "EUW1_3", vec![team(vec![line(Some("Alt#EUW"), true), line(Some("Other#EUW"), false)])]);
+
+        let found = db.archived_players(main.id).unwrap();
+        let player = |name: Option<&str>, ally: bool| ArchivedPlayer {
+            riot_id: name.map(|n| RiotId::parse(n).unwrap()),
+            champion: format!("чемпион {}", name.unwrap_or("?")),
+            ally,
+        };
+        let sorted = |id: &str| {
+            let mut list = found[id].clone();
+            list.sort_by_key(|p| p.riot_id.as_ref().map(ToString::to_string));
+            list
+        };
+        assert_eq!(found.len(), 2);
+        assert_eq!(
+            sorted("EUW1_1"),
+            [player(None, true), player(Some("Foe#EUW"), false), player(Some("Pal#EUW"), true)]
+        );
+        assert_eq!(sorted("EUW1_2"), [player(Some("Foe#EUW"), false), player(Some("Pal#EUW"), true)]);
+        assert!(db.archived_players(12345).unwrap().is_empty());
+    }
+
+    /// Старая игра из загрузки истории ложится в архив сразу с подробностями;
+    /// игры без подробностей в «уже загруженные» не попадают.
+    #[test]
+    fn archive_game_saves_summary_and_details() {
+        let mut db = Db::open_in_memory().unwrap();
+        let a = db.insert_account(&input("Name#EUW", Region::Euw)).unwrap();
+        let mut snap = snapshot("p1", "Name#EUW");
+        snap.matches = Some(vec![game("EUW1_9", true)]);
+        db.save_snapshot(a.id, &snap, 1).unwrap();
+
+        db.archive_game(a.id, &game("EUW1_1", false), &details("EUW1_1")).unwrap();
+
+        let ids: Vec<String> = db.archived_matches(a.id, None).unwrap().into_iter().map(|g| g.id).collect();
+        assert_eq!(ids, ["EUW1_9", "EUW1_1"]);
+        assert_eq!(db.archived_details(a.id, "EUW1_1").unwrap(), Some(details("EUW1_1")));
+        assert_eq!(db.matches_with_details(a.id).unwrap(), HashSet::from(["EUW1_1".to_string()]));
     }
 
     #[test]

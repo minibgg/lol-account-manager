@@ -38,11 +38,12 @@ use crate::riot_login::AuthStep;
 use crate::lobby::{
     self, Encounters, EnemyPlayer, LiveGame, LobbyPhase, LobbyPlayer, LobbyState, Meeting, PlayerProfile, RecentForm,
 };
-use crate::messages::{Command, CredentialKind, Event, ImportReport, LeagueDirInfo, Secret};
+use crate::messages::{Command, CredentialKind, Event, HistoryProgress, ImportReport, LeagueDirInfo, Secret};
 use crate::riot::{
     AccountSnapshot, ApiKey, DataSource, Inventory, MatchDetails, MatchSummary, PlayerStats, RankedQueues, Region, RiotClient,
     RiotId,
 };
+use crate::riot::client::HISTORY_PAGE;
 use crate::storage::{Account, AccountId, AccountInput, Credentials, SecretChange, Storage, unix_now};
 use crate::transfer;
 use crate::update::{self, UpdateInfo, Updater, Version};
@@ -323,6 +324,9 @@ struct Worker {
     events: EventSink,
     clipboard: SecretClipboard,
     clipboard_clear_after: Duration,
+    /// Аккаунты, у которых сейчас загружается вся история игр. Убрать аккаунт отсюда —
+    /// остановить загрузку: она проверяет это перед каждой игрой.
+    loading_history: Arc<Mutex<HashSet<AccountId>>>,
     /// Аккаунты, которые сейчас обновляются или ждут очереди.
     refreshing: Arc<Mutex<HashSet<AccountId>>>,
     /// Семафор — «N пропусков»: задача берёт пропуск перед обновлением и
@@ -390,6 +394,7 @@ impl Worker {
             clipboard,
             clipboard_clear_after,
             refreshing: Arc::default(),
+            loading_history: Arc::default(),
             refresh_slots: Arc::new(Semaphore::new(PARALLEL_REFRESHES)),
             positions: Arc::default(),
             hello_lock: Arc::new(AtomicBool::new(hello_lock)),
@@ -1412,6 +1417,14 @@ impl Worker {
                     let result = worker.with_storage(move |s| s.archived_matches(account, None)).await;
                     worker.events.send(Event::GamesLoaded { account, result });
                 }
+                Command::LoadPlayers(account) => {
+                    let result = worker.with_storage(move |s| s.archived_players(account)).await;
+                    worker.events.send(Event::PlayersLoaded { account, result });
+                }
+                Command::LoadHistory(account) => worker.load_history(account).await,
+                Command::StopHistory(account) => {
+                    worker.loading_history.lock().unwrap_or_else(PoisonError::into_inner).remove(&account);
+                }
                 Command::LoadInventory(account) => worker.send_inventory(account).await,
                 Command::LoadInventories => {
                     let list = worker.inventories().await;
@@ -1826,6 +1839,93 @@ impl Worker {
         }
         if saved > 0 {
             debug!(id, saved, "подробности игр сохранены в архив");
+        }
+    }
+
+    // ----- Загрузка всей истории игр ----------------------------------------
+
+    /// Вся история игр аккаунта — в архив, через Riot API. Обычное обновление берёт только
+    /// последние 20 игр; здесь листаем match-v5 назад по 100 номеров, пока Riot их отдаёт,
+    /// и сохраняем каждую игру сразу с обеими командами. Игры, у которых подробности уже
+    /// есть, пропускаем — поэтому прерванная загрузка продолжается с того же места.
+    /// Каждая игра — запрос, лимит ключа разработчика — 100 за 2 минуты: сотня игр
+    /// загружается минуты за три (лимиты общие с обычными обновлениями).
+    async fn load_history(&self, id: AccountId) {
+        if !self.loading_history.lock().unwrap_or_else(PoisonError::into_inner).insert(id) {
+            return; // уже загружается
+        }
+        let mut progress = HistoryProgress::default();
+        let error = self.history_pages(id, &mut progress).await.err();
+        // Убрали из списка раньше нас — значит, пользователь нажал «стоп».
+        progress.stopped = !self.loading_history.lock().unwrap_or_else(PoisonError::into_inner).remove(&id);
+        match &error {
+            Some(e) => warn!(id, error = %e, saved = progress.saved, "загрузка истории прервалась"),
+            None => info!(id, scanned = progress.scanned, saved = progress.saved, "история игр загружена"),
+        }
+        self.events.send(Event::HistoryDone { account: id, progress, error });
+    }
+
+    fn history_stopped(&self, id: AccountId) -> bool {
+        !self.loading_history.lock().unwrap_or_else(PoisonError::into_inner).contains(&id)
+    }
+
+    async fn history_pages(&self, id: AccountId, progress: &mut HistoryProgress) -> AppResult<()> {
+        if !self.riot.has_api_key() {
+            return Err(AppError::MissingApiKey);
+        }
+        let account = self.with_storage(move |s| s.get_account(id)).await?;
+        let region = account.region;
+        let by_riot_id = async || self.riot.account_by_riot_id(&account.riot_id, region).await.map(|a| a.puuid);
+        let mut puuid = match &account.puuid {
+            Some(puuid) => puuid.clone(),
+            None => by_riot_id().await?,
+        };
+        let done = self.with_storage(move |s| s.matches_with_details(id)).await?;
+        let mut retried = false;
+        let mut start = 0;
+        loop {
+            if self.history_stopped(id) {
+                return Ok(());
+            }
+            let ids = match self.riot.match_ids(&puuid, region, start).await {
+                // PUUID «чужой» (ключ сменили) — найдём аккаунт заново по Riot ID.
+                Err(AppError::BadRequest | AppError::AccountNotFound) if !retried => {
+                    retried = true;
+                    puuid = by_riot_id().await?;
+                    continue;
+                }
+                other => other?,
+            };
+            let page = ids.len();
+            for match_id in ids {
+                progress.scanned += 1;
+                if done.contains(&match_id) {
+                    continue;
+                }
+                if self.history_stopped(id) {
+                    return Ok(());
+                }
+                let game = match self.riot.match_by_id(&match_id, region).await {
+                    Ok(game) => game,
+                    // Riot не отдаёт эту игру (служебная или слишком старая) — дальше.
+                    Err(AppError::MatchNotFound) => continue,
+                    Err(e) => return Err(e),
+                };
+                let Some(mut summary) = game.summary_for(&puuid) else {
+                    continue;
+                };
+                let mut details = game.details(Some(&puuid));
+                self.fill_champion_names(std::iter::once(&mut summary.me)).await;
+                self.fill_champion_names(details.players_mut().map(|p| &mut p.stats)).await;
+                self.with_storage(move |s| s.archive_game(id, &summary, &details)).await?;
+                progress.saved += 1;
+                self.events.send(Event::HistoryProgress { account: id, progress: *progress });
+            }
+            self.events.send(Event::HistoryProgress { account: id, progress: *progress });
+            if page < HISTORY_PAGE {
+                return Ok(()); // дошли до конца истории
+            }
+            start += HISTORY_PAGE;
         }
     }
 

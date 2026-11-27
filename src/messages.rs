@@ -26,7 +26,7 @@ use crate::lcu::LcuStatus;
 use crate::clash::{ClashHistory, ClashState, HistoryRequest};
 use crate::lobby::{LiveGame, LobbyState};
 use crate::riot::{DataSource, Inventory, MatchDetails, MatchSummary, RankedQueues, RiotId};
-use crate::storage::{Account, AccountId, AccountInput, Credentials, SecretChange};
+use crate::storage::{Account, AccountId, AccountInput, ArchivedPlayer, Credentials, SecretChange};
 use crate::update::UpdateInfo;
 use crate::wallpapers::Skin;
 
@@ -141,6 +141,14 @@ pub enum Command {
     LoadMatch { account: AccountId, match_id: String },
     /// Все игры аккаунта из архива — для окна «Все игры».
     LoadGames(AccountId),
+    /// Другие игроки в играх аккаунта (по архиву) — для «напарников» в окне «Профиль»
+    /// и поиска по нику и чемпиону во «Всех играх».
+    LoadPlayers(AccountId),
+    /// Загрузить в архив всю историю игр аккаунта через Riot API (в фоне, с прогрессом).
+    /// Уже загруженные игры пропускаются, поэтому прерванная загрузка продолжается с места.
+    LoadHistory(AccountId),
+    /// Остановить загрузку истории аккаунта.
+    StopHistory(AccountId),
     /// Инвентарь аккаунта — для окна «Профиль»: свежий из клиента League, если в нём
     /// выполнен вход в этот аккаунт, иначе последний сохранённый.
     LoadInventory(AccountId),
@@ -180,6 +188,17 @@ pub struct ImportReport {
     pub duplicates: usize,
     /// Записи с ошибкой в файле (неверный Riot ID или регион).
     pub invalid: usize,
+}
+
+/// Как идёт (или чем кончилась) загрузка истории игр аккаунта.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HistoryProgress {
+    /// Сколько игр истории просмотрено (и уже лежавших в архиве, и новых).
+    pub scanned: usize,
+    /// Сколько игр загружено и сохранено в архив.
+    pub saved: usize,
+    /// Остановлена пользователем, а не дошла до конца истории.
+    pub stopped: bool,
 }
 
 /// События от фонового потока к окну.
@@ -268,6 +287,20 @@ pub enum Event {
     GamesLoaded {
         account: AccountId,
         result: Result<Vec<MatchSummary>, AppError>,
+    },
+    /// Ответ на `LoadPlayers`: номер игры → другие игроки в ней.
+    PlayersLoaded {
+        account: AccountId,
+        result: Result<std::collections::HashMap<String, Vec<ArchivedPlayer>>, AppError>,
+    },
+    /// Загрузка истории идёт: новые игры уже в архиве.
+    HistoryProgress { account: AccountId, progress: HistoryProgress },
+    /// Загрузка истории закончилась (дошла до конца, остановлена или ошибка).
+    /// Даже при ошибке загруженное до неё остаётся в архиве.
+    HistoryDone {
+        account: AccountId,
+        progress: HistoryProgress,
+        error: Option<AppError>,
     },
 
     /// Ответ на `LoadInventory`: `None` — инвентарь этого аккаунта ещё ни разу не видели.

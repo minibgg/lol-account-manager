@@ -1,0 +1,58 @@
+# Проверка кода на каждый пуш в master и каждый пул-реквест: тесты и clippy.
+#
+# Если проверка красная — в логе шага видно, какой тест упал или что не понравилось
+# clippy. Локально то же самое:
+#   cargo test --locked
+#   cargo clippy --all-targets --locked -- -D warnings
+#
+# rustfmt не проверяем: код проекта отформатирован вручную (строки длиннее,
+# чем по умолчанию у rustfmt).
+
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+# Новый пуш в ту же ветку отменяет ещё не законченную проверку старого.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Тесты и clippy (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Скачать код
+        uses: actions/checkout@v7
+
+      - name: Установить Rust (stable) и clippy
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy --no-self-update
+          rustup default stable
+          rustc --version
+
+      # Кэш скачанных и собранных библиотек: без него каждая проверка — минут десять.
+      - name: Кэш сборки
+        uses: Swatinem/rust-cache@v2
+
+      # Те же быстрые тесты, что и `cargo test` локально (без сети и хранилища паролей).
+      - name: Тесты
+        run: cargo test --locked
+
+      # -D warnings: любое предупреждение — ошибка, чтобы они не копились.
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings

@@ -9,7 +9,7 @@ pub mod secrets;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-pub use db::{Account, AccountId, AccountInput, CachedProfile, Db, normalize_tags, unix_now};
+pub use db::{Account, AccountId, AccountInput, ArchivedPlayer, CachedProfile, Db, normalize_tags, unix_now};
 pub use secrets::{Credentials, Secrets};
 
 use crate::error::{AppError, AppResult};
@@ -182,6 +182,18 @@ impl Storage {
 
     pub fn matches_without_details(&self, id: AccountId, limit: usize) -> AppResult<Vec<String>> {
         self.db.matches_without_details(id, limit)
+    }
+
+    pub fn matches_with_details(&self, id: AccountId) -> AppResult<std::collections::HashSet<String>> {
+        self.db.matches_with_details(id)
+    }
+
+    pub fn archive_game(&mut self, id: AccountId, game: &MatchSummary, details: &MatchDetails) -> AppResult<()> {
+        self.db.archive_game(id, game, details)
+    }
+
+    pub fn archived_players(&self, id: AccountId) -> AppResult<std::collections::HashMap<String, Vec<ArchivedPlayer>>> {
+        self.db.archived_players(id)
     }
 
     pub fn meetings(&self, players: &[RiotId]) -> AppResult<Vec<(RiotId, crate::lobby::Meeting)>> {

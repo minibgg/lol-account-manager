@@ -80,6 +80,7 @@ enum Kind {
     Refresh,
     History,
     Games,
+    LoadHistory,
     Profile,
     OpGg,
     Edit,
@@ -112,6 +113,7 @@ const COMMANDS: &[Spec] = &[
     Spec { kind: Kind::Refresh, names: &["обновить", "refresh", "update"], hint: "обновить ранги" },
     Spec { kind: Kind::History, names: &["история", "history"], hint: "история ранга" },
     Spec { kind: Kind::Games, names: &["игры", "games", "матчи"], hint: "все игры аккаунта (архив)" },
+    Spec { kind: Kind::LoadHistory, names: &["загрузить", "import", "архив"], hint: "загрузить всю историю игр из Riot API (ещё раз — стоп)" },
     Spec { kind: Kind::Profile, names: &["профиль", "profile", "стата"], hint: "статистика по архиву игр" },
     Spec { kind: Kind::OpGg, names: &["opgg", "опгг"], hint: "профиль на op.gg" },
     Spec { kind: Kind::Edit, names: &["изменить", "edit"], hint: "изменить аккаунт" },
@@ -141,7 +143,7 @@ const SORTS: [(SortOrder, &str, &str); 4] = [
 impl Kind {
     fn arg(self) -> Arg {
         match self {
-            Self::Login | Self::AutoLogin | Self::Password | Self::UserName | Self::RiotId | Self::History | Self::Games
+            Self::Login | Self::AutoLogin | Self::Password | Self::UserName | Self::RiotId | Self::History | Self::Games | Self::LoadHistory
             | Self::Profile | Self::OpGg | Self::Edit | Self::Delete => Arg::Account,
             Self::Refresh => Arg::AccountOrAll,
             Self::Tag => Arg::Tag,
@@ -163,6 +165,7 @@ impl Kind {
             Self::Refresh => Action::Refresh,
             Self::History => Action::History,
             Self::Games => Action::Games,
+            Self::LoadHistory => Action::LoadHistory,
             Self::Profile => Action::Profile,
             Self::OpGg => Action::OpGg,
             Self::Edit => Action::Edit,
@@ -471,6 +474,7 @@ mod tests {
         // Часть ника из середины.
         assert_eq!(first("история shroom"), Some(Invocation::on(Action::History, 3)));
         assert_eq!(first("игры benjm"), Some(Invocation::on(Action::Games, 1)));
+        assert_eq!(first("загрузить benjm"), Some(Invocation::on(Action::LoadHistory, 1)));
         assert_eq!(first("профиль benjm"), Some(Invocation::on(Action::Profile, 1)));
         assert_eq!(first("метка новый"), Some(Invocation::new(Action::ToggleTag("новый".into()))));
         // Без ника — выбранный курсором (id 3) первым.

@@ -47,11 +47,14 @@ use crate::ui::post_game::PostGame;
 use crate::ui::profile_view::ProfileView;
 use crate::ui::rank_history::{self, HistoryDialog};
 use crate::ui::command::{self, Invocation, Suggestion, Target};
-use crate::ui::games_view::{GamesAction, GamesView};
+use crate::ui::games_view::{GamesAction, GamesView, HistoryLoad};
 use crate::ui::keymap::{self, Action, Screen};
 use crate::ui::terminal::{self, CommandEvent, CommandLine, Hint};
 use crate::ui::clash_history_view::{self, HistoryAction};
 use crate::ui::{clash_view, lobby_view, wallpapers_view, window_frame};
+
+/// Загрузка истории: открытые окна перечитывают архив после каждых стольких новых игр.
+const HISTORY_RELOAD_EVERY: usize = 20;
 
 /// Сколько сообщение видно в нижней строке.
 const NOTICE_DURATION: Duration = Duration::from_secs(8);
@@ -283,6 +286,8 @@ pub struct App {
     command: Option<CommandLine>,
     /// Открыта справка по клавишам (`?` или F1).
     help_open: bool,
+    /// Загрузка всей истории игр (h во «Всех играх»): идёт или чем кончилась — по аккаунтам.
+    history_loads: HashMap<AccountId, HistoryLoad>,
     /// Окно «Все игры» (архив игр аккаунта, клавиша m).
     games_view: Option<GamesView>,
     /// Окно «Сводка» (все аккаунты за период, клавиша d).
@@ -382,6 +387,7 @@ impl App {
             command: None,
             help_open: false,
             games_view: None,
+            history_loads: HashMap::new(),
             profile_view: None,
             overview: None,
             collection: None,
@@ -743,6 +749,8 @@ impl App {
                     || self.profile_view.as_ref().is_some_and(|v| v.account == account.id)
                 {
                     self.backend.send(Command::LoadGames(account.id));
+                    // И игроки этих игр (напарники, поиск): у новых игр могли появиться подробности.
+                    self.backend.send(Command::LoadPlayers(account.id));
                 }
                 self.replace_account(account);
             }
@@ -890,6 +898,37 @@ impl App {
                 {
                     view.games = Some(result);
                 }
+            }
+            Event::PlayersLoaded { account, result } => {
+                if let Some(view) = &mut self.profile_view
+                    && view.account == account
+                {
+                    view.players_loaded(&result);
+                }
+                if let Some(view) = &mut self.games_view
+                    && view.account == account
+                {
+                    view.players = Some(result);
+                }
+            }
+            Event::HistoryProgress { account, progress } => {
+                let before = self.history_loads.get(&account).map_or(0, |l| l.progress.saved);
+                self.history_loads.insert(account, HistoryLoad { progress, running: true, error: None });
+                // Открытые окна подхватывают новые игры не каждую игру, а пачками.
+                if progress.saved / HISTORY_RELOAD_EVERY != before / HISTORY_RELOAD_EVERY {
+                    self.reload_archive(account);
+                }
+            }
+            Event::HistoryDone { account, progress, error } => {
+                let name = self.accounts.iter().find(|a| a.id == account).map(|a| a.riot_id.to_string());
+                let name = name.unwrap_or_default();
+                match &error {
+                    Some(e) => self.notify_error_text(format!("История {name}: {e} (загружено +{} игр)", progress.saved)),
+                    None if progress.stopped => self.notify(format!("История {name}: остановлено, +{} игр", progress.saved)),
+                    None => self.notify(format!("История {name} загружена: +{} новых игр", progress.saved)),
+                }
+                self.history_loads.insert(account, HistoryLoad { progress, running: false, error });
+                self.reload_archive(account);
             }
             Event::InventoryLoaded { account, inventory } => {
                 // Список инвентарей уже загружен — обновим в нём этот аккаунт.
@@ -1150,6 +1189,7 @@ impl App {
                 if let Some(account) = self.accounts.iter().find(|a| a.archived_games > 0) {
                     self.profile_view = Some(ProfileView::new(account.id));
                     self.backend.send(Command::LoadGames(account.id));
+                    self.backend.send(Command::LoadPlayers(account.id));
                     self.backend.send(Command::LoadInventory(account.id));
                 }
             }
@@ -1157,6 +1197,7 @@ impl App {
                 if let Some(account) = self.accounts.iter().find(|a| a.archived_games > 0) {
                     self.games_view = Some(GamesView::new(account.id, account.riot_id.clone()));
                     self.backend.send(Command::LoadGames(account.id));
+                    self.backend.send(Command::LoadPlayers(account.id));
                 }
             }
             "command" => {
@@ -1266,6 +1307,27 @@ impl App {
     fn load_clash_history(&mut self, request: HistoryRequest) {
         self.clash_histories.insert(request.riot_id.clone(), None);
         self.backend.send(Command::LoadClashHistory(request));
+    }
+
+    /// В архиве аккаунта появились игры — перечитать их в открытые «Все игры» и «Профиль».
+    fn reload_archive(&mut self, id: AccountId) {
+        if self.games_view.as_ref().is_some_and(|v| v.account == id)
+            || self.profile_view.as_ref().is_some_and(|v| v.account == id)
+        {
+            self.backend.send(Command::LoadGames(id));
+            self.backend.send(Command::LoadPlayers(id));
+        }
+    }
+
+    /// Загрузить всю историю игр аккаунта или, если она уже идёт, остановить.
+    fn toggle_history(&mut self, id: AccountId, start: bool) {
+        if start {
+            let progress = Default::default();
+            self.history_loads.insert(id, HistoryLoad { progress, running: true, error: None });
+            self.backend.send(Command::LoadHistory(id));
+        } else {
+            self.backend.send(Command::StopHistory(id));
+        }
     }
 
     fn notify(&mut self, text: impl Into<String>) {
@@ -1842,6 +1904,7 @@ impl App {
             | A::History
             | A::Game(_)
             | A::Games
+            | A::LoadHistory
             | A::Profile
             | A::OpGg
             | A::Edit
@@ -1922,10 +1985,21 @@ impl App {
             A::Games => {
                 self.games_view = Some(GamesView::new(id, riot_id.clone()));
                 self.backend.send(Command::LoadGames(id));
+                self.backend.send(Command::LoadPlayers(id));
+            }
+            A::LoadHistory => {
+                let running = self.history_loads.get(&id).is_some_and(|l| l.running);
+                self.toggle_history(id, !running);
+                if running {
+                    self.notify(format!("История {riot_id}: останавливаю загрузку"));
+                } else {
+                    self.notify(format!("История {riot_id}: загружаю в фоне — прогресс во «Всех играх» (m)"));
+                }
             }
             A::Profile => {
                 self.profile_view = Some(ProfileView::new(id));
                 self.backend.send(Command::LoadGames(id));
+                self.backend.send(Command::LoadPlayers(id));
                 self.backend.send(Command::LoadInventory(id));
             }
             A::Game(n) => match game {
@@ -2122,13 +2196,16 @@ impl App {
         let keys = self.match_dialog.is_none();
         // История рангов аккаунта — для столбца «ранг после игры».
         let accounts = &self.accounts;
+        let loads = &self.history_loads;
         let shown = self.games_view.as_mut().map(|view| {
             let history = accounts.iter().find(|a| a.id == view.account).map_or(&[][..], |a| &a.history);
-            (view.account, view.show(ctx, keys, history))
+            (view.account, view.show(ctx, keys, history, loads.get(&view.account)))
         });
         if let Some((id, action)) = shown {
             match action {
                 GamesAction::None => {}
+                GamesAction::LoadHistory => self.toggle_history(id, true),
+                GamesAction::StopHistory => self.toggle_history(id, false),
                 GamesAction::Close => self.games_view = None,
                 GamesAction::Open(summary) => {
                     if let Some(owner) = self.accounts.iter().find(|a| a.id == id).map(|a| a.riot_id.clone()) {
@@ -3122,6 +3199,8 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.close_to_tray(&ctx);
         self.expire_notice(&ctx);
+        // Арты образов, которые давно не рисовались, — из памяти (их тысячи на «Обоях»).
+        self.images.evict_unused(&ctx, Instant::now());
         // Клавиши — до виджетов: найденные нажатия забираем, чтобы их не увидели кнопки.
         let mut actions = self.hotkeys(&ctx);
         // Порядок важен: сначала верхняя и нижняя панели, CentralPanel — последней.

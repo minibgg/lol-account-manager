@@ -35,6 +35,9 @@ const MAX_AUTO_WAIT: Duration = Duration::from_secs(130);
 /// Пауза после 429 без заголовка Retry-After (такое бывает при перегрузке сервиса Riot).
 const DEFAULT_RETRY_WAIT: Duration = Duration::from_secs(2);
 
+/// Сколько номеров игр match-v5 отдаёт за один запрос (больше Riot не разрешает).
+pub const HISTORY_PAGE: usize = 100;
+
 // ---------------------------------------------------------------------------
 // API-ключ
 // ---------------------------------------------------------------------------
@@ -288,6 +291,17 @@ impl RiotClient {
             }
         }
         Ok((matches, details))
+    }
+
+    /// match-v5: номера игр игрока, новые первыми, с `start`-й по счёту — до
+    /// [`HISTORY_PAGE`] за запрос. Для загрузки всей истории: листаем, пока не придёт
+    /// неполная страница.
+    pub async fn match_ids(&self, puuid: &str, region: Region, start: usize) -> AppResult<Vec<String>> {
+        let path = format!(
+            "/lol/match/v5/matches/by-puuid/{}/ids?start={start}&count={HISTORY_PAGE}",
+            encode_segment(puuid)
+        );
+        Ok(self.get_json(region.regional().host(), &path).await?.unwrap_or_default())
     }
 
     /// match-v5: последние игры в Clash (очередь 700) — до `count` штук, новые первыми.

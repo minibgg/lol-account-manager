@@ -31,7 +31,7 @@ pub const ROW_HEIGHT: f32 = 26.0;
 /// Ширины колонок: курсор, аккаунт, регион, solo/duo, flex, 7 дней, игры. Остальное —
 /// последняя колонка (в клиенте / обновляется / ошибка / теги).
 const COLUMNS: [f32; 7] = [18.0, 238.0, 48.0, 168.0, 168.0, 58.0, 118.0];
-const HEADERS: [&str; 8] = ["", "аккаунт", "рег", "solo/duo", "flex", "7д", "игры", ""];
+const HEADERS: [&str; 8] = ["", "аккаунт", "рег", "solo/duo 5×5", "flex 5×5", "7д", "игры", ""];
 /// Сколько клеток в полоске LP («████░░░»).
 const BAR_CELLS: usize = 20;
 
@@ -308,7 +308,7 @@ impl Details<'_> {
 
                 // Строки 2–3: ранги с полоской LP и общий счёт.
                 let cache = account.cache.as_ref();
-                for (title, queue) in [("solo ", history::Queue::Solo), ("flex ", history::Queue::Flex)] {
+                for (title, queue) in [("solo 5×5 ", history::Queue::Solo), ("flex 5×5 ", history::Queue::Flex)] {
                     let stats = cache.map(|c| queue.stats(&c.ranked));
                     let mut left = rank_line(title, stats, &font);
                     // Алмаз и выше: через сколько дней без игр ранг начнёт сгорать.
